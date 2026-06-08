@@ -1,8 +1,8 @@
 """
-Export one resonator per GDS, centered inside the GSG frame template.
+Export one resonator per GDS with the GSG frame at top-left and signal node at frame center.
 
-Each file: GSG_frame at origin + one resonator pasted at the frame center.
-One GDS per resonator. No vias or filter metal yet.
+Each file: GSG frame + ppd at top-left, resonator shifted so signal node is at
+frame center. Visual sanity check — no preserved metal or vias.
 
 Draft outputs go to draft_output/. Ground truth stays in example_output/.
 """
@@ -14,10 +14,20 @@ from pathlib import Path
 import gdstk
 
 from layermap import LAYERMAP_PATH, describe_layers, gds_pairs_in_cell, load_layermap
-from separate import Resonator, separate
+from rteg_skill import (
+    FRAME_ORIGIN,
+    PPD_ORIGIN,
+    frame_top_cell,
+    infer_inst_names,
+    placement_shift,
+    rteg_cell_name,
+)
+from separate import separate
 
-FRAME_GDS = Path(__file__).parent / "GSG_frame.gds"
-FRAME_TOP = "GSG_frame"
+FILTER_GDS = Path(__file__).parent / "KB331_N_01_clean.gds"
+FRAME_GDS = Path(__file__).parent / "KB331_N_Frame.gds"
+PPD_GDS = Path(__file__).parent / "ppd_1port.gds"
+PPD_TOP = "ppd_1port"
 
 
 @dataclass
@@ -25,6 +35,7 @@ class ResonatorExportStats:
     """Summary for one exported resonator GDS."""
 
     cell_name: str
+    inst_name: str
     res_type: str
     master_name: str
     filter_origin: tuple[float, float]
@@ -33,66 +44,47 @@ class ResonatorExportStats:
     layers: list[str]
 
 
-def rteg_cell_name(parent: str, index: int, res: Resonator) -> str:
-    """Indexed name when Virtuoso instance names are unavailable in GDS."""
-    return f"{parent}_RTEG1_{index:02d}_{res.res_type}"
-
-
-def _bbox_center(
-    bbox: tuple[tuple[float, float], tuple[float, float]],
-) -> tuple[float, float]:
-    (x0, y0), (x1, y1) = bbox
-    return (x0 + x1) / 2, (y0 + y1) / 2
-
-
-def center_in_frame(
-    res_cell: gdstk.Cell, frame_cell: gdstk.Cell
-) -> tuple[float, float]:
-    """Origin for resonator so its bbox center sits on the frame bbox center."""
-    res_bb = res_cell.bounding_box()
-    frame_bb = frame_cell.bounding_box()
-    if res_bb is None or frame_bb is None:
-        raise ValueError("Resonator or frame cell has no bounding box")
-    rcx, rcy = _bbox_center(res_bb)
-    fcx, fcy = _bbox_center(frame_bb)
-    return fcx - rcx, fcy - rcy
-
-
 def export_resonators(
     filter_gds: str | Path,
     output_dir: str | Path,
     frame_gds: str | Path | None = None,
+    ppd_gds: str | Path | None = None,
     layermap_path: str | Path | None = None,
 ) -> list[ResonatorExportStats]:
-    """
-    For each resonator, write one GDS: GSG_frame + resonator centered in frame.
-    """
+    """For each resonator, write one GDS with top-left frame and signal-node placement."""
     filter_gds = Path(filter_gds)
     frame_gds = Path(frame_gds or FRAME_GDS)
+    ppd_gds = Path(ppd_gds or PPD_GDS)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     layermap = load_layermap(layermap_path)
     filter_lib = gdstk.read_gds(filter_gds)
     frame_lib = gdstk.read_gds(frame_gds)
+    ppd_lib = gdstk.read_gds(ppd_gds)
 
-    frame_cell = next(c for c in frame_lib.cells if c.name == FRAME_TOP)
+    frame_cell = frame_top_cell(frame_lib)
     frame_subcells = {c.name: c for c in frame_lib.cells}
+    ppd_cell = next(c for c in ppd_lib.cells if c.name == PPD_TOP)
 
     resonators_by_parent = separate(filter_lib)
     all_stats: list[ResonatorExportStats] = []
 
     for parent, res_list in resonators_by_parent.items():
+        inst_names = infer_inst_names(res_list)
         for index, res in enumerate(res_list):
-            name = rteg_cell_name(parent, index, res)
-            origin = center_in_frame(res.reference.cell, frame_cell)
+            inst_name = inst_names[index]
+            name = rteg_cell_name(parent, inst_name)
+            dx, dy = placement_shift(res, frame_cell, layermap)
+            rteg_origin = (res.origin[0] + dx, res.origin[1] + dy)
 
             top = gdstk.Cell(name)
-            top.add(gdstk.Reference(frame_cell, origin=(0.0, 0.0)))
+            top.add(gdstk.Reference(frame_cell, origin=FRAME_ORIGIN))
+            top.add(gdstk.Reference(ppd_cell, origin=PPD_ORIGIN))
             top.add(
                 gdstk.Reference(
                     res.reference.cell,
-                    origin=origin,
+                    origin=rteg_origin,
                     rotation=res.rotation,
                     magnification=res.magnification,
                     x_reflection=res.x_reflection,
@@ -102,6 +94,7 @@ def export_resonators(
             out_lib = gdstk.Library()
             for cell in frame_subcells.values():
                 out_lib.add(cell)
+            out_lib.add(ppd_cell)
             out_lib.add(res.reference.cell)
             out_lib.add(top)
             out_lib.write_gds(output_dir / f"{name}.gds")
@@ -112,10 +105,11 @@ def export_resonators(
             all_stats.append(
                 ResonatorExportStats(
                     cell_name=name,
+                    inst_name=inst_name,
                     res_type=res.res_type,
                     master_name=res.master_name,
                     filter_origin=res.origin,
-                    rteg_origin=origin,
+                    rteg_origin=rteg_origin,
                     rotation=res.rotation,
                     layers=layers,
                 )
@@ -131,6 +125,7 @@ if __name__ == "__main__":
 
     print(f"Filter: {filter_path}")
     print(f"Frame:  {FRAME_GDS}")
+    print(f"PPD:    {PPD_GDS}")
     print(f"Layermap: {LAYERMAP_PATH}")
     print(f"Output: {out_dir}\n")
 
@@ -145,7 +140,8 @@ if __name__ == "__main__":
             layer_preview += f" ... +{len(s.layers) - 4} more"
         print(
             f"  {s.cell_name}.gds\n"
-            f"    type={s.res_type}  master={s.master_name}\n"
-            f"    filter@={filt_xy}  centered@={rteg_xy}  rotation={rot_deg} deg\n"
+            f"    inst={s.inst_name}  type={s.res_type}  master={s.master_name}\n"
+            f"    filter@={filt_xy}  rteg@={rteg_xy}\n"
+            f"    rotation={rot_deg} deg\n"
             f"    layers: {layer_preview}"
         )

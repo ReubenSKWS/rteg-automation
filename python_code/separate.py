@@ -174,6 +174,7 @@ def separate(
             continue
         res = find_resonators(cell)
         if res:
+            # Stable order: parent-cell reference iteration (matches SKILL cplist).
             result[cell.name] = res
     return result
 

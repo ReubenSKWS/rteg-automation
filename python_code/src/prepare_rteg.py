@@ -20,7 +20,7 @@ from layer_labels import describe_layers, gds_pairs_in_cell
 from layermap import load_layermap
 from paths import DEFAULT_LAYERMAP
 from route_rteg import GOLDEN_DEFAULT, RouteConfig, resolve_allowed_layer_pairs
-from rteg_skill import (
+from rteg_utils import (
     add_foundation_refs,
     build_foundation,
     frame_top_cell,

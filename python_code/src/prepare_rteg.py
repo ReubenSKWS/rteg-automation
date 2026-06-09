@@ -1,8 +1,8 @@
 """
 Prepare resonator(s) as routing-ready RTEG input.
 
-Builds standalone RTEGs: GSG frame + ppd at top-left, resonator placed so its
-signal node is at the frame center, preserved metal and vias, golden layer trim.
+Builds standalone RTEGs: die frame at top-left, ppd centered in frame, resonator
+centered on the assembly, preserved metal and vias, golden layer trim.
 
 Output: draft_output/<parent>_RTEG1_<instName>_prepared.gds
 """
@@ -16,11 +16,13 @@ from pathlib import Path
 import gdstk
 
 import geometry as G
-from layermap import LAYERMAP_PATH, describe_layers, gds_pairs_in_cell, load_layermap
+from layer_labels import describe_layers, gds_pairs_in_cell
+from layermap import load_layermap
+from paths import DEFAULT_LAYERMAP
 from route_rteg import GOLDEN_DEFAULT, RouteConfig, resolve_allowed_layer_pairs
 from rteg_skill import (
-    FRAME_ORIGIN,
-    PPD_ORIGIN,
+    add_foundation_refs,
+    build_foundation,
     frame_top_cell,
     infer_inst_names,
     load_connect_backup,
@@ -131,7 +133,7 @@ def prepare_resonator(
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg = config or RouteConfig()
 
-    layermap = load_layermap(layermap_path)
+    layermap = load_layermap(layermap_path or DEFAULT_LAYERMAP)
     allowed = resolve_allowed_layer_pairs(cfg, golden_gds)
     filter_lib = gdstk.read_gds(filter_gds)
     frame_lib = gdstk.read_gds(frame_gds)
@@ -140,6 +142,7 @@ def prepare_resonator(
     frame_cell = frame_top_cell(frame_lib)
     frame_subcells = {c.name: c for c in frame_lib.cells}
     ppd_cell = next(c for c in ppd_lib.cells if c.name == PPD_TOP)
+    foundation = build_foundation(frame_cell, ppd_cell)
 
     resonators_by_parent = separate(filter_lib)
     parent, res_list = _select_parent(resonators_by_parent)
@@ -153,12 +156,11 @@ def prepare_resonator(
     inst_name = names[index]
     name = rteg_cell_name(parent, inst_name)
 
-    dx, dy = placement_shift(res, frame_cell, layermap)
+    dx, dy = placement_shift(res, frame_cell, ppd_cell, foundation=foundation)
     rteg_origin = (res.origin[0] + dx, res.origin[1] + dy)
 
     top = gdstk.Cell(name)
-    top.add(gdstk.Reference(frame_cell, origin=FRAME_ORIGIN))
-    top.add(gdstk.Reference(ppd_cell, origin=PPD_ORIGIN))
+    add_foundation_refs(top, frame_cell, ppd_cell, foundation)
     top.add(
         gdstk.Reference(
             res.reference.cell,
@@ -275,7 +277,7 @@ def _print_stats(stats: PrepareStats) -> None:
     rot_deg = round(stats.rotation * 180 / 3.141592653589793, 1)
     print(f"  {stats.cell_name}  ({stats.res_type}, inst={stats.inst_name})")
     print(f"    master={stats.master_name}")
-    print(f"    filter@={filt_xy}  rteg@={rteg_xy}  (signal node -> frame center)")
+    print(f"    filter@={filt_xy}  rteg@={rteg_xy}  (resonator -> assembly center)")
     print(f"    rotation={rot_deg} deg  vias={stats.via_count}")
     print(
         f"    preserved metal: {stats.preserved_poly_count} polys"
@@ -311,7 +313,7 @@ if __name__ == "__main__":
     print(f"Frame:    {FRAME_GDS}")
     print(f"PPD:      {PPD_GDS}")
     print(f"Golden:   {args.golden}")
-    print(f"Layermap: {LAYERMAP_PATH}\n")
+    print(f"Layermap: {DEFAULT_LAYERMAP}\n")
 
     if args.all:
         with warnings.catch_warnings(record=True) as caught:

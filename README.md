@@ -50,7 +50,7 @@ python build_rteg.py
 | `layermap.py` | Parses `layermap` into name ↔ (layer, datatype) lookups. Needed before any step that reads or writes geometry by layer name. |
 | `inspect_refs.py` | Debug view of the GDS — lists every placed component (references), where it sits, and any labels. Use when counts look wrong or instance names are missing. |
 | `separate.py` | Finds resonators, groups splits/cascades, and counts vias. This is the main identification step toward R-tag generation. |
-| `rteg_skill.py` | Shared helpers: top-left frame anchor, signal-node placement, inst-name inference, `connect_backup` loader. Used by `prepare_rteg.py` and `build_rteg.py`. |
+| `rteg_skill.py` | Shared helpers: `build_foundation` (frame + centered ppd), resonator placement, inst-name inference, `connect_backup` loader. Used by `prepare_rteg.py` and `build_rteg.py`. |
 | `build_rteg.py` | Exports one isolated resonator per GDS to `draft_output/` (frame + ppd + centered resonator) to verify separation. |
 
 ---
@@ -176,12 +176,12 @@ Exported 8 resonator(s):
 
 | Part | Meaning |
 |---|---|
-| `Exported 8 resonator(s)` | One GDS per resonator in `draft_output/` with frame at top-left and signal node at frame center |
+| `Exported 8 resonator(s)` | One GDS per resonator: frame at top-left, ppd centered in frame, resonator at assembly center |
 | `inst=S3` | Inferred or overridden Virtuoso-style instance name |
 | `filter@=(282.6, 183.1)` | Where it sat on the original filter die |
-| `rteg@=(148.3, 289.6)` | Resonator origin after placement shift (signal node -> frame center) |
+| `rteg@=(228.2, 290.0)` | Resonator origin after placement shift (bbox center -> assembly center) |
 
-Open each `.gds` in a layout viewer and confirm the GSG frame sits at top-left and the signal feed metal is near the frame center.
+Open each `.gds` in a layout viewer and confirm the ppd sits in the middle of the die frame and the resonator is centered in the overall cell.
 
 ---
 
@@ -215,7 +215,7 @@ Filter GDS + frame template + layermap
         ├── layermap.py      → layer name lookups
         ├── inspect_refs.py  → sanity-check the GDS export
         ├── separate.py      → resonator / via identification
-        ├── rteg_skill.py    → top-left frame, signal-node placement, naming, connect_backup
+        ├── rteg_skill.py    → build_foundation, placement, naming, connect_backup
         ├── build_rteg.py    → draft RTEG per resonator → draft_output/
         │
         └── prepare_rteg.py --all → frame + ppd + resonator + metal + vias

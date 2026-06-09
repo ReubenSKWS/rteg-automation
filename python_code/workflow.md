@@ -135,15 +135,16 @@ Output is printed to the terminal (8 resonators for `KB331_N_01`). Order follows
 
 Shared SKILL-aligned helpers (not run directly):
 
-- `placement_shift` — signal feed centroid (BAW_MTE series / BAW_MBE shunt) → frame center
-- `FRAME_ORIGIN` / `PPD_ORIGIN` — both anchor at cell top-left `(0, 0)`
+- `build_foundation` — die frame at top-left, ppd centered in frame, returns assembly bbox/center
+- `placement_shift` — resonator bbox center → assembly center (same shift for metal/vias)
+- `FRAME_ORIGIN` — die frame anchor `(0, 0)`; ppd origin is computed by `build_foundation`
 - `infer_inst_names` — best-effort `S1`/`P1`/… naming + JSON overrides
 - `load_connect_backup` — preserved-metal source with MTE/MBE fallback
 - Overlap and polygon-shift utilities
 
 ### 5. `build_rteg.py`
 
-**Visual sanity check only.** Exports one GDS per resonator with frame + `ppd_1port` at top-left and resonator shifted so the signal node sits at frame center. Open in KLayout to confirm separation picked the right geometry. No preserved metal or vias.
+**Visual sanity check only.** Exports one GDS per resonator with die frame at top-left, ppd centered in frame, and resonator centered on the assembly. Open in KLayout to confirm separation picked the right geometry. No preserved metal or vias.
 
 ---
 
@@ -169,8 +170,8 @@ python inspect_golden.py --prepared draft_output/KB331_N_01_RTEG1_S3_prepared.gd
 
 **What it builds (mirrors `rdsBawTEGAutoUpdateTemp`):**
 
-1. Top cell `{parent}_RTEG1_{instName}` with **frame** and **ppd_1port** at top-left `(0, 0)` (best-effort template; exact `_RTEG1_template` placement pending Virtuoso export).
-2. Resonator shifted so **signal node** (feed-layer centroid) lands on **frame center**; preserved metal and vias use the same shift.
+1. Top cell `{parent}_RTEG1_{instName}` with **die frame** at top-left and **ppd_1port** centered in the frame.
+2. Resonator shifted so **bbox center** lands on the **assembly center**; preserved metal and vias use the same shift.
 3. **Preserved metal** from `{parent}_connect_backup` if available; otherwise overlapping **connectMTE / connectMBE** polygons (same shift).
 4. Nearby **vtb** vias (bbox + 10 µm overlap test), shifted to match.
 5. **Trims** every cell to layers present in the golden — drops die-context fill (`BAW_BF*`, `BAW_TSV`, `EM_VPT`) and resonator extras.
@@ -315,4 +316,4 @@ After `route_rteg.py`, open `draft_output/ROUTE_S3_REPORT.md`. The sections that
 5. **Net overlay (§4b)** — SIGNAL / GROUND / OTHER classification
 6. **Missing-layer inventory** — what the golden has that v1 does not generate
 
-After `prepare_rteg.py --all`, check the terminal for connect_backup fallback warnings and per-resonator `rteg@` placement (signal node -> frame center).
+After `prepare_rteg.py --all`, check the terminal for connect_backup fallback warnings and per-resonator `rteg@` placement (resonator -> assembly center).

@@ -1,23 +1,16 @@
 """
-Parse Skyworks's layermap file into lookups between layer names and
-(layer_number, datatype) GDS pairs.
+Parse the Skyworks layermap file into layer name <-> (layer, datatype) lookups.
 
-The layermap format is whitespace-separated columns:
+Format (whitespace-separated):
 
     BAW_MBE     drawing 2  0
     BAW_MTE     drawing 5  0
     <name>      <purpose> <layer_number> <datatype>
-
-Blank lines are ignored.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
-import gdstk
-
-LAYERMAP_PATH = Path(__file__).parent / "layermap"
 
 
 @dataclass(frozen=True)
@@ -35,7 +28,6 @@ class LayerEntry:
 class LayerMap:
     def __init__(self, entries: list[LayerEntry]) -> None:
         self._by_name: dict[str, LayerEntry] = {e.name: e for e in entries}
-        # (layer, datatype) -> entry. First definition wins on collisions.
         self._by_pair: dict[tuple[int, int], LayerEntry] = {}
         for e in entries:
             self._by_pair.setdefault(e.gds_pair, e)
@@ -43,7 +35,8 @@ class LayerMap:
     @classmethod
     def from_file(cls, path: str | Path) -> "LayerMap":
         entries: list[LayerEntry] = []
-        for lineno, raw in enumerate(Path(path).read_text().splitlines(), start=1):
+        path = Path(path)
+        for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             line = raw.strip()
             if not line:
                 continue
@@ -77,45 +70,6 @@ class LayerMap:
         return len(self._by_name)
 
 
-def load_layermap(path: str | Path | None = None) -> LayerMap:
-    """Load the Skyworks layermap; defaults to ``LAYERMAP_PATH``."""
-    return LayerMap.from_file(path or LAYERMAP_PATH)
-
-
-def gds_pairs_in_cell(cell: gdstk.Cell) -> set[tuple[int, int]]:
-    """All (layer, datatype) pairs used by geometry in a cell."""
-    pairs: set[tuple[int, int]] = set()
-    for poly in cell.polygons:
-        pairs.add((poly.layer, poly.datatype))
-    for path in cell.paths:
-        layers = getattr(path, "layers", None)
-        datatypes = getattr(path, "datatypes", None)
-        if layers is not None and datatypes is not None:
-            for layer, datatype in zip(layers, datatypes):
-                pairs.add((layer, datatype))
-        else:
-            pairs.add((path.layer, path.datatype))
-    for label in cell.labels:
-        pairs.add((label.layer, label.texttype))
-    return pairs
-
-
-def describe_layers(pairs: set[tuple[int, int]], layermap: LayerMap) -> list[str]:
-    """Human-readable layer list, e.g. 'BAW_MBE (2/0)'."""
-    lines: list[str] = []
-    for layer, datatype in sorted(pairs):
-        name = layermap.name(layer, datatype)
-        label = name if name else "?"
-        lines.append(f"{label} ({layer}/{datatype})")
-    return lines
-
-
-if __name__ == "__main__":
-    import sys
-
-    lm = load_layermap(sys.argv[1] if len(sys.argv) > 1 else None)
-    print(f"Loaded {len(lm)} layers")
-    for nm in ("BAW_MBE", "BAW_MTE", "BAW_LABEL"):
-        if nm in lm:
-            print(f"  {nm}: {lm.pair(nm)}")
-    # print(f"  (2, 0) -> {lm.name(2, 0)}")
+def load_layermap(path: str | Path) -> LayerMap:
+    """Load the Skyworks layermap from ``path``."""
+    return LayerMap.from_file(path)

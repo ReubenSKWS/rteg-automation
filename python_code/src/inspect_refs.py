@@ -1,20 +1,16 @@
 """
 Inspect how instance identity survives GDS export.
 
-Defaults to the filter GDS and the ppd_1port probe-pad template used by the
-prepare/route test pipeline. Pass a path to inspect other files (e.g. prepared
-or routed draft outputs).
+Lists references and labels in a GDS library. All file paths are passed in by
+the caller (notebook, CLI, or other scripts).
 """
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import gdstk
-
-FILTER_GDS = Path(__file__).parent / "KB331_N_01_clean.gds"
-FRAME_GDS = Path(__file__).parent / "ppd_1port.gds"
-FRAME_TOP = "ppd_1port"
 
 
 def inspect_cell(cell: gdstk.Cell, max_refs: int = 15) -> None:
@@ -26,7 +22,7 @@ def inspect_cell(cell: gdstk.Cell, max_refs: int = 15) -> None:
             props = getattr(ref, "properties", None)
             print(
                 f"   -> {master:24s} @ {tuple(round(c, 2) for c in ref.origin)}"
-                f"  rot={ref.rotation}  props={props if props else '—'}"
+                f"  rot={ref.rotation}  props={props if props else '-'}"
             )
         if len(refs) > max_refs:
             print(f"   ... +{len(refs) - max_refs} more")
@@ -48,15 +44,38 @@ def inspect_cell(cell: gdstk.Cell, max_refs: int = 15) -> None:
             )
 
 
-def inspect_gds(path: Path) -> None:
+def inspect_gds(path: str | Path, *, max_refs: int = 15) -> None:
+    """Print hierarchy summary for one GDS file."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
     print(f"\n=== {path.name} ===")
     lib = gdstk.read_gds(path)
+    tops = {c.name for c in lib.top_level()}
     for cell in lib.cells:
-        if cell.references or cell.labels or cell.name in lib.top_level():
-            inspect_cell(cell)
+        if cell.references or cell.labels or cell.name in tops:
+            inspect_cell(cell, max_refs=max_refs)
+
+
+def inspect_gds_files(
+    paths: Sequence[str | Path],
+    *,
+    max_refs: int = 15,
+    skip_missing: bool = False,
+) -> None:
+    """Print hierarchy summary for each GDS path in ``paths``."""
+    for path in paths:
+        path = Path(path)
+        if not path.is_file():
+            if skip_missing:
+                print(f"ERROR: missing file: {path}")
+                continue
+            raise FileNotFoundError(path)
+        inspect_gds(path, max_refs=max_refs)
 
 
 if __name__ == "__main__":
-    paths = [Path(p) for p in sys.argv[1:]] if len(sys.argv) > 1 else [FILTER_GDS, FRAME_GDS]
-    for gds_path in paths:
-        inspect_gds(gds_path)
+    if len(sys.argv) < 2:
+        print("Usage: python inspect_refs.py <file.gds> [more.gds ...]", file=sys.stderr)
+        sys.exit(1)
+    inspect_gds_files(sys.argv[1:], skip_missing=True)

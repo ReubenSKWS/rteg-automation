@@ -2,37 +2,116 @@
 RTEG preprocessing helpers.
 
 Naming, preserved-metal loading, and frame placement for prepare_rteg.py and
-build_rteg.py. The GSG frame (KB331_N_Frame) sits at the cell top-left (0, 0).
-The resonator is shifted so its signal feed centroid lands on the frame center.
+build_rteg.py.
+
+Foundation layout (built before each resonator is placed):
+  1. Die frame (KB331_N_Frame) at the cell top-left
+  2. ppd_1port centered inside the die frame
+  3. Resonator bbox center aligned to the combined assembly center
 """
 from __future__ import annotations
 
 import json
 import math
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import gdstk
 
-from layermap import LayerMap, load_layermap
+from layermap import LayerMap
 from separate import Resonator
 
-DEFAULT_FRAME_W = 66.6  # legacy; not used for placement (centering is used instead)
+DEFAULT_FRAME_W = 66.6  # legacy; not used for placement
 CONNECT_BACKUP_MIN_POLYS = 10
 GOLDEN_ANCHOR_INDEX = 6
 GOLDEN_ANCHOR_INST_NAME = "S3"
 INST_MAP_PATH = Path(__file__).parent / "resonator_inst_map.json"
 
-# GSG frame and ppd template both anchor at the top-left of the RTEG cell.
+# Die frame anchors at the top-left of the RTEG cell; ppd origin is computed.
 FRAME_ORIGIN = (0.0, 0.0)
-PPD_ORIGIN = (0.0, 0.0)
 
 
-def _bbox_center(
+@dataclass(frozen=True)
+class RtegFoundation:
+    """Frame + ppd layout before the resonator is placed."""
+
+    frame_origin: tuple[float, float]
+    ppd_origin: tuple[float, float]
+    assembly_bbox: tuple[tuple[float, float], tuple[float, float]]
+
+    @property
+    def assembly_center(self) -> tuple[float, float]:
+        return bbox_center(self.assembly_bbox)
+
+
+def bbox_center(
     bbox: tuple[tuple[float, float], tuple[float, float]],
 ) -> tuple[float, float]:
     (x0, y0), (x1, y1) = bbox
     return (x0 + x1) / 2, (y0 + y1) / 2
+
+
+def _translate_bbox(
+    bbox: tuple[tuple[float, float], tuple[float, float]],
+    origin: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    (x0, y0), (x1, y1) = bbox
+    ox, oy = origin
+    return (x0 + ox, y0 + oy), (x1 + ox, y1 + oy)
+
+
+def _union_bbox(
+    a: tuple[tuple[float, float], tuple[float, float]],
+    b: tuple[tuple[float, float], tuple[float, float]],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    return (
+        (min(a[0][0], b[0][0]), min(a[0][1], b[0][1])),
+        (max(a[1][0], b[1][0]), max(a[1][1], b[1][1])),
+    )
+
+
+def build_foundation(
+    frame_cell: gdstk.Cell,
+    ppd_cell: gdstk.Cell,
+    frame_origin: tuple[float, float] = FRAME_ORIGIN,
+) -> RtegFoundation:
+    """
+    Step 1: place die frame at ``frame_origin``.
+    Step 2: center ppd_1port inside the frame bbox.
+    Returns origins plus the combined assembly bbox (for resonator centering).
+    """
+    frame_bb = frame_cell.bounding_box()
+    ppd_bb = ppd_cell.bounding_box()
+    if frame_bb is None:
+        raise ValueError("Frame cell has no bounding box")
+    if ppd_bb is None:
+        raise ValueError("ppd cell has no bounding box")
+
+    frame_world_bb = _translate_bbox(frame_bb, frame_origin)
+    fcx, fcy = bbox_center(frame_world_bb)
+    pcx, pcy = bbox_center(ppd_bb)
+    ppd_origin = (fcx - pcx, fcy - pcy)
+
+    ppd_world_bb = _translate_bbox(ppd_bb, ppd_origin)
+    assembly_bbox = _union_bbox(frame_world_bb, ppd_world_bb)
+
+    return RtegFoundation(
+        frame_origin=frame_origin,
+        ppd_origin=ppd_origin,
+        assembly_bbox=assembly_bbox,
+    )
+
+
+def add_foundation_refs(
+    top: gdstk.Cell,
+    frame_cell: gdstk.Cell,
+    ppd_cell: gdstk.Cell,
+    foundation: RtegFoundation,
+) -> None:
+    """Add frame and centered ppd references to a top cell."""
+    top.add(gdstk.Reference(frame_cell, origin=foundation.frame_origin))
+    top.add(gdstk.Reference(ppd_cell, origin=foundation.ppd_origin))
 
 
 def _signal_feed_layer(res: Resonator) -> str:
@@ -71,35 +150,39 @@ def _world_layer_centroid(
 def placement_shift(
     res: Resonator,
     frame_cell: gdstk.Cell,
+    ppd_cell: gdstk.Cell,
+    *,
+    foundation: RtegFoundation | None = None,
     layermap: LayerMap | None = None,
 ) -> tuple[float, float]:
     """
-    (dx, dy) placing the resonator so its signal node sits on the frame center.
+    (dx, dy) placing the resonator bbox center on the assembly center.
 
-    Signal node = centroid of the signal feed layer on the resonator master
-    (BAW_MTE for series, BAW_MBE for shunt). Falls back to bbox center if absent.
+    Builds (or reuses) the frame + centered-ppd foundation, then shifts the
+    resonator so its world bbox center matches ``foundation.assembly_center``.
     Preserved metal and vias receive the same shift.
-    """
-    layermap = layermap or load_layermap()
-    frame_bb = frame_cell.bounding_box()
-    if frame_bb is None:
-        raise ValueError("Frame cell has no bounding box")
-    fcx, fcy = _bbox_center(frame_bb)
 
-    anchor = _world_layer_centroid(res, _signal_feed_layer(res), layermap)
-    if anchor is None:
-        anchor = _bbox_center(resonator_world_bbox(res))
-    acx, acy = anchor
-    return fcx - acx, fcy - acy
+    ``layermap`` is accepted for backward compatibility but not used here.
+    """
+    _ = layermap  # unused; resonator placement is bbox-centered on the foundation
+    foundation = foundation or build_foundation(frame_cell, ppd_cell)
+    acx, acy = foundation.assembly_center
+    rcx, rcy = bbox_center(resonator_world_bbox(res))
+    return acx - rcx, acy - rcy
 
 
 def centering_shift(
     res: Resonator,
     frame_cell: gdstk.Cell,
+    ppd_cell: gdstk.Cell,
+    *,
+    foundation: RtegFoundation | None = None,
     layermap: LayerMap | None = None,
 ) -> tuple[float, float]:
-    """Alias for placement_shift (signal node → frame center)."""
-    return placement_shift(res, frame_cell, layermap)
+    """Alias for placement_shift (resonator bbox -> assembly center)."""
+    return placement_shift(
+        res, frame_cell, ppd_cell, foundation=foundation, layermap=layermap
+    )
 
 
 def rteg_cell_name(parent: str, inst_name: str) -> str:

@@ -16,6 +16,7 @@ from pathlib import Path
 import gdstk
 
 from layermap import LayerMap, load_layermap
+from paths import DEFAULT_LAYERMAP
 
 GOLDEN = Path(__file__).parent / "example_output" / "KB331_N_01_RTEG1_S3.gds"
 PREPARED = (
@@ -74,7 +75,7 @@ def _fmt_bbox(bbox) -> str:
 
 def build_notes(golden_path: Path = GOLDEN, prepared_path: Path = PREPARED) -> str:
     """Build the NOTES block as a markdown-ish string."""
-    layermap = load_layermap()
+    layermap = load_layermap(DEFAULT_LAYERMAP)
     golden = gdstk.read_gds(golden_path).cells[0]
     prep_lib = gdstk.read_gds(prepared_path)
     prepared = _find_prepared_top(prep_lib, prepared_path)
@@ -122,7 +123,7 @@ def grouped_missing_layers(
     with a provisional origin tag for SME review. Inventory only -- v1 does not
     generate these layers.
     """
-    layermap = load_layermap()
+    layermap = load_layermap(DEFAULT_LAYERMAP)
     golden = gdstk.read_gds(golden_path).cells[0]
     other = gdstk.read_gds(prepared_or_routed_path)
     other_cell = _find_prepared_top(other, prepared_or_routed_path)

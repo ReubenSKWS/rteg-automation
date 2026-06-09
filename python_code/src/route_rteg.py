@@ -34,6 +34,7 @@ import gdstk
 import geometry as G
 from inspect_golden import _find_prepared_top, build_notes, grouped_missing_layers
 from layermap import LayerMap, load_layermap
+from paths import DEFAULT_LAYERMAP
 
 PREPARED_DEFAULT = (
     Path(__file__).parent / "draft_output" / "KB331_N_01_RTEG1_S3_prepared.gds"
@@ -479,7 +480,7 @@ def route(
     config: RouteConfig | None = None,
 ) -> RouteResult:
     cfg = config or RouteConfig()
-    layermap = load_layermap()
+    layermap = load_layermap(DEFAULT_LAYERMAP)
     allowed = resolve_allowed_layer_pairs(cfg, golden_path)
 
     prep_lib = gdstk.read_gds(prepared_path)

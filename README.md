@@ -1,4 +1,4 @@
-# R-tag automation — Python pipeline
+# rTEG automation — Python pipeline
 
 Automates **R-tag (RTEG) test layouts** for BAW filters at Skyworks: take a clean filter GDS and produce per-resonator test structures inside a GSG probe frame. The manual flow today runs in **Cadence Virtuoso** via Jing Yang's SKILL script [`rdsBawTEGAutoFromTemp.il`](rdsBawTEGAutoFromTemp.il). This repo rebuilds that flow in Python.
 
@@ -14,10 +14,10 @@ For scope, constraints, and domain context see [`CLAUDE.md`](CLAUDE.md).
 | 2. Selection | Identify resonators and vias | Done |
 | 3. Separation | Center resonator in GSG PPD frame | Done |
 | 4. Setting up | Place assembly in die frame + export GDS | Done |
-| 5. Routing | MBE/MTE interconnect | Planned |
+| 5. Routing | MBE ground plate merge | Done (v1) |
 | 6. Verification | DRC-clean layout | Planned |
 
-Steps 1–4 run end-to-end in [`python_code/single_run.ipynb`](python_code/single_run.ipynb).
+Steps 1–5 run end-to-end in [`python_code/single_run.ipynb`](python_code/single_run.ipynb) (step 5 starts at resonator index 5 by default).
 
 ---
 
@@ -82,7 +82,10 @@ flowchart LR
     ppdprep --> frameprep
     frame --> frameprep
     frameprep --> export
+    frameprep --> route[route_rteg.py + ground_merge.py]
     lm --> export
+    lm --> route
+    route --> export
     export --> draft[draft_output/*.gds + .lyp]
 ```
 
@@ -133,9 +136,38 @@ Placement rules (inner MBE ring cavity, not the outer 460×580 bbox):
 
 Export writes only the reachable cell hierarchy (single top cell) and filters layers to the layermap. Open each `.gds` in KLayout with its matching `.lyp` for Skyworks layer names.
 
-### Steps 5–6 — Routing and DRC (not implemented)
+### Step 5 — Routing (MBE ground plate merge, v1)
 
-Interconnect routing, ground recut, via placement, and sign-off DRC will build on the in-memory assemblies from step 4.
+The ground side is built as a **boolean plate merge**, not a wire. The outer GSG ground arms, the right-hand MBE filler plate, and the resonator's preserved `connectMBE` connector are all one ground net: the pipeline unions them, auto-bridges any residual gap, fuses the preserved metal, then carves the DRC keepouts (center signal + MTE at 14 µm, resonator MBE at 14 µm, resonator-neighborhood release holes at 6 µm) and verifies one connected, clean ground body touching both ground pads. The center signal pad (`BAW_MTE`) is a carve obstacle, never fused.
+
+| Module | Role |
+|---|---|
+| `src/ground_merge.py` | Shared plate-merge pipeline: collect/precheck/union/bridge/connect/carve/verify (`GroundMergeConfig`, `run_ground_merge`) |
+| `src/route_primitives.py` | Pure geometry: grow/boolean/spacing helpers (and route shapes, kept for signal pass) |
+| `src/route_rteg.py` | `route_rteg_assemblies()` → `RtegRoutedAssembly` (carved `ground_body` + summary) |
+| `src/route_search.py` | `RouteSearchConfig` + candidate search — **retained for the future signal/MTE pass**, not used by the ground merge |
+| `src/agentic/` | Experimental LLM-driven plate merge over the same pipeline (see [`artifacts/AGENTIC_COMPARISON.md`](python_code/artifacts/AGENTIC_COMPARISON.md)) |
+
+**Assumption register** — enforced in code and documented in module docstrings:
+
+| ID | Assumption |
+|---|---|
+| A1 | GSG: outer top/bottom = ground (MBE), center = signal (MTE) |
+| A2 | Ground v1 merges plates only; center signal pad is a carve obstacle, never fused |
+| A3 | Preserved metal from `connectMBE` / `connect_backup`, `BAW_MBE` layer |
+| A4 | Overlap window = resonator filter bbox + `preserved_overlap_margin_um` |
+| A5 | Shifts translate resonator + preserved metal only (no rotation) |
+| A6 | PPD, die frame, and filler plate fixed |
+| A7 | Carve keepouts: signal/MTE +14 µm, resonator MBE +14 µm, release holes +6 µm (release holes filtered to the resonator neighborhood so pad-cavity `BAW_CAV` outlines are not carved) |
+| A10 | Ground collar not inferred — preserved MBE fused directly into the body |
+| A11 | Via at center pad flagged via `via_at_center_flag` (carved ground must not overlap the center signal pad) |
+| A14 | Layer numbers from layermap names only |
+
+Success = one connected carved component touches both ground pads **and** the preserved metal with zero net-aware DRC violations; `ground_body_hash` is a stable fingerprint of the carved body. Notebook section 5 has a reader-facing assumptions markdown cell and an explicit `GroundMergeConfig` before any routing code.
+
+### Step 6 — Verification (not implemented)
+
+Sign-off DRC and golden-layout comparison remain future work.
 
 ---
 
@@ -154,7 +186,8 @@ Interconnect routing, ground recut, via placement, and sign-off DRC will build o
 
 After the export cell in the notebook:
 
-- `{parent}_RTEG1_{index:02d}_{inst_name}_framed.gds` — one file per resonator (index disambiguates shared master names)
+- `{parent}_RTEG1_{index:02d}_{inst_name}_framed.gds` — step 4 frame assemblies
+- `{parent}_RTEG1_{index:02d}_{inst_name}_routed.gds` — step 5 routed assemblies (`status == "routed"` only)
 - Matching `.lyp` — KLayout layer properties from the layermap
 
 ---
@@ -168,7 +201,12 @@ After the export cell in the notebook:
 | `separate.py` | 2 |
 | `prep_resonator_ppd.py` | 3 |
 | `prep_rteg_frame.py` | 4 |
-| `export_gds.py` | 4 (export) |
+| `export_gds.py` | 4–5 (export) |
+| `ground_merge.py` | 5 (ground plate merge) |
+| `route_primitives.py` | 5 |
+| `route_search.py` | 5 (retained for future signal pass) |
+| `route_rteg.py` | 5 |
+| `agentic/` | 5 (experimental LLM plate merge) |
 | `rteg_utils.py` | shared geometry helpers |
 
 ---

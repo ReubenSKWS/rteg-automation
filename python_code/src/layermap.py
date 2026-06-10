@@ -63,6 +63,24 @@ class LayerMap:
         entry = self._by_pair.get((layer, datatype))
         return entry.name if entry else None
 
+    def entry(self, layer: int, datatype: int) -> LayerEntry | None:
+        """Full layermap row for a GDS pair, if mapped."""
+        return self._by_pair.get((layer, datatype))
+
+    def is_mapped(self, layer: int, datatype: int) -> bool:
+        return (layer, datatype) in self._by_pair
+
+    def known_pairs(self) -> frozenset[tuple[int, int]]:
+        """All ``(layer, datatype)`` pairs defined in the layermap."""
+        return frozenset(self._by_pair)
+
+    def entries_for_pairs(
+        self, pairs: set[tuple[int, int]] | frozenset[tuple[int, int]]
+    ) -> list[LayerEntry]:
+        """Layermap rows for the given GDS pairs, sorted by layer/datatype."""
+        out = [self._by_pair[p] for p in pairs if p in self._by_pair]
+        return sorted(out, key=lambda e: (e.layer, e.datatype))
+
     def __contains__(self, name: str) -> bool:
         return name in self._by_name
 

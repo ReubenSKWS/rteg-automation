@@ -1,3 +1,10 @@
 # Generated GDS/LYP exports — track folder only
 python_code/draft_output/*
 !python_code/draft_output/.gitkeep
+
+# Agentic experiment artifacts (traces may contain prompts) — track folder only
+python_code/artifacts/*
+!python_code/artifacts/.gitkeep
+
+# Local secrets (API keys)
+.env

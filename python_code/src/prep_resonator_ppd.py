@@ -1,8 +1,8 @@
 """
-Step 2: combine each resonator with the GSG PPD frame (resonator centered in PPD).
+Step 3 — Separation: center each resonator in the GSG PPD frame.
 
-Accepts ``res_df`` + ``Resonator`` objects from ``separate.identify()``.
-Returns in-memory assembly objects for notebook editing and a later frame step.
+Accepts ``res_df`` + ``Resonator`` objects from ``separate.identify()`` (step 2).
+Returns in-memory ``ResonatorPpdAssembly`` objects for step 4 and export.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pathlib import Path
 import gdstk
 import pandas as pd
 
-from rteg_utils import bbox_center, frame_top_cell, resonator_world_bbox
+from rteg_utils import bbox_center, frame_top_cell, resonator_world_bbox, translate_bbox
 from separate import Resonator
 
 # GSG PPD pad / frame metal vs resonator MBE+MTE (same layers, different cells).
@@ -33,15 +33,6 @@ class PpdSlotBounds:
     bottom_y0: float
 
 
-def _translate_bbox(
-    bbox: tuple[tuple[float, float], tuple[float, float]],
-    origin: tuple[float, float],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    (x0, y0), (x1, y1) = bbox
-    ox, oy = origin
-    return (x0 + ox, y0 + oy), (x1 + ox, y1 + oy)
-
-
 def ppd_assembly_center(
     ppd_cell: gdstk.Cell,
     ppd_origin: tuple[float, float] = (0.0, 0.0),
@@ -50,7 +41,7 @@ def ppd_assembly_center(
     ppd_bb = ppd_cell.bounding_box()
     if ppd_bb is None:
         raise ValueError("PPD cell has no bounding box")
-    return bbox_center(_translate_bbox(ppd_bb, ppd_origin))
+    return bbox_center(translate_bbox(ppd_bb, ppd_origin))
 
 
 def resonator_ppd_shift(
@@ -276,7 +267,7 @@ def avoid_ppd_frame_overlap(
 
 @dataclass
 class ResonatorPpdAssembly:
-    """In-memory PPD + centered resonator (step 2 of the modular pipeline)."""
+    """In-memory PPD + centered resonator (step 3)."""
 
     index: int
     inst_name: str

@@ -1,11 +1,11 @@
 """
-Identify resonators and vtb vias in a filter-variant GDS layout.
+Step 2 — Selection: identify resonators and vtb vias in the filter GDS.
 
-Ports identification rules from Jing Yang's SKILL script (rdsBawTEGAutoFromTemp.il):
+Rules from Jing Yang's SKILL script (``rdsBawTEGAutoFromTemp.il``):
 - Resonator masters start with: series, shunt, rcap, mimcap
 - Via masters start with: vtb
 
-This module only identifies instances — no layermap, routing, or RTEG assembly.
+Returns ``IdentificationResult`` for step 3+. No layermap or layout assembly here.
 """
 from __future__ import annotations
 
@@ -143,6 +143,7 @@ def find_vias(cell: gdstk.Cell) -> list[gdstk.Reference]:
 
 
 def group_splits(resonators: list[Resonator]) -> dict[str, list[Resonator]]:
+    """Group split/cascade resonators by base instance name (reserved for step 5)."""
     groups: dict[str, list[Resonator]] = {}
     for r in resonators:
         key = r.split_base or r.inst_name
@@ -153,6 +154,7 @@ def group_splits(resonators: list[Resonator]) -> dict[str, list[Resonator]]:
 def vias_near(
     res: Resonator, vias: list[gdstk.Reference], margin: float = 10.0
 ) -> list[gdstk.Reference]:
+    """Vias whose origin falls inside the resonator bbox + margin (reserved for step 5)."""
     rb = res.reference.cell.bounding_box()
     if rb is None:
         return []

@@ -1,9 +1,10 @@
 """
-Step 4: place each PPD+resonator assembly inside the die frame.
+Step 4 — Setting up: place each PPD+resonator assembly in the die frame.
 
-Accepts in-memory ``ResonatorPpdAssembly`` objects from ``prep_resonator_ppd``.
-Margins are measured from the inner die frame (MBE ring cavity), not the outer
-460×580 bbox. An MBE filler rectangle on the right normalizes RTEG width.
+Accepts in-memory ``ResonatorPpdAssembly`` objects from step 3
+(``prep_resonator_ppd``). Margins are measured from the inner die frame (MBE
+ring cavity), not the outer 460×580 bbox. An MBE filler rectangle on the right
+normalizes RTEG width.
 """
 from __future__ import annotations
 
@@ -17,22 +18,13 @@ import gdstk
 import pandas as pd
 
 from prep_resonator_ppd import ResonatorPpdAssembly
-from rteg_utils import bbox_center, frame_top_cell
+from rteg_utils import bbox_center, frame_top_cell, translate_bbox
 
 DEFAULT_X_MARGIN_PCT = 0.04
 DEFAULT_Y_MARGIN_PCT = 0.07
 MBE_LAYER = 2
 MBE_DATATYPE = 0
 INNER_FRAME_RING_MIN_AREA = 10_000.0
-
-
-def _translate_bbox(
-    bbox: tuple[tuple[float, float], tuple[float, float]],
-    origin: tuple[float, float],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    (x0, y0), (x1, y1) = bbox
-    ox, oy = origin
-    return (x0 + ox, y0 + oy), (x1 + ox, y1 + oy)
 
 
 def inner_die_frame_bbox(
@@ -62,7 +54,7 @@ def inner_die_frame_bbox(
         raise ValueError("Frame MBE ring is not a rectangular ring")
 
     local_bb = ((xs[1], ys[1]), (xs[2], ys[2]))
-    return _translate_bbox(local_bb, frame_origin)
+    return translate_bbox(local_bb, frame_origin)
 
 
 def _margined_content_bbox(
@@ -189,7 +181,7 @@ def _assembly_exceeds_content_x(
 
 @dataclass
 class RtegFrameAssembly:
-    """In-memory die frame + PPD/resonator assembly (step 4 of the modular pipeline)."""
+    """In-memory die frame + PPD/resonator assembly (step 4)."""
 
     index: int
     inst_name: str
@@ -238,10 +230,6 @@ class RtegFrameAssembly:
         }
 
 
-# Backward-compatible alias
-FrameAssembly = RtegFrameAssembly
-
-
 def prep_rteg_in_frame(
     assemblies: Sequence[ResonatorPpdAssembly],
     frame_gds: str | Path,
@@ -252,7 +240,7 @@ def prep_rteg_in_frame(
     y_margin_pct: float = DEFAULT_Y_MARGIN_PCT,
 ) -> list[RtegFrameAssembly]:
     """
-    Build one die-frame + PPD assembly per step-2 object.
+    Build one die-frame + PPD assembly per step-3 object.
 
     Margins are measured from the inner die frame cavity. Each assembly is
     left-aligned in X (4%) and centered in Y (7%), then an MBE rectangle fills

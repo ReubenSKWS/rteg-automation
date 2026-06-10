@@ -1,5 +1,8 @@
 """
-Parse the Skyworks layermap file into layer name <-> (layer, datatype) lookups.
+Step 1 — Process inputs: Skyworks layermap name ↔ GDS (layer, datatype) lookups.
+
+All geometry in steps 3–4 uses layer numbers from the source GDS. Export
+(``export_gds``) filters to mapped pairs and writes matching KLayout ``.lyp`` names.
 
 Format (whitespace-separated):
 

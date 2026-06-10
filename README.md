@@ -1,10 +1,23 @@
-# Python pipeline — R-tag automation
+# R-tag automation — Python pipeline
 
-This folder is the Python side of the R-tag project: automating per-resonator test layouts for BAW filters. The end goal is to take a filter GDS and output DRC-clean R-tag GDS files (probe pads + preserved metal + routing + vias). See `../CLAUDE.md` for full scope and constraints.
+Automates **R-tag (RTEG) test layouts** for BAW filters at Skyworks: take a clean filter GDS and produce per-resonator test structures inside a GSG probe frame. The manual flow today runs in **Cadence Virtuoso** via Jing Yang's SKILL script [`rdsBawTEGAutoFromTemp.il`](rdsBawTEGAutoFromTemp.il). This repo rebuilds that flow in Python.
 
-Today this folder handles **reading inputs, identifying resonators, SKILL-aligned RTEG preparation for all 8 resonators, and a frozen first-pass router** for golden S3. Full multi-resonator routing, fill-layer generation, and sign-off DRC are not implemented yet.
+For scope, constraints, and domain context see [`CLAUDE.md`](CLAUDE.md).
 
-The Python logic is ported from Jing Yang's Cadence SKILL script [`../rdsBawTEGAutoFromTemp.il`](../rdsBawTEGAutoFromTemp.il) — especially the resonator-finding rules (lines 178–179) and split/cascade grouping (lines 216–267). That script runs inside Virtuoso and already creates full RTEG cells; Python is rebuilding the same pipeline outside Virtuoso.
+---
+
+## Status
+
+| Step | Notebook section | Status |
+|---|---|---|
+| 1. Process inputs | Layermap + GDS sanity checks | Done |
+| 2. Selection | Identify resonators and vias | Done |
+| 3. Separation | Center resonator in GSG PPD frame | Done |
+| 4. Setting up | Place assembly in die frame + export GDS | Done |
+| 5. Routing | MBE/MTE interconnect | Planned |
+| 6. Verification | DRC-clean layout | Planned |
+
+Steps 1–4 run end-to-end in [`python_code/single_run.ipynb`](python_code/single_run.ipynb).
 
 ---
 
@@ -12,228 +25,165 @@ The Python logic is ported from Jing Yang's Cadence SKILL script [`../rdsBawTEGA
 
 ```powershell
 cd python_code
-pip install gdstk
+pip install gdstk pandas
 ```
 
----
-
-## Inputs
-
-| File | What it is |
-|---|---|
-| **`KB331_N_01_clean.gds`** | Filter layout exported from Virtuoso. Must be a **clean** (hierarchical) export — not dense/flattened. A sample copy lives in this folder. |
-| **`KB331_N_Frame.gds`** | Full R-tag frame (460×580 µm, matches the golden). Frame template for `prepare_rteg.py` and the route pipeline. |
-| **`ppd_1port.gds`** | Single-port probe-pad device (`ppd_1port`, 240×225 µm), same cell the SKILL flow uses. Included in prepared output; `route_rteg.py` uses it for signal-pad launch lookup. |
-| **`resonator_inst_map.json`** | Optional index → instName overrides (e.g. `"6": "S3"` for golden anchor). Inferred names otherwise come from sorted filter placement. |
-| **`layermap`** | Skyworks layer-name table. Maps names like `BAW_MBE` to GDS layer numbers `(2, 0)`. |
-
-| Folder | What it is |
-|---|---|
-| **`example_output/`** | Ground truth reference layouts (read-only; never written by Python). Holds `KB331_N_01_RTEG1_S3.gds`, the golden the router is compared against. |
-| **`draft_output/`** | Python-generated draft RTEG GDS files and the route report. |
+Open `single_run.ipynb` and run all cells top-to-bottom. The notebook resolves paths from `python_code/` (needs `input_files/` and `src/`).
 
 ---
 
-## Run the scripts
+## How to run
 
-All scripts default to the sample files above. Run from `python_code/`:
+**Primary entry point:** `python_code/single_run.ipynb`
+
+Optional CLI checks (from `python_code/`, with `src/` on `PYTHONPATH` or run via notebook path setup):
 
 ```powershell
-python layermap.py
-python inspect_refs.py
-python separate.py
-python build_rteg.py
+python src/separate.py input_files/KB331_N_01.gds
+python src/inspect_refs.py input_files/KB331_N_01.gds input_files/KB331_N_Frame.gds
 ```
-
-| Script | What it does |
-|---|---|
-| `layermap.py` | Parses `layermap` into name ↔ (layer, datatype) lookups. Needed before any step that reads or writes geometry by layer name. |
-| `inspect_refs.py` | Debug view of the GDS — lists every placed component (references), where it sits, and any labels. Use when counts look wrong or instance names are missing. |
-| `separate.py` | Finds resonators, groups splits/cascades, and counts vias. This is the main identification step toward R-tag generation. |
-| `rteg_skill.py` | Shared helpers: `build_foundation` (frame + centered ppd), resonator placement, inst-name inference, `connect_backup` loader. Used by `prepare_rteg.py` and `build_rteg.py`. |
-| `build_rteg.py` | Exports one isolated resonator per GDS to `draft_output/` (frame + ppd + centered resonator) to verify separation. |
 
 ---
 
-## SKILL-aligned prepare (all 8) + frozen routing (S3 v1)
+## Pipeline (matches the notebook)
 
-Pre-routing assembly: template (frame + `ppd_1port`), resonator centered in the frame, preserved metal from `connect_backup` (MTE/MBE fallback). See [`workflow.md`](workflow.md) for the full flow.
+```mermaid
+flowchart LR
+    subgraph inputs [Inputs]
+        filter[KB331_N_01.gds]
+        frame[KB331_N_Frame.gds]
+        ppd[GSG_frame.gds]
+        lm[layermap]
+    end
 
-```powershell
-python prepare_rteg.py --all
-python inspect_golden.py
+    subgraph step1 [Step 1]
+        layermap[layermap.py]
+        inspect[inspect_refs.py]
+    end
+
+    subgraph step2 [Step 2]
+        sep[separate.py]
+    end
+
+    subgraph step3 [Step 3]
+        ppdprep[prep_resonator_ppd.py]
+    end
+
+    subgraph step4 [Step 4]
+        frameprep[prep_rteg_frame.py]
+        export[export_gds.py]
+    end
+
+    lm --> layermap
+    filter --> inspect
+    filter --> sep
+    sep --> ppdprep
+    ppd --> ppdprep
+    ppdprep --> frameprep
+    frame --> frameprep
+    frameprep --> export
+    lm --> export
+    export --> draft[draft_output/*.gds + .lyp]
 ```
 
-Routing (`route_rteg.py`) is unchanged — pass the new prepared path when resuming:
+### Step 1 — Process inputs
 
-```powershell
-python route_rteg.py --prepared draft_output/KB331_N_01_RTEG1_S3_prepared.gds
-```
+Load the Skyworks layermap and confirm GDS hierarchy looks correct.
 
-| Script | What it does | Output |
-|---|---|---|
-| `prepare_rteg.py` | Builds standalone RTEGs for all 8 resonators (or `--index N`). Resonator centered in frame, preserved metal, vias, golden layer trim. | `draft_output/KB331_N_01_RTEG1_{instName}_prepared.gds` |
-| `inspect_golden.py` | Read-only diff of golden vs prepared. | prints NOTES; `--prepared` / `--golden` flags |
-| `geometry.py` | Helper library (not run directly): booleans, routable region, nets, golden metrics. | — |
-| `route_rteg.py` | **Frozen v1** — signal route, ground recut, net-aware DRC, report. Defaults still reference old `06_series` paths. | `*_routed.gds`, `ROUTE_S3_REPORT.md` |
+| Module | Role |
+|---|---|
+| `src/layermap.py` | Parse `input_files/layermap` → name ↔ `(layer, datatype)` |
+| `src/inspect_refs.py` | List references and labels in filter, frame, and PPD GDS |
 
-**Scope of v1 (read `ROUTE_S3_REPORT.md` for the full picture):** the router
-draws a simple signal connector, recuts the real `KB331_N_Frame` ground, and
-checks signal-vs-ground spacing per net. The **headline metric is MBE/MTE
-overlap area vs the golden** (not layer-count match, which is dominated by fill
-layers v1 does not generate). It does not claim parity with the golden. The
-signal connector is limited to straight / single-45° / one L-bend — anything
-harder is logged as "needs real router" rather than detoured. Several inputs are
-assumptions flagged for SME review: the signal-vs-ground side rule for series
-resonators, the release-hole layer set, the `ppd_1port`-to-pad mapping, and
-whether index 06 is exactly the Virtuoso `S3` instance. The golden's fill/`BAW_H*`/TF
-layers are inventoried (grouped, tagged) for SME follow-up but never synthesized.
+### Step 2 — Selection
+
+Find resonators and vias under the filter parent cell.
+
+| Module | Role |
+|---|---|
+| `src/separate.py` | `identify(filter_gds)` → `res_df`, `res_list`, `via_df` |
+
+Identification rules match the SKILL script: masters starting with `series`, `shunt`, `rcap`, `mimcap`; vias with `vtb`.
+
+### Step 3 — Separation
+
+For each resonator, build an in-memory **PPD + centered resonator** assembly.
+
+| Module | Role |
+|---|---|
+| `src/prep_resonator_ppd.py` | `prep_resonator_ppd(res_df, res_list, ppd_gds)` → `ppd_assemblies` |
+| `src/rteg_utils.py` | Shared bbox / top-cell helpers |
+
+Centering uses bbox alignment only (no scale). A 10 µm axis-aligned nudge keeps resonator MBE/MTE clear of GSG pad metal.
+
+### Step 4 — Setting up
+
+Place each PPD assembly in the die frame and export GDS.
+
+| Module | Role |
+|---|---|
+| `src/prep_rteg_frame.py` | `prep_rteg_in_frame(ppd_assemblies, frame_gds)` → `rteg_assemblies` |
+| `src/export_gds.py` | `export_gds(..., layermap=layermap)` → one GDS + `.lyp` per resonator |
+
+Placement rules (inner MBE ring cavity, not the outer 460×580 bbox):
+
+- **X:** left-aligned at 4% margin inside the inner frame
+- **Y:** assembly bbox centered at 7% margin band
+- **MBE filler:** rectangle from inner-frame center to the margined right edge, height = placed assembly bbox
+
+Export writes only the reachable cell hierarchy (single top cell) and filters layers to the layermap. Open each `.gds` in KLayout with its matching `.lyp` for Skyworks layer names.
+
+### Steps 5–6 — Routing and DRC (not implemented)
+
+Interconnect routing, ground recut, via placement, and sign-off DRC will build on the in-memory assemblies from step 4.
 
 ---
 
-## Example output — how to read it
+## Inputs (`python_code/input_files/`)
 
-### `layermap.py`
-
-```
-Loaded 155 layers
-  BAW_MBE: (2, 0)
-  BAW_MTE: (5, 0)
-  BAW_LABEL: (100, 0)
-```
-
-| Line | Meaning |
+| File | Role |
 |---|---|
-| `Loaded 155 layers` | Parsed 155 entries from `layermap` |
-| `BAW_MBE: (2, 0)` | Layer name `BAW_MBE` = GDS layer **2**, datatype **0** |
-| `BAW_MTE: (5, 0)` | Top-metal layer MTE is GDS layer 5 |
-
-When you later copy or check metal polygons, you'll use these numbers to know which GDS layer is MBE vs MTE.
+| `KB331_N_01.gds` | Clean hierarchical filter layout |
+| `KB331_N_Frame.gds` | Die frame template (460×580 µm outer bbox) |
+| `GSG_frame.gds` | GSG PPD / probe-pad reference |
+| `layermap` | Skyworks layer-name table |
 
 ---
 
-### `inspect_refs.py`
+## Outputs (`python_code/draft_output/`)
 
-```
-KB331_N_01: 17 references
-   -> shuntq3_CDNS_780903262810 @ (282.6, 183.1)  rot=0.0  props=—
-   -> seriesq3_CDNS_780903262811 @ (95.8, 145.1)  rot=1.57  props=—
-   -> vtb3_CDNS_780903262813   @ (208.6, 127.4)  rot=4.71  props=—
-   -> KB331_N_01_connectMTE    @ (0.0, 0.0)  rot=0.0  props=—
-```
+After the export cell in the notebook:
 
-| Part | Meaning |
-|---|---|
-| `KB331_N_01: 17 references` | The filter cell has 17 placed sub-components |
-| `-> shuntq3_...` | A **shunt resonator** placed at (282.6, 183.1) µm |
-| `-> seriesq3_...` | A **series resonator** |
-| `-> vtb3_...` | A **via** connecting MBE ↔ MTE |
-| `-> KB331_N_01_connectMTE` | The filter's **interconnect metal** |
-| `rot=1.57` | Rotation in radians (~90°). `0` = none, `3.14` ≈ 180°, `4.71` ≈ 270° |
-| `props=—` | No Virtuoso instance name survived export (no `S1A`, `P3`, etc.) |
-
-The cell you care about most is **`KB331_N_01`** — that's the filter die. Other cells like `KB331_N_Frame` are the probe-pad template frame.
+- `{parent}_RTEG1_{index:02d}_{inst_name}_framed.gds` — one file per resonator (index disambiguates shared master names)
+- Matching `.lyp` — KLayout layer properties from the layermap
 
 ---
 
-### `separate.py`
+## Source layout (`python_code/src/`)
 
-```
-GDS: ...\KB331_N_01_clean.gds
-Cells with resonators: 1
-
-KB331_N_01: 8 resonators, 6 groups, 4 vias
-  shuntq3_CDNS_780903262810      shunt    @ (282.6, 183.1)
-  seriesq3_CDNS_780903262811     series   @ (95.8, 145.1)
-  ...
-```
-
-| Part | Meaning |
+| File | Step |
 |---|---|
-| `Cells with resonators: 1` | One filter-variant cell contains resonators |
-| `8 resonators` | 8 testable pieces found (masters starting with `series`, `shunt`, `rcap`, or `mimcap`) |
-| `6 groups` | Split/cascade families. Here mostly one resonator per group because instance names didn't survive GDS export |
-| `4 vias` | Four `vtb` structures in that cell |
-| Each line | Instance name (or master fallback) · type · position on the die |
-
-This is the list the SKILL script uses to decide which RTEG cells to create (e.g. `KB331_N_01_RTEG1_S1A`).
+| `layermap.py` | 1 |
+| `inspect_refs.py` | 1 |
+| `separate.py` | 2 |
+| `prep_resonator_ppd.py` | 3 |
+| `prep_rteg_frame.py` | 4 |
+| `export_gds.py` | 4 (export) |
+| `rteg_utils.py` | shared geometry helpers |
 
 ---
 
-### `build_rteg.py`
+## Concepts
 
-```
-Filter: ...\KB331_N_01_clean.gds
-Output: ...\draft_output
-
-Exported 8 resonator(s):
-
-  KB331_N_01_RTEG1_00_shunt.gds
-    type=shunt  master=shuntq3_CDNS_780903262810
-    filter@=(282.6, 183.1)  rotation=0.0 deg
-  ...
-```
-
-| Part | Meaning |
+| Term | Meaning |
 |---|---|
-| `Exported 8 resonator(s)` | One GDS per resonator: frame at top-left, ppd centered in frame, resonator at assembly center |
-| `inst=S3` | Inferred or overridden Virtuoso-style instance name |
-| `filter@=(282.6, 183.1)` | Where it sat on the original filter die |
-| `rteg@=(228.2, 290.0)` | Resonator origin after placement shift (bbox center -> assembly center) |
-
-Open each `.gds` in a layout viewer and confirm the ppd sits in the middle of the die frame and the resonator is centered in the overall cell.
+| **R-tag / RTEG** | Per-resonator test layout in a GSG frame |
+| **PPD** | Probe-pad device (`GSG_frame.gds`) |
+| **Preserved metal** | Filter interconnect kept exact near the resonator (step 5+) |
+| **Layermap** | Maps `BAW_MBE`, `BAW_MTE`, … to GDS layer/datatype pairs |
 
 ---
 
-### `route_rteg.py`
+## Reference layouts
 
-```
-=== Route log ===
-  resonator world bbox: (160.5, 235.5)-(299.5, 344.5)
-  signal metal (BAW_MTE) polys near resonator: 4
-  recut ground plane: 1 polys
-  DRC self-check MBE vs MTE @ 14.0um: 3 violation polys
-Golden diff: 26/95 layers match on count
-```
-
-| Part | Meaning |
-|---|---|
-| `resonator world bbox` | Where resonator 06 lands inside the frame |
-| `recut ground plane: 1 polys` | The frame's full ground fill, carved back around the resonator/signal/release holes |
-| `DRC self-check ... 3 violation polys` | MBE/MTE overlaps — here all within the connected resonator net (same net), not unconnected-spacing failures |
-| `Golden diff: 26/95 layers match` | How many layers match the golden on polygon count; large mismatch is expected since v1 omits fill layers |
-
-The detailed assumptions, golden NOTES, and per-layer diff table are written to `draft_output/ROUTE_S3_REPORT.md`.
-
----
-
-## Where this fits in the project
-
-```
-Filter GDS + frame template + layermap
-        │
-        ├── layermap.py      → layer name lookups
-        ├── inspect_refs.py  → sanity-check the GDS export
-        ├── separate.py      → resonator / via identification
-        ├── rteg_skill.py    → build_foundation, placement, naming, connect_backup
-        ├── build_rteg.py    → draft RTEG per resonator → draft_output/
-        │
-        └── prepare_rteg.py --all → frame + ppd + resonator + metal + vias
-                │            (geometry.py = boolean/offset/DRC helpers)
-                ├── inspect_golden.py → golden vs prepared NOTES
-                ▼
-            route_rteg.py    → frozen v1 on S3 (pass --prepared for new names)
-                ▼
-        [future] fill layers, multi-resonator routing, sign-off DRC
-```
-
-| Done today | Not built yet |
-|---|---|
-| Read GDS and layermap | Fill/`BAW_H*`/TF layer generation |
-| Identify resonators, vias, splits | Multi-resonator + split/cascade routing |
-| Export isolated resonator GDS per piece | Split/cascade / Infra35 RTEGs |
-| SKILL-aligned prepare for all 8 resonators | Confirmed signal/ground rule per resonator type |
-| connect_backup path + MTE/MBE fallback | Full `{filter}_connect_backup` export from Virtuoso |
-| Recut ground plane, naive signal route, DRC (S3 v1, frozen) | Multi-resonator routing + updated route defaults |
-
-The SKILL script (`rdsBawTEGAutoFromTemp.il`) already does the full flow in Virtuoso — copy template, place resonator, copy metal/vias, update labels. Python will eventually replace that end-to-end.
+Golden/manual layouts live outside this pipeline (e.g. Virtuoso exports under `KB331_files/`). They are reference only — step 4 output is generated in-memory and written to `draft_output/` when you run export.

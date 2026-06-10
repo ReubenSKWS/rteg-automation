@@ -1,8 +1,8 @@
 """
-Inspect how instance identity survives GDS export.
+Step 1 — Process inputs: inspect GDS hierarchy and reference properties.
 
-Lists references and labels in a GDS library. All file paths are passed in by
-the caller (notebook, CLI, or other scripts).
+Lists placed instances and labels so you can confirm the filter export is
+hierarchical and see whether Virtuoso instance names survived export.
 """
 from __future__ import annotations
 

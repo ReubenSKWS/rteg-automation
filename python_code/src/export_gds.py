@@ -1,12 +1,12 @@
 """
-Write in-memory RTEG assemblies to standalone GDS files.
+Export in-memory assemblies to standalone GDS files (after step 4, or any stage).
 
-Works with any pipeline object that exposes ``index``, ``inst_name``,
-``top_cell``, ``library``, and ``flatten()`` — e.g. ``ResonatorPpdAssembly``
-(step 3) or ``RtegFrameAssembly`` (step 4), and future routed assemblies.
+Accepts objects with ``index``, ``inst_name``, ``top_cell``, ``library``, and
+``flatten()`` — e.g. ``ResonatorPpdAssembly`` (step 3) or ``RtegFrameAssembly``
+(step 4). Future routed assemblies can use the same API.
 
-When a layermap is supplied, export keeps only geometry on mapped GDS pairs
-and writes a matching KLayout ``.lyp`` sidecar with Skyworks layer names.
+When ``layermap`` is supplied, export keeps only mapped GDS pairs and writes a
+matching KLayout ``.lyp`` sidecar with Skyworks layer names.
 """
 from __future__ import annotations
 
@@ -274,13 +274,14 @@ def default_gds_filename(
     """
     Build a GDS filename for one assembly.
 
-    When ``parent`` is set (filter parent cell name), uses the SKILL-style
-    ``{parent}_RTEG1_{inst_name}[_stage].gds`` pattern. Otherwise uses the
-    assembly top cell name.
+    When ``parent`` is set (filter parent cell name), uses
+    ``{parent}_RTEG1_{index:02d}_{inst_name}[_stage].gds``. The numeric index
+    disambiguates resonators that share the same master-based ``inst_name`` when
+    Virtuoso instance names are missing from the GDS export.
     """
     if parent:
         suffix = f"_{stage}" if stage else ""
-        return f"{parent}_RTEG1_{assembly.inst_name}{suffix}.gds"
+        return f"{parent}_RTEG1_{assembly.index:02d}_{assembly.inst_name}{suffix}.gds"
     return f"{assembly.top_cell.name}.gds"
 
 

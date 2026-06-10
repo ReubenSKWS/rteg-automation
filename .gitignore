@@ -1,0 +1,3 @@
+# Generated GDS/LYP exports — track folder only
+python_code/draft_output/*
+!python_code/draft_output/.gitkeep

@@ -2,7 +2,7 @@
 Shared RTEG helpers for naming, preserved metal, and frame-stage placement.
 
 Used by prepare_rteg.py / build_rteg.py until they adopt the modular
-prep_resonator_ppd + prep_ppd_frame pipeline.
+prep_resonator_ppd + prep_rteg_frame pipeline.
 """
 from __future__ import annotations
 

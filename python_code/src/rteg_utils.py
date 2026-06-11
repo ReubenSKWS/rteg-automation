@@ -1,8 +1,8 @@
 """
 Shared geometry helpers for the modular R-tag pipeline.
 
-Used by ``prep_resonator_ppd`` (step 3), ``prep_rteg_frame`` (step 4), and
-``export_gds``. Step 5 routing may extend this module later.
+Used by ``prep_resonator_ppd`` (step 3), ``prep_rteg_frame`` (step 4),
+``rteg_collect`` (step 5.1), and ``export_gds``.
 """
 from __future__ import annotations
 

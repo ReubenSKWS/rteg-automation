@@ -6,6 +6,7 @@ Returns in-memory ``ResonatorPpdAssembly`` objects for step 4 and export.
 """
 from __future__ import annotations
 
+import math
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,8 +21,11 @@ from separate import Resonator
 # GSG PPD pad / frame metal vs resonator MBE+MTE (same layers, different cells).
 PPD_PAD_LAYERS = frozenset({(33, 0), (81, 0), (202, 0), (2, 0)})
 RESONATOR_METAL_LAYERS = frozenset({(2, 0), (5, 0)})
+# BAW_ReF + BAW_CAV on the resonator (layermap layer/datatype pairs).
+RELEASE_HOLE_LAYERS = frozenset({(33, 0), (36, 0)})
 MIN_KEEPOUT_POLY_AREA = 10.0
 MIN_FRAME_CLEARANCE_UM = 10.0
+MIN_RELEASE_HOLE_CLEARANCE_UM = 6.0
 
 
 @dataclass(frozen=True)
@@ -102,12 +106,14 @@ def ppd_slot_bounds(keepout_polys: Sequence[gdstk.Polygon]) -> PpdSlotBounds:
     return PpdSlotBounds(left_x1=left_x1, top_y1=top_y1, bottom_y0=bottom_y0)
 
 
-def resonator_metal_polys(
+def _shifted_resonator_polys(
     res: Resonator,
     dx: float,
     dy: float,
+    *,
+    layers: frozenset[tuple[int, int]],
 ) -> list[gdstk.Polygon]:
-    """Resonator MBE/MTE polygons after applying ``(dx, dy)`` to the filter placement."""
+    """Flattened resonator polygons on ``layers`` after ``(dx, dy)`` placement."""
     origin = (res.origin[0] + dx, res.origin[1] + dy)
     ref = gdstk.Reference(
         res.reference.cell,
@@ -116,13 +122,31 @@ def resonator_metal_polys(
         magnification=res.magnification,
         x_reflection=res.x_reflection,
     )
-    tmp = gdstk.Cell("_res_metal")
+    tmp = gdstk.Cell("_res_polys")
     tmp.add(ref)
     return [
         poly
         for poly in tmp.flatten().polygons
-        if (poly.layer, poly.datatype) in RESONATOR_METAL_LAYERS
+        if (poly.layer, poly.datatype) in layers
     ]
+
+
+def resonator_metal_polys(
+    res: Resonator,
+    dx: float,
+    dy: float,
+) -> list[gdstk.Polygon]:
+    """Resonator MBE/MTE polygons after applying ``(dx, dy)`` to the filter placement."""
+    return _shifted_resonator_polys(res, dx, dy, layers=RESONATOR_METAL_LAYERS)
+
+
+def resonator_release_hole_polys(
+    res: Resonator,
+    dx: float,
+    dy: float,
+) -> list[gdstk.Polygon]:
+    """Resonator BAW_ReF / BAW_CAV polygons after ``(dx, dy)`` placement."""
+    return _shifted_resonator_polys(res, dx, dy, layers=RELEASE_HOLE_LAYERS)
 
 
 def _metal_bbox(
@@ -163,6 +187,24 @@ def _grown_keepout_polys(
     return grown
 
 
+def polys_satisfy_clearance(
+    polys: Sequence[gdstk.Polygon],
+    keepout_polys: Sequence[gdstk.Polygon],
+    *,
+    min_gap: float,
+) -> bool:
+    """True when every polygon is at least ``min_gap`` from every keepout polygon."""
+    if min_gap <= 0:
+        return not metal_overlaps_keepout(polys, keepout_polys)
+
+    clearance_zone = _grown_keepout_polys(keepout_polys, min_gap)
+    for poly in polys:
+        for zone in clearance_zone:
+            if gdstk.boolean(poly, zone, "and"):
+                return False
+    return True
+
+
 def metal_satisfies_frame_clearance(
     metal_polys: Sequence[gdstk.Polygon],
     keepout_polys: Sequence[gdstk.Polygon],
@@ -170,15 +212,43 @@ def metal_satisfies_frame_clearance(
     min_gap: float = MIN_FRAME_CLEARANCE_UM,
 ) -> bool:
     """True when resonator metal is at least ``min_gap`` from every pad polygon."""
-    if min_gap <= 0:
-        return not metal_overlaps_keepout(metal_polys, keepout_polys)
+    return polys_satisfy_clearance(metal_polys, keepout_polys, min_gap=min_gap)
 
-    clearance_zone = _grown_keepout_polys(keepout_polys, min_gap)
-    for metal in metal_polys:
-        for zone in clearance_zone:
-            if gdstk.boolean(metal, zone, "and"):
-                return False
+
+def ppd_clearance_satisfied(
+    metal_polys: Sequence[gdstk.Polygon],
+    release_polys: Sequence[gdstk.Polygon],
+    keepout_polys: Sequence[gdstk.Polygon],
+    *,
+    min_metal_gap: float = MIN_FRAME_CLEARANCE_UM,
+    min_release_gap: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
+) -> bool:
+    """Metal and release-hole clearance vs the GSG PPD frame."""
+    if not polys_satisfy_clearance(metal_polys, keepout_polys, min_gap=min_metal_gap):
+        return False
+    if release_polys and not polys_satisfy_clearance(
+        release_polys, keepout_polys, min_gap=min_release_gap
+    ):
+        return False
     return True
+
+
+def min_clearance_um(
+    polys: Sequence[gdstk.Polygon],
+    keepout_polys: Sequence[gdstk.Polygon],
+) -> float:
+    """Minimum vertex-sample spacing from ``polys`` to ``keepout_polys`` (0 = overlap)."""
+    best = float("inf")
+    for poly in polys:
+        for keepout in keepout_polys:
+            if gdstk.boolean(poly, keepout, "and"):
+                return 0.0
+            for pa in poly.points:
+                for pb in keepout.points:
+                    d = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+                    if d < best:
+                        best = d
+    return 0.0 if best == float("inf") else best
 
 
 def avoid_ppd_frame_overlap(
@@ -189,14 +259,16 @@ def avoid_ppd_frame_overlap(
     *,
     ppd_origin: tuple[float, float] = (0.0, 0.0),
     min_gap: float = MIN_FRAME_CLEARANCE_UM,
-    max_iterations: int = 12,
+    min_release_gap: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
+    max_iterations: int = 24,
 ) -> tuple[float, float]:
     """
     Extra ``(dx, dy)`` nudging the resonator on one axis at a time to clear PPD pads.
 
     Starts from the centered shift ``(dx, dy)``. Only x/y translation is applied;
     resonator rotation and magnification are unchanged. Keeps at least ``min_gap``
-    between the closest points of resonator MBE/MTE and GSG pad metal.
+    between resonator MBE/MTE and GSG pad metal, and ``min_release_gap`` between
+    resonator BAW_ReF / BAW_CAV release holes and the GSG frame.
     """
     keepouts = ppd_pad_keepout_polys(ppd_cell, ppd_origin)
     if not keepouts:
@@ -205,27 +277,45 @@ def avoid_ppd_frame_overlap(
     slot = ppd_slot_bounds(keepouts)
     extra_dx = 0.0
     extra_dy = 0.0
+    drive_gap = max(min_gap, min_release_gap)
+
+    def _placed_polys(shift_x: float, shift_y: float) -> tuple[list[gdstk.Polygon], list[gdstk.Polygon]]:
+        tx, ty = dx + shift_x, dy + shift_y
+        return (
+            resonator_metal_polys(res, tx, ty),
+            resonator_release_hole_polys(res, tx, ty),
+        )
+
+    def _satisfied(shift_x: float, shift_y: float) -> bool:
+        metal, release = _placed_polys(shift_x, shift_y)
+        return ppd_clearance_satisfied(
+            metal,
+            release,
+            keepouts,
+            min_metal_gap=min_gap,
+            min_release_gap=min_release_gap,
+        )
 
     for _ in range(max_iterations):
-        metal = resonator_metal_polys(res, dx + extra_dx, dy + extra_dy)
-        if metal_satisfies_frame_clearance(metal, keepouts, min_gap=min_gap):
+        if _satisfied(extra_dx, extra_dy):
             return extra_dx, extra_dy
 
-        bbox = _metal_bbox(metal)
+        metal, release = _placed_polys(extra_dx, extra_dy)
+        bbox = _metal_bbox([*metal, *release])
         if bbox is None:
             return extra_dx, extra_dy
 
         (x0, y0), (x1, y1) = bbox
         moved = False
 
-        if x0 < slot.left_x1 + min_gap:
-            extra_dx += slot.left_x1 + min_gap - x0
+        if x0 < slot.left_x1 + drive_gap:
+            extra_dx += slot.left_x1 + drive_gap - x0
             moved = True
-        elif y1 > slot.bottom_y0 - min_gap:
-            extra_dy += slot.bottom_y0 - min_gap - y1
+        elif y1 > slot.bottom_y0 - drive_gap:
+            extra_dy += slot.bottom_y0 - drive_gap - y1
             moved = True
-        elif y0 < slot.top_y1 + min_gap:
-            extra_dy += slot.top_y1 + min_gap - y0
+        elif y0 < slot.top_y1 + drive_gap:
+            extra_dy += slot.top_y1 + drive_gap - y0
             moved = True
 
         if moved:
@@ -238,21 +328,23 @@ def avoid_ppd_frame_overlap(
             if kbb is None:
                 continue
             (kx0, ky0), (kx1, ky1) = kbb
-            if x1 <= kx0 - min_gap or x0 >= kx1 + min_gap or y1 <= ky0 - min_gap or y0 >= ky1 + min_gap:
+            if (
+                x1 <= kx0 - drive_gap
+                or x0 >= kx1 + drive_gap
+                or y1 <= ky0 - drive_gap
+                or y0 >= ky1 + drive_gap
+            ):
                 continue
             candidates = (
-                (kx1 - x0 + min_gap, 0.0),
-                (kx0 - x1 - min_gap, 0.0),
-                (0.0, ky1 - y0 + min_gap),
-                (0.0, ky0 - y1 - min_gap),
+                (kx1 - x0 + drive_gap, 0.0),
+                (kx0 - x1 - drive_gap, 0.0),
+                (0.0, ky1 - y0 + drive_gap),
+                (0.0, ky0 - y1 - drive_gap),
             )
             for cand_dx, cand_dy in candidates:
                 if cand_dx == 0.0 and cand_dy == 0.0:
                     continue
-                test_metal = resonator_metal_polys(
-                    res, dx + extra_dx + cand_dx, dy + extra_dy + cand_dy
-                )
-                if metal_satisfies_frame_clearance(test_metal, keepouts, min_gap=min_gap):
+                if _satisfied(extra_dx + cand_dx, extra_dy + cand_dy):
                     best = (extra_dx + cand_dx, extra_dy + cand_dy)
                     break
             if best is not None:
@@ -277,6 +369,7 @@ class ResonatorPpdAssembly:
     resonator_origin: tuple[float, float]
     centering_shift: tuple[float, float]
     clearance_shift: tuple[float, float]
+    min_release_clearance_um: float
     shift: tuple[float, float]
     assembly_center: tuple[float, float]
     top_cell: gdstk.Cell
@@ -299,6 +392,7 @@ class ResonatorPpdAssembly:
             "centering_shift_y": round(self.centering_shift[1], 1),
             "clearance_shift_x": round(self.clearance_shift[0], 1),
             "clearance_shift_y": round(self.clearance_shift[1], 1),
+            "min_release_clearance_um": round(self.min_release_clearance_um, 1),
             "shift_x": round(self.shift[0], 1),
             "shift_y": round(self.shift[1], 1),
             "assembly_center_x": round(self.assembly_center[0], 1),
@@ -345,18 +439,21 @@ def prep_resonator_ppd(
     ppd_origin: tuple[float, float] = (0.0, 0.0),
     ppd_cell: gdstk.Cell | None = None,
     min_frame_clearance: float = MIN_FRAME_CLEARANCE_UM,
+    min_release_hole_clearance: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
 ) -> list[ResonatorPpdAssembly]:
     """
     Build one PPD + centered-resonator assembly per ``res_df`` row.
 
     PPD is placed at ``ppd_origin`` (default top-left). Each resonator is shifted
     so its bbox center lands on the PPD bbox center, then nudged axis-aligned to
-    keep at least ``min_frame_clearance`` between resonator metal and GSG pads.
+    keep at least ``min_frame_clearance`` between resonator metal and GSG pads,
+    and ``min_release_hole_clearance`` between BAW_ReF / BAW_CAV and the frame.
     Only x/y placement changes; scale and orientation are preserved.
     """
     indices = _validate_res_df(res_df, resonators)
     ppd_lib, ppd_master = _load_ppd_cell(ppd_gds, ppd_cell)
     center = ppd_assembly_center(ppd_master, ppd_origin)
+    keepouts = ppd_pad_keepout_polys(ppd_master, ppd_origin)
 
     assemblies: list[ResonatorPpdAssembly] = []
     for idx in indices:
@@ -373,9 +470,14 @@ def prep_resonator_ppd(
             center_dy,
             ppd_origin=ppd_origin,
             min_gap=min_frame_clearance,
+            min_release_gap=min_release_hole_clearance,
         )
         dx = center_dx + clear_dx
         dy = center_dy + clear_dy
+        release_polys = resonator_release_hole_polys(res, dx, dy)
+        min_release_clear = (
+            min_clearance_um(release_polys, keepouts) if release_polys else float("inf")
+        )
         rteg_origin = (res.origin[0] + dx, res.origin[1] + dy)
         cell_name = f"ppd_{idx}_{inst_name}"
 
@@ -407,6 +509,7 @@ def prep_resonator_ppd(
                 resonator_origin=rteg_origin,
                 centering_shift=(center_dx, center_dy),
                 clearance_shift=(clear_dx, clear_dy),
+                min_release_clearance_um=min_release_clear,
                 shift=(dx, dy),
                 assembly_center=center,
                 top_cell=top,

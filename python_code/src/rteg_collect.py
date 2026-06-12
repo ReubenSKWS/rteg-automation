@@ -33,7 +33,8 @@ from prep_resonator_ppd import (
     resonator_release_hole_polys,
 )
 from prep_rteg_frame import RtegFrameAssembly
-from rteg_utils import resonator_world_bbox
+from rteg_orientation import OrientationAnalysis, analyze_orientation
+from rteg_utils import polys_bbox, resonator_world_bbox, split_by_y_gaps
 from separate import IdentificationResult, Resonator
 
 Point = tuple[float, float]
@@ -160,6 +161,7 @@ class RtegGeometryRoles:
     preserved: PreservedMetal
     release_holes: ReleaseHoles
     frame_boundary: InnerFrameBoundary
+    resonator_body_mte: list[gdstk.Polygon] = field(default_factory=list)
 
     def group_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -286,25 +288,13 @@ def _cluster_pad_polys_by_y(
     label_prefix: str,
 ) -> tuple[list[TaggedPolygon], list[TaggedPolygon], list[TaggedPolygon]]:
     """Split pad polygons into top / center / bottom bands by Y-centroid gaps."""
-    entries: list[tuple[float, gdstk.Polygon]] = []
-    for poly in polys:
-        bb = poly.bounding_box()
-        if bb is None:
-            continue
-        cy = (bb[0][1] + bb[1][1]) / 2.0
-        entries.append((cy, poly))
-    if len(entries) < 3:
+    top_polys, center_polys, bottom_polys = split_by_y_gaps(polys)
+    if not center_polys and not bottom_polys:
         tagged = [
             TaggedPolygon(f"{label_prefix}[{i}]", layer_name, p)
-            for i, (_, p) in enumerate(entries)
+            for i, p in enumerate(top_polys)
         ]
         return tagged, [], []
-
-    entries.sort(key=lambda item: item[0], reverse=True)
-    ys = [cy for cy, _ in entries]
-    gaps = [(ys[i] - ys[i + 1], i) for i in range(len(ys) - 1)]
-    gaps.sort(reverse=True)
-    split_a, split_b = sorted((gaps[0][1], gaps[1][1]))
 
     def tag_group(group: Sequence[gdstk.Polygon], band: str) -> list[TaggedPolygon]:
         return [
@@ -312,10 +302,11 @@ def _cluster_pad_polys_by_y(
             for i, p in enumerate(group)
         ]
 
-    top = tag_group([p for _, p in entries[: split_a + 1]], "top")
-    center = tag_group([p for _, p in entries[split_a + 1 : split_b + 1]], "center")
-    bottom = tag_group([p for _, p in entries[split_b + 1 :]], "bottom")
-    return top, center, bottom
+    return (
+        tag_group(top_polys, "top"),
+        tag_group(center_polys, "center"),
+        tag_group(bottom_polys, "bottom"),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +368,56 @@ def collect_ground_plates(
     return GroundPlates(top=top, center=center, bottom=bottom, filler=filler)
 
 
+def preserved_collars_at_shift(
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    *,
+    shift: Point,
+    config: RtegCollectConfig | None = None,
+) -> tuple[list[gdstk.Polygon], list[gdstk.Polygon]]:
+    """
+    Preserved filter MTE / MBE collar polygons translated by ``shift``.
+
+    Selects ``{parent}_connectMTE`` / ``{parent}_connectMBE`` polygons that
+    overlap the resonator window (in filter coordinates), then offsets them by
+    ``shift`` — the delta from filter placement to the target placement. Shared
+    by step 3 (PPD-space orientation) and step 5.1 (RTEG-world collection), so
+    both see the same collar geometry. Returns ``(mte_polys, mbe_polys)``.
+    """
+    cfg = config or RtegCollectConfig()
+    filter_bb = _expand_bbox(
+        resonator_world_bbox(res), cfg.preserved_overlap_margin_um
+    )
+    dx, dy = shift
+
+    out: dict[str, list[gdstk.Polygon]] = {cfg.mte_layer: [], cfg.mbe_layer: []}
+    for suffix, layer_name in (
+        ("connectMTE", cfg.mte_layer),
+        ("connectMBE", cfg.mbe_layer),
+    ):
+        cell = _find_connect_cell(identification, suffix)
+        if cell is None:
+            continue
+        pair = layermap.pair(layer_name)
+        for poly in cell.flatten().polygons:
+            if (poly.layer, poly.datatype) != pair:
+                continue
+            if abs(poly.area()) < cfg.min_polygon_area_um2:
+                continue
+            bb = poly.bounding_box()
+            if bb is None or not _bbox_overlap(bb, filter_bb):
+                continue
+            out[layer_name].append(
+                gdstk.Polygon(
+                    [(x + dx, y + dy) for x, y in poly.points],
+                    layer=poly.layer,
+                    datatype=poly.datatype,
+                )
+            )
+    return out[cfg.mte_layer], out[cfg.mbe_layer]
+
+
 def collect_preserved_metal(
     assembly: RtegFrameAssembly,
     res: Resonator,
@@ -389,44 +430,83 @@ def collect_preserved_metal(
 
     Source cells: ``{parent}_connectMBE`` / ``{parent}_connectMTE`` (with
     ``connect_backup`` fallback), filtered in filter coordinates then translated
-    into RTEG world space.
+    into RTEG world space via the same shift as ``resonator_metal_polys``.
     """
     cfg = config or RtegCollectConfig()
-    margin = cfg.preserved_overlap_margin_um
-    filter_bb = _expand_bbox(resonator_world_bbox(res), margin)
+    mte_polys, mbe_polys = preserved_collars_at_shift(
+        res,
+        identification,
+        layermap,
+        shift=_resonator_shift(res, assembly),
+        config=cfg,
+    )
+    return PreservedMetal(
+        mbe=[
+            TaggedPolygon(f"preserved_{cfg.mbe_layer}[{i}]", cfg.mbe_layer, p)
+            for i, p in enumerate(mbe_polys)
+        ],
+        mte=[
+            TaggedPolygon(f"preserved_{cfg.mte_layer}[{i}]", cfg.mte_layer, p)
+            for i, p in enumerate(mte_polys)
+        ],
+    )
 
-    out_mbe: list[TaggedPolygon] = []
-    out_mte: list[TaggedPolygon] = []
-    for suffix, layer_name in (
-        ("connectMBE", cfg.mbe_layer),
-        ("connectMTE", cfg.mte_layer),
-    ):
-        cell = _find_connect_cell(identification, suffix)
-        if cell is None:
-            continue
-        pair = layermap.pair(layer_name)
-        selected: list[gdstk.Polygon] = []
-        for poly in cell.flatten().polygons:
-            if (poly.layer, poly.datatype) != pair:
-                continue
-            if abs(poly.area()) < cfg.min_polygon_area_um2:
-                continue
-            bb = poly.bounding_box()
-            if bb is None or not _bbox_overlap(bb, filter_bb):
-                continue
-            selected.append(poly)
 
-        rteg_polys = _filter_to_rteg_world(selected, res, assembly)
-        tagged = [
-            TaggedPolygon(f"preserved_{layer_name}[{i}]", layer_name, p)
-            for i, p in enumerate(rteg_polys)
-        ]
-        if layer_name == cfg.mbe_layer:
-            out_mbe.extend(tagged)
-        else:
-            out_mte.extend(tagged)
+def preserved_mte_overlap_with_body(
+    preserved_mte: gdstk.Polygon,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+) -> float:
+    """Shared area between one preserved MTE collar and resonator-body MTE."""
+    overlap = 0.0
+    for body in body_mte_polys:
+        inter = gdstk.boolean(preserved_mte, body, "and", precision=precision)
+        if inter:
+            overlap = max(overlap, sum(abs(p.area()) for p in inter))
+    return overlap
 
-    return PreservedMetal(mbe=out_mbe, mte=out_mte)
+
+def select_preserved_collar_mte(
+    preserved: PreservedMetal,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    *,
+    min_overlap_um2: float = 0.01,
+    precision: float = 1e-3,
+) -> TaggedPolygon | None:
+    """
+    Pick the one preserved MTE collar that overlaps resonator-body MTE.
+
+    Filter connectMTE often yields two pieces (resonator outline + edge collar);
+    only the collar touching the resonator body should receive an extension.
+    """
+    best: TaggedPolygon | None = None
+    best_overlap = 0.0
+    for collar_tp in preserved.mte:
+        overlap = preserved_mte_overlap_with_body(
+            collar_tp.polygon, body_mte_polys, precision=precision
+        )
+        if overlap >= min_overlap_um2 and overlap > best_overlap:
+            best = collar_tp
+            best_overlap = overlap
+    return best
+
+
+def collect_resonator_body_mte(
+    res: Resonator,
+    assembly: RtegFrameAssembly,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> list[gdstk.Polygon]:
+    """Resonator-master MTE polygons in RTEG world space (not filter interconnect)."""
+    cfg = config or RtegCollectConfig()
+    dx, dy = _resonator_shift(res, assembly)
+    mte_pair = layermap.pair(cfg.mte_layer)
+    return [
+        poly
+        for poly in resonator_metal_polys(res, dx, dy)
+        if (poly.layer, poly.datatype) == mte_pair
+    ]
 
 
 def collect_release_holes(
@@ -519,6 +599,66 @@ def get_inner_frame_boundary(
     return InnerFrameBoundary(cavity=cavity, ring=ring)
 
 
+def pad_bboxes_by_band(
+    pad_polys: Sequence[gdstk.Polygon],
+) -> dict[str, Bbox | None]:
+    """Map top / center / bottom GSG pad bboxes from MBE pad polygons."""
+    top, center, bottom = split_by_y_gaps(list(pad_polys))
+    return {
+        "top": polys_bbox(top),
+        "center": polys_bbox(center),
+        "bottom": polys_bbox(bottom),
+    }
+
+
+def pad_bboxes_from_ground_plates(
+    ground_plates: GroundPlates,
+) -> dict[str, Bbox | None]:
+    """Union bbox per GSG band from step-5.1 ground plates."""
+    return {
+        "top": polys_bbox([tp.polygon for tp in ground_plates.top]),
+        "center": polys_bbox([tp.polygon for tp in ground_plates.center]),
+        "bottom": polys_bbox([tp.polygon for tp in ground_plates.bottom]),
+    }
+
+
+def collect_orientation_inputs(
+    assembly: RtegFrameAssembly,
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    *,
+    ground_plates: GroundPlates | None = None,
+    config: RtegCollectConfig | None = None,
+) -> OrientationAnalysis:
+    """
+    Collar orientation analysis in RTEG world space (step 5.2 input).
+
+    Reuses preserved collar geometry and either step-5.1 ground plates or PPD
+    MBE pad bboxes when ``ground_plates`` is omitted.
+    """
+    cfg = config or RtegCollectConfig()
+    shift = _resonator_shift(res, assembly)
+    dx, dy = shift
+    mte_polys, mbe_polys = preserved_collars_at_shift(
+        res, identification, layermap, shift=shift, config=cfg
+    )
+    body_polys = resonator_metal_polys(res, dx, dy)
+
+    if ground_plates is not None:
+        pad_bboxes = pad_bboxes_from_ground_plates(ground_plates)
+    else:
+        ox, oy = _ppd_world_origin(assembly)
+        keepouts = ppd_pad_keepout_polys(assembly.ppd_assembly.top_cell, (ox, oy))
+        mbe_pair = layermap.pair(cfg.mbe_layer)
+        mbe_pads = [
+            p for p in keepouts if (p.layer, p.datatype) == mbe_pair
+        ]
+        pad_bboxes = pad_bboxes_by_band(mbe_pads)
+
+    return analyze_orientation(body_polys, mte_polys, mbe_polys, pad_bboxes)
+
+
 def collect_geometry_roles(
     assembly: RtegFrameAssembly,
     res: Resonator,
@@ -537,6 +677,7 @@ def collect_geometry_roles(
         ),
         release_holes=collect_release_holes(assembly, res, layermap, cfg),
         frame_boundary=get_inner_frame_boundary(assembly, layermap, cfg),
+        resonator_body_mte=collect_resonator_body_mte(res, assembly, layermap, cfg),
     )
 
 

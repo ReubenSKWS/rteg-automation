@@ -1,10 +1,9 @@
 """
-Step 5.2 — Classify GSG node blocks as signal or ground (resonator-type rule).
+Step 5.2 — Classify GSG node blocks as signal or ground from collar orientation.
 
-**Shunt:** center GSG pad = **signal**; top and bottom = ground.
-
-**Series:** all GSG pads = **ground**; signal lives on the resonator body
-(``signal_band = "on_resonator"``), not on a probe pad.
+MTE routing has two modes only:
+- **center pad** — when preserved MTE faces center, try to connect to center signal pad
+- **collar extend** — otherwise extend preserved MTE ~13 µm (no pad connection)
 
 ``filler_plate`` is always ground and is not a GSG probe node.
 """
@@ -14,12 +13,12 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from rteg_collect import GroundPlates, PreservedMetal, TaggedPolygon
+from rteg_orientation import CollarOrientation, MteRouteTarget, OrientationAnalysis
 
 NodeBand = Literal["top", "center", "bottom"]
 NodeNet = Literal["signal", "ground"]
-SignalBand = NodeBand | Literal["on_resonator"]
-ClassifyMethod = Literal["res_type"]
-ResType = Literal["shunt", "series"]
+SignalTerminal = Literal["MTE", "MBE"]
+ClassifyMethod = Literal["orientation"]
 
 _BAND_ORDER: tuple[NodeBand, ...] = ("top", "center", "bottom")
 
@@ -50,10 +49,14 @@ class ClassifiedNode:
 class NodeClassification:
     """Result of ``classify_nodes`` for one resonator."""
 
-    signal_band: SignalBand
+    signal_terminal: SignalTerminal
+    collar_orientation: CollarOrientation
+    mte_route_target: MteRouteTarget
+    signal_pad_band: NodeBand
+    signal_drawable: bool
     nodes: list[ClassifiedNode] = field(default_factory=list)
     filler: list[TaggedPolygon] = field(default_factory=list)
-    method: ClassifyMethod = "res_type"
+    method: ClassifyMethod = "orientation"
     res_type: str = ""
     note: str = ""
 
@@ -65,10 +68,13 @@ class NodeClassification:
         return {n.band: n for n in self.nodes}
 
     def signal_polygons(self) -> list[TaggedPolygon]:
-        if self.signal_band == "on_resonator":
+        if self.mte_route_target != "center_pad":
             return []
-        node = self.by_band()[self.signal_band]
-        return list(node.polygons)
+        return list(self.by_band()["center"].polygons)
+
+    def ground_route_polygons(self) -> list[TaggedPolygon]:
+        """Unused — collar-extend mode does not route to ground pads."""
+        return []
 
     def ground_node_polygons(self) -> list[TaggedPolygon]:
         out: list[TaggedPolygon] = []
@@ -86,57 +92,42 @@ def _band_items(ground_plates: GroundPlates) -> dict[NodeBand, list[TaggedPolygo
     }
 
 
-def _signal_band_for_res_type(res_type: str) -> tuple[SignalBand, str]:
-    """Return (signal_band, note) for a shunt or series resonator."""
-    if res_type == "shunt":
-        return "center", "shunt — center GSG pad is signal"
-    if res_type == "series":
-        return (
-            "on_resonator",
-            "series — signal on resonator body; all GSG pads ground",
-        )
-    raise ValueError(
-        f"unsupported res_type {res_type!r}; expected 'shunt' or 'series'"
-    )
-
-
 def classify_nodes(
     ground_plates: GroundPlates,
     preserved: PreservedMetal,
     *,
-    res_type: str,
+    orientation: OrientationAnalysis,
+    res_type: str = "",
     config: ClassifyNodesConfig | None = None,
 ) -> NodeClassification:
     """
-    Assign signal vs ground to each GSG node band from resonator type.
+    Assign signal vs ground to each GSG band from collar orientation.
 
-    Parameters
-    ----------
-    ground_plates
-        Step-5.1 ``GroundPlates`` (top / center / bottom / filler).
-    preserved
-        Step-5.1 ``PreservedMetal`` (accepted for pipeline symmetry; unused).
-    res_type
-        ``"shunt"`` or ``"series"`` from step 2 ``identification``.
-    config
-        Optional placeholder config.
-
-    Returns
-    -------
-    NodeClassification
-        Signal band, per-band nets, filler (always ground), and method used.
+    MTE drawable when preserved filter MTE exists. Route target is center pad
+    (signal) when MTE faces center; otherwise route preserved MTE to ground.
     """
-    _ = preserved
     _ = config
     bands = _band_items(ground_plates)
-    signal_band, note = _signal_band_for_res_type(res_type)
+    collar = orientation.collar
+    route = collar.mte_route_target
+    has_mte = bool(preserved.mte)
+    signal_drawable = has_mte
+    signal_terminal: SignalTerminal = "MTE" if has_mte else "MBE"
+    signal_pad_band: NodeBand = "center"
+
+    if not has_mte:
+        note = "no preserved MTE — nothing to draw"
+    elif route == "center_pad":
+        note = "preserved MTE faces center pad — draw MTE span to center signal pad"
+    else:
+        note = "preserved MTE not facing center — extend preserved MTE ~13 µm only"
 
     nodes: list[ClassifiedNode] = []
     for band in _BAND_ORDER:
-        if signal_band == "on_resonator":
-            net: NodeNet = "ground"
+        if route == "center_pad" and has_mte:
+            net: NodeNet = "signal" if band == "center" else "ground"
         else:
-            net = "signal" if band == signal_band else "ground"
+            net = "ground"
         nodes.append(
             ClassifiedNode(
                 band=band,
@@ -146,10 +137,14 @@ def classify_nodes(
         )
 
     return NodeClassification(
-        signal_band=signal_band,
+        signal_terminal=signal_terminal,
+        collar_orientation=collar,
+        mte_route_target=route,
+        signal_pad_band=signal_pad_band,
+        signal_drawable=signal_drawable,
         nodes=nodes,
         filler=list(ground_plates.filler),
-        method="res_type",
+        method="orientation",
         res_type=res_type,
         note=note,
     )
@@ -173,6 +168,12 @@ def classification_summary_table(
         if res_type is not None:
             row["res_type"] = res_type
         row["method"] = classification.method
-        row["signal_band"] = classification.signal_band
+        row["signal_terminal"] = classification.signal_terminal
+        row["mte_route_target"] = classification.mte_route_target
+        row["signal_pad_band"] = classification.signal_pad_band
+        row["signal_drawable"] = classification.signal_drawable
+        row["mte_faces_center"] = classification.collar_orientation.mte_faces_center
+        row["facing_pad"] = classification.collar_orientation.facing_pad
+        row["collar_axis"] = classification.collar_orientation.axis
         rows.append(row)
     return rows

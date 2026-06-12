@@ -1,36 +1,25 @@
 """
-Step 5.3 — Build the signal (MTE) net.
+Step 5.3 — Draw MTE extensions from preserved filter collars.
 
-**Shunt:** connects preserved filter MTE to the classified **signal** GSG pad
-with a shaped connector plate (45/90° segments only), then boolean-unions
-preserved MTE + connector into one MTE polygon.
+Draws one new ~13 µm extension from the preserved MTE collar that overlaps
+resonator-body MTE (not the outline-only piece). Original preserved MTE in the
+frame is never modified or removed.
 
-**Series:** a thin MTE strip along the resonator MBE perimeter between two
-release holes — no pad-directed connector and no GSG signal pad
-(``on_resonator`` mode).
-
-Signal probe pads are MBE; shunt connectors are extended to meet them within
-``connect_tolerance_um`` so downstream carving can treat the full signal path
-as a keepout.
+Step 5.4 (classification / orientation) is separate — it does not gate this draw.
 
 Public API
 ----------
-``signal_endpoints``   — facing launch points between preserved MTE and signal pad
-``build_signal_plate`` — orthogonal connector polygon between those points
-``union_preserved_mte_net`` — OR preserved MTE only (series / on_resonator)
-``union_signal_net``   — OR preserved MTE + connector into one MTE net
-``build_signal_net``   — orchestrator + DRC vs ground MBE
-``export_signal_rteg_gds`` — write full framed RTEG + MTE connector to GDS
-``preview_signal_net_svg`` — SVG preview for notebooks
+``build_mte_extensions``           — step 5.3: one call for all resonators
+``draw_mte_from_preserved_collar`` — basis draw: one extension per preserved collar
+``export_signal_rteg_gds``         — write framed RTEG + new MTE polygons to GDS
 """
 from __future__ import annotations
 
 import math
-import re
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import gdstk
 
@@ -38,15 +27,23 @@ from export_gds import ExportResult, export_gds
 from layermap import LayerMap
 from prep_rteg_frame import RtegFrameAssembly
 from rteg_classify import NodeClassification
-from rteg_collect import GroundPlates, PreservedMetal, ReleaseHoles, TaggedPolygon
-from separate import Resonator
+from rteg_collect import (
+    GroundPlates,
+    PreservedMetal,
+    ReleaseHoles,
+    TaggedPolygon,
+    select_preserved_collar_mte,
+)
+from rteg_mte_route import (
+    check_mte_attached_to_collar,
+    check_mte_vs_ground_drc,
+    draw_preserved_mte_extension,
+    find_collar_facing_edge,
+)
+from rteg_utils import assign_layer
 
 Point = tuple[float, float]
 Edge = tuple[Point, Point]
-
-_ANGLE_TOL_DEG = 0.5
-_JOG_STEP_UM = 2.0
-_DEFAULT_JOG_MARGIN_UM = 80.0
 
 
 @dataclass(frozen=True)
@@ -56,18 +53,17 @@ class SignalBuildConfig:
     mte_layer: str = "BAW_MTE"
     mbe_layer: str = "BAW_MBE"
     mbe_mte_spacing_um: float = 14.0
-    connect_tolerance_um: float = 0.5
     plate_width_um: float = 14.0
+    collar_extension_um: float = 13.0
     boolean_precision: float = 1e-3
-    jog_search_margin_um: float = 80.0
+    release_hole_clearance_um: float = 6.0
 
 
 @dataclass
 class SignalEndpoints:
-    """Facing launch pair between preserved MTE and the signal node."""
+    """Launch info for the first preserved MTE collar extension."""
 
     preserved: TaggedPolygon
-    signal_pad: TaggedPolygon | None
     metal_point: Point
     pad_point: Point
     metal_edge: Edge
@@ -75,7 +71,7 @@ class SignalEndpoints:
     clearance_um: float
 
     def summary(self) -> dict[str, object]:
-        row: dict[str, object] = {
+        return {
             "preserved_label": self.preserved.label,
             "metal_point": (round(self.metal_point[0], 1), round(self.metal_point[1], 1)),
             "pad_point": (round(self.pad_point[0], 1), round(self.pad_point[1], 1)),
@@ -84,24 +80,12 @@ class SignalEndpoints:
                 if not math.isnan(self.clearance_um)
                 else None
             ),
-            "metal_edge": (
-                (round(self.metal_edge[0][0], 1), round(self.metal_edge[0][1], 1)),
-                (round(self.metal_edge[1][0], 1), round(self.metal_edge[1][1], 1)),
-            ),
         }
-        if self.signal_pad is not None:
-            row["pad_edge"] = (
-                (round(self.pad_edge[0][0], 1), round(self.pad_edge[0][1], 1)),
-                (round(self.pad_edge[1][0], 1), round(self.pad_edge[1][1], 1)),
-            )
-        else:
-            row["pad_edge"] = None
-        return row
 
 
 @dataclass
 class SignalPlate:
-    """Connector plate between preserved MTE and the signal pad."""
+    """Drawn extension geometry (first collar)."""
 
     polygon: gdstk.Polygon
     centerline: list[Point]
@@ -110,33 +94,31 @@ class SignalPlate:
 
 @dataclass
 class SignalNetResult:
-    """Fused signal net ready for ground carve keepouts."""
+    """Drawn MTE extensions ready for export."""
 
     endpoints: SignalEndpoints
     connector: SignalPlate
     net_polygons: list[gdstk.Polygon]
-    signal_pad_polygons: list[gdstk.Polygon]
+    preserved_collar_polygons: list[gdstk.Polygon]
     n_net_polygons: int
+    signal_terminal: str
+    signal_drawable: bool
     is_connected: bool
-    reaches_pad: bool
     min_ground_spacing_um: float
     drc_violations: list[str] = field(default_factory=list)
 
     @property
-    def is_on_resonator(self) -> bool:
-        return self.connector.shape_name == "on_resonator"
-
-    @property
     def is_success(self) -> bool:
-        if self.is_on_resonator:
-            return self.is_connected and not self.drc_violations
-        return self.is_connected and self.reaches_pad and not self.drc_violations
+        if not self.signal_drawable:
+            return not self.drc_violations
+        return self.is_connected and not self.drc_violations
 
     def summary(self) -> dict[str, object]:
         return {
             "n_net_polygons": self.n_net_polygons,
+            "signal_terminal": self.signal_terminal,
+            "signal_drawable": self.signal_drawable,
             "is_connected": self.is_connected,
-            "reaches_pad": self.reaches_pad,
             "is_success": self.is_success,
             "shape": self.connector.shape_name,
             "min_ground_spacing_um": round(self.min_ground_spacing_um, 1),
@@ -145,664 +127,236 @@ class SignalNetResult:
         }
 
 
-# --------------------------------------------------------------------------- #
-# Geometry helpers
-# --------------------------------------------------------------------------- #
-def _min_spacing(poly_a: gdstk.Polygon, poly_b: gdstk.Polygon) -> tuple[float, Point, Point]:
-    if gdstk.boolean(poly_a, poly_b, "and", precision=1e-3):
-        p = poly_a.points[0]
-        q = (float(p[0]), float(p[1]))
-        return 0.0, q, q
-    best = float("inf")
-    best_p: Point = (0.0, 0.0)
-    best_q: Point = (0.0, 0.0)
-    for pa in poly_a.points:
-        for pb in poly_b.points:
-            d = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
-            if d < best:
-                best = d
-                best_p = (float(pa[0]), float(pa[1]))
-                best_q = (float(pb[0]), float(pb[1]))
-    return best, best_p, best_q
+def _edge_midpoint(edge: Edge) -> Point:
+    return ((edge[0][0] + edge[1][0]) / 2.0, (edge[0][1] + edge[1][1]) / 2.0)
 
 
-def _min_spacing_to_many(
-    poly: gdstk.Polygon, obstacles: Sequence[gdstk.Polygon]
-) -> tuple[float, Point]:
-    best = float("inf")
-    where: Point = (0.0, 0.0)
-    for obs in obstacles:
-        d, p, _ = _min_spacing(poly, obs)
-        if d < best:
-            best = d
-            where = p
-    return best, where
+def draw_mte_from_preserved_collar(
+    collar_tp: TaggedPolygon,
+    layermap: LayerMap,
+    cfg: SignalBuildConfig,
+) -> tuple[gdstk.Polygon, Point, Point]:
+    """
+    Basis draw op: one new MTE polygon per preserved collar.
 
-
-def _bbox_center(bb: tuple[Point, Point]) -> Point:
-    return ((bb[0][0] + bb[1][0]) / 2.0, (bb[0][1] + bb[1][1]) / 2.0)
-
-
-def _facing_edge(bb: tuple[Point, Point], toward: Point) -> Edge:
-    """Side of axis-aligned ``bb`` that faces ``toward``."""
-    (x0, y0), (x1, y1) = bb
-    cx, cy = _bbox_center(bb)
-    tx, ty = toward
-    if abs(tx - cx) >= abs(ty - cy):
-        return ((x0, y0), (x0, y1)) if tx < cx else ((x1, y0), (x1, y1))
-    return ((x0, y0), (x1, y0)) if ty < cy else ((x0, y1), (x1, y1))
-
-
-def _launch_on_edge(edge: Edge, toward: Point) -> Point:
-    """Point on ``edge`` closest to ``toward`` (clamped to the segment)."""
-    (x0, y0), (x1, y1) = edge
-    if abs(x0 - x1) < 1e-6:
-        y = max(min(toward[1], max(y0, y1)), min(y0, y1))
-        return (x0, y)
-    x = max(min(toward[0], max(x0, x1)), min(x0, x1))
-    return (x, y0)
-
-
-def _segment_is_45_90(p1: Point, p2: Point) -> bool:
-    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-        return False
-    angle = math.degrees(math.atan2(dy, dx)) % 45.0
-    return min(angle, 45.0 - angle) <= _ANGLE_TOL_DEG
-
-
-def _centerline_length(centerline: Sequence[Point]) -> float:
-    return sum(
-        math.hypot(centerline[i][0] - centerline[i - 1][0], centerline[i][1] - centerline[i - 1][1])
-        for i in range(1, len(centerline))
+    Follows the collar outline; the open end is a straight line ~13 µm out.
+    Original preserved metal is not modified.
+    """
+    mte_layer, mte_datatype = layermap.pair(cfg.mte_layer)
+    extension = draw_preserved_mte_extension(
+        collar_tp.polygon,
+        cfg.collar_extension_um,
+        mte_layer,
+        mte_datatype,
     )
-
-
-def _extend_into_bbox(pt: Point, bb: tuple[Point, Point], extend_um: float) -> Point:
-    """Nudge ``pt`` toward the interior of ``bb`` for boolean overlap."""
-    if extend_um <= 0:
-        return pt
-    cx, cy = _bbox_center(bb)
-    dx, dy = cx - pt[0], cy - pt[1]
+    extension = assign_layer(extension, layermap, cfg.mte_layer)
+    cx = sum(float(p[0]) for p in collar_tp.polygon.points) / len(collar_tp.polygon.points)
+    cy = sum(float(p[1]) for p in collar_tp.polygon.points) / len(collar_tp.polygon.points)
+    toward = max(
+        collar_tp.polygon.points,
+        key=lambda p: (float(p[0]) - cx) ** 2 + (float(p[1]) - cy) ** 2,
+    )
+    toward_pt = (float(toward[0]), float(toward[1]))
+    edge = find_collar_facing_edge(collar_tp.polygon, toward_pt)
+    intercept = _edge_midpoint(edge)
+    dx, dy = edge[1][0] - edge[0][0], edge[1][1] - edge[0][1]
     length = math.hypot(dx, dy)
     if length < 1e-9:
-        return pt
-    scale = extend_um / length
-    return (pt[0] + dx * scale, pt[1] + dy * scale)
-
-
-def _extend_centerline(
-    centerline: list[Point],
-    extend_um: float,
-    *,
-    metal_bb: tuple[Point, Point] | None = None,
-    pad_bb: tuple[Point, Point] | None = None,
-) -> list[Point]:
-    """Extend launch points into preserved MTE and the signal pad for union overlap."""
-    if len(centerline) < 2 or extend_um <= 0:
-        return list(centerline)
-    out = list(centerline)
-
-    def _step_outward(a: Point, b: Point) -> Point:
-        dx, dy = a[0] - b[0], a[1] - b[1]
-        length = math.hypot(dx, dy)
-        if length < 1e-9:
-            return a
-        scale = extend_um / length
-        return (a[0] + dx * scale, a[1] + dy * scale)
-
-    if metal_bb is not None:
-        out[0] = _extend_into_bbox(out[0], metal_bb, extend_um)
+        nx, ny = 1.0, 0.0
     else:
-        out[0] = _step_outward(out[0], out[1])
-    if pad_bb is not None:
-        out[-1] = _extend_into_bbox(out[-1], pad_bb, extend_um)
-    return out
+        nx, ny = -dy / length, dx / length
+    mid = intercept
+    cx, cy = (edge[0][0] + edge[1][0]) / 2.0, (edge[0][1] + edge[1][1]) / 2.0
+    if (toward_pt[0] - cx) * nx + (toward_pt[1] - cy) * ny < 0:
+        nx, ny = -nx, -ny
+    tip = (mid[0] + nx * cfg.collar_extension_um, mid[1] + ny * cfg.collar_extension_um)
+    return extension, intercept, tip
 
 
-def _stroke_polygon(
-    centerline: Sequence[Point],
-    width: float,
-    layer: int,
-    datatype: int,
-) -> gdstk.Polygon:
-    flex = gdstk.FlexPath(list(centerline), width, layer=layer, datatype=datatype)
-    polys = flex.to_polygons()
-    if not polys:
-        raise ValueError("centerline produced no stroke polygon")
-    return polys[0]
+def _preserved_mte_polys(preserved: PreservedMetal) -> list[gdstk.Polygon]:
+    return [tp.polygon for tp in preserved.mte]
 
 
-def _union_polys(
-    polys: Sequence[gdstk.Polygon], precision: float
-) -> list[gdstk.Polygon]:
-    if not polys:
-        return []
-    acc: list[gdstk.Polygon] = [polys[0]]
-    for poly in polys[1:]:
-        nxt = gdstk.boolean(acc, poly, "or", precision=precision)
-        acc = nxt if nxt else acc + [poly]
-    return acc
-
-
-def _infer_plate_width(preserved: TaggedPolygon, config: SignalBuildConfig) -> float:
-    bb = preserved.bbox
-    if bb is None:
-        return config.plate_width_um
-    w = min(bb[1][0] - bb[0][0], bb[1][1] - bb[0][1])
-    return max(config.plate_width_um, min(w, 2 * config.plate_width_um))
-
-
-def _spacing_violates(
-    poly: gdstk.Polygon,
-    obstacles: Sequence[gdstk.Polygon],
-    min_um: float,
-    precision: float,
-) -> tuple[bool, float, Point]:
-    """True when ``poly`` overlaps or encroaches within ``min_um`` of ground MBE."""
-    worst = float("inf")
-    where: Point = (0.0, 0.0)
-    for obs in obstacles:
-        if gdstk.boolean(poly, obs, "and", precision=precision):
-            return True, 0.0, where
-        grown = gdstk.offset(obs, min_um)
-        if grown and gdstk.boolean(poly, grown, "and", precision=precision):
-            return True, 0.0, where
-        d, p, _ = _min_spacing(poly, obs)
-        if d < worst:
-            worst = d
-            where = p
-    return False, worst, where
-
-
-def _path_net_polygon(
-    net_polys: Sequence[gdstk.Polygon], connector: gdstk.Polygon, precision: float
-) -> gdstk.Polygon | None:
-    for net in net_polys:
-        if gdstk.boolean(net, connector, "and", precision=precision):
-            return net
-    return None
-
-
-def _ground_mbe_obstacles(
-    classification: NodeClassification,
-    ground_plates: GroundPlates,
-    layermap: LayerMap,
-    config: SignalBuildConfig,
-) -> list[gdstk.Polygon]:
-    """Ground-net MBE only (non-signal GSG bands + filler)."""
-    mbe_pair = layermap.pair(config.mbe_layer)
-    out: list[gdstk.Polygon] = []
-    for node in classification.nodes:
-        if node.net == "ground":
-            for tagged in node.polygons:
-                if layermap.pair(tagged.layer_name) == mbe_pair:
-                    out.append(tagged.polygon)
-    for tagged in ground_plates.filler:
-        if layermap.pair(tagged.layer_name) == mbe_pair:
-            out.append(tagged.polygon)
-    return out
-
-
-def _signal_pad_polygons(
-    classification: NodeClassification,
-    layermap: LayerMap,
-    config: SignalBuildConfig,
-) -> list[gdstk.Polygon]:
-    mbe_pair = layermap.pair(config.mbe_layer)
-    return [
-        tag.polygon
-        for tag in classification.signal_polygons()
-        if layermap.pair(tag.layer_name) == mbe_pair
-    ]
-
-
-# --------------------------------------------------------------------------- #
-# Public steps
-# --------------------------------------------------------------------------- #
-def signal_endpoints(
+def _mte_extensions_from_preserved(
     preserved: PreservedMetal,
-    classification: NodeClassification,
-    config: SignalBuildConfig | None = None,
-) -> SignalEndpoints:
-    """
-    Facing launch pair between preserved MTE and the classified signal node.
-
-    Picks the preserved MTE polygon with the shortest approach to the signal
-    band, then places launch points on the mutually facing edges.
-    """
-    cfg = config or SignalBuildConfig()
-    signal_polys = classification.signal_polygons()
-    if not preserved.mte:
-        raise ValueError("no preserved MTE to route from")
-    if not signal_polys:
-        raise ValueError("no signal-node polygons in classification")
-
-    best_d = float("inf")
-    best_mte: TaggedPolygon | None = None
-    best_pad_tag: TaggedPolygon | None = None
-
-    signal_gds = [t.polygon for t in signal_polys]
-    for mte_tag in preserved.mte:
-        for sig_tag, sig_poly in zip(signal_polys, signal_gds, strict=True):
-            d, _, _ = _min_spacing(mte_tag.polygon, sig_poly)
-            if d < best_d:
-                best_d = d
-                best_mte = mte_tag
-                best_pad_tag = sig_tag
-
-    assert best_mte is not None and best_pad_tag is not None
-    mte_bb = best_mte.bbox or ((0.0, 0.0), (0.0, 0.0))
-    pad_bb = best_pad_tag.bbox or ((0.0, 0.0), (0.0, 0.0))
-    pad_center = _bbox_center(pad_bb)
-    metal_center = _bbox_center(mte_bb)
-
-    metal_edge = _facing_edge(mte_bb, pad_center)
-    pad_edge = _facing_edge(pad_bb, metal_center)
-    metal_point = _launch_on_edge(metal_edge, pad_center)
-    pad_point = _launch_on_edge(pad_edge, metal_center)
-
-    return SignalEndpoints(
-        preserved=best_mte,
-        signal_pad=best_pad_tag,
-        metal_point=metal_point,
-        pad_point=pad_point,
-        metal_edge=metal_edge,
-        pad_edge=pad_edge,
-        clearance_um=best_d,
-    )
-
-
-def _route_candidates(
-    p1: Point, p2: Point, *, margin_um: float = _DEFAULT_JOG_MARGIN_UM
-) -> list[tuple[str, list[Point]]]:
-    """Orthogonal / 45° centerline options between two launch points."""
-    x1, y1 = p1
-    x2, y2 = p2
-    out: list[tuple[str, list[Point]]] = []
-
-    if abs(x1 - x2) < 1e-6 or abs(y1 - y2) < 1e-6:
-        out.append(("straight", [p1, p2]))
-    else:
-        out.append(("route_L", [p1, (x2, y1), p2]))
-        out.append(("route_L", [p1, (x1, y2), p2]))
-        corner_45 = (x2, y1) if abs(x2 - x1) >= abs(y2 - y1) else (x1, y2)
-        out.append(("route_45", [p1, corner_45, p2]))
-
-        y_lo = min(y1, y2) - margin_um
-        y_hi = max(y1, y2) + margin_um
-        y = y_lo
-        while y <= y_hi + 1e-6:
-            out.append(("route_Z", [p1, (x1, y), (x2, y), p2]))
-            out.append(("route_Z", [p1, (x2, y1), (x2, y), p2]))
-            y += _JOG_STEP_UM
-
-        x_lo = min(x1, x2) - margin_um
-        x_hi = max(x1, x2) + margin_um
-        x = x_lo
-        while x <= x_hi + 1e-6:
-            out.append(("route_Z", [p1, (x, y1), (x, y2), p2]))
-            out.append(("route_Z", [p1, (x, y1), (x2, y1), p2]))
-            x += _JOG_STEP_UM
-
-    seen: set[tuple[Point, ...]] = set()
-    unique: list[tuple[str, list[Point]]] = []
-    for name, cl in out:
-        key = tuple(cl)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((name, cl))
-    return unique
-
-
-def build_signal_plate(
-    endpoints: SignalEndpoints,
     layermap: LayerMap,
-    config: SignalBuildConfig | None = None,
+    cfg: SignalBuildConfig,
     *,
-    ground_obstacles: Sequence[gdstk.Polygon] | None = None,
-) -> SignalPlate:
-    """
-    Shaped MTE connector plate between ``endpoints`` (45/90° only).
-
-    Tries straight / L / 45 / Z candidates and picks the shortest that satisfies
-    ``mbe_mte_spacing_um`` vs ground MBE when obstacles are provided.
-    """
-    cfg = config or SignalBuildConfig()
-    mte_pair = layermap.pair(cfg.mte_layer)
-    width = _infer_plate_width(endpoints.preserved, cfg)
-    p1, p2 = endpoints.metal_point, endpoints.pad_point
-
-    metal_bb = endpoints.preserved.bbox
-    pad_bb = endpoints.signal_pad.bbox
-    extend_um = max(cfg.connect_tolerance_um, width * 0.5)
-
-    best: SignalPlate | None = None
-    best_len = float("inf")
-    fallback: SignalPlate | None = None
-    fallback_len = float("inf")
-
-    for shape_name, centerline in _route_candidates(
-        p1, p2, margin_um=cfg.jog_search_margin_um
-    ):
-        for i in range(1, len(centerline)):
-            if not _segment_is_45_90(centerline[i - 1], centerline[i]):
-                break
-        else:
-            extended = _extend_centerline(
-                centerline,
-                extend_um,
-                metal_bb=metal_bb,
-                pad_bb=pad_bb,
-            )
-            poly = _stroke_polygon(extended, width, mte_pair[0], mte_pair[1])
-            length = _centerline_length(centerline)
-            if ground_obstacles:
-                violates, _, _ = _spacing_violates(
-                    poly, ground_obstacles, cfg.mbe_mte_spacing_um, cfg.boolean_precision
-                )
-                if violates:
-                    if length < fallback_len:
-                        fallback_len = length
-                        fallback = SignalPlate(
-                            polygon=poly,
-                            centerline=extended,
-                            shape_name=shape_name,
-                        )
-                    continue
-            if length < best_len:
-                best_len = length
-                best = SignalPlate(
-                    polygon=poly, centerline=extended, shape_name=shape_name
-                )
-
-    if best is not None:
-        return best
-    if fallback is not None:
-        return fallback
-
-    centerline = _extend_centerline(
-        [p1, p2],
-        extend_um,
-        metal_bb=metal_bb,
-        pad_bb=pad_bb,
-    )
-    poly = _stroke_polygon(centerline, width, mte_pair[0], mte_pair[1])
-    return SignalPlate(polygon=poly, centerline=centerline, shape_name="straight")
-
-
-@dataclass(frozen=True)
-class ShuntRouteOption:
-    """One shunt pad-route candidate for agent selection."""
-
-    candidate_id: int
-    shape_name: str
-    length_um: float
-    drc_clean: bool
-    reaches_pad: bool
-    min_ground_spacing_um: float
-    violations: tuple[str, ...]
-
-
-def enumerate_shunt_routes(
-    preserved: PreservedMetal,
-    classification: NodeClassification,
-    ground_plates: GroundPlates,
-    layermap: LayerMap,
-    config: SignalBuildConfig | None = None,
-) -> tuple[SignalEndpoints, list[ShuntRouteOption], list[SignalPlate]]:
-    """
-    Evaluate all orthogonal / 45° pad routes for agent or debug use.
-
-    Returns endpoints, ranked option summaries, and the matching connector plates.
-    """
-    cfg = config or SignalBuildConfig()
-    ground_obs = _ground_mbe_obstacles(classification, ground_plates, layermap, cfg)
-    endpoints = signal_endpoints(preserved, classification, cfg)
-    signal_pads = _signal_pad_polygons(classification, layermap, cfg)
-    mte_pair = layermap.pair(cfg.mte_layer)
-    width = _infer_plate_width(endpoints.preserved, cfg)
-    p1, p2 = endpoints.metal_point, endpoints.pad_point
-    metal_bb = endpoints.preserved.bbox
-    pad_bb = endpoints.signal_pad.bbox
-    extend_um = max(cfg.connect_tolerance_um, width * 0.5)
-
-    options: list[ShuntRouteOption] = []
-    plates: list[SignalPlate] = []
-
-    for shape_name, centerline in _route_candidates(
-        p1, p2, margin_um=cfg.jog_search_margin_um
-    ):
-        for i in range(1, len(centerline)):
-            if not _segment_is_45_90(centerline[i - 1], centerline[i]):
-                break
-        else:
-            extended = _extend_centerline(
-                centerline,
-                extend_um,
-                metal_bb=metal_bb,
-                pad_bb=pad_bb,
-            )
-            poly = _stroke_polygon(extended, width, mte_pair[0], mte_pair[1])
-            plate = SignalPlate(
-                polygon=poly, centerline=extended, shape_name=shape_name
-            )
-            net_polys = union_signal_net(preserved, plate, layermap, cfg)
-            _, reaches_pad, min_clear, violations = _verify_signal_net(
-                net_polys, plate.polygon, signal_pads, ground_obs, cfg
-            )
-            cid = len(plates)
-            plates.append(plate)
-            options.append(
-                ShuntRouteOption(
-                    candidate_id=cid,
-                    shape_name=shape_name,
-                    length_um=round(_centerline_length(centerline), 1),
-                    drc_clean=not violations,
-                    reaches_pad=reaches_pad,
-                    min_ground_spacing_um=round(min_clear, 3)
-                    if min_clear == min_clear
-                    else float("nan"),
-                    violations=tuple(violations),
-                )
-            )
-
-    ranked = sorted(
-        zip(options, plates, strict=True),
-        key=lambda pair: (
-            not pair[0].drc_clean,
-            not pair[0].reaches_pad,
-            pair[0].length_um,
-        ),
-    )
-    options = [
-        ShuntRouteOption(
-            candidate_id=i,
-            shape_name=opt.shape_name,
-            length_um=opt.length_um,
-            drc_clean=opt.drc_clean,
-            reaches_pad=opt.reaches_pad,
-            min_ground_spacing_um=opt.min_ground_spacing_um,
-            violations=opt.violations,
-        )
-        for i, (opt, _) in enumerate(ranked)
-    ]
-    plates = [plate for _, plate in ranked]
-    return endpoints, options, plates
-
-
-def build_shunt_signal_net_from_plate(
-    preserved: PreservedMetal,
-    classification: NodeClassification,
-    ground_plates: GroundPlates,
-    layermap: LayerMap,
-    connector: SignalPlate,
-    config: SignalBuildConfig | None = None,
+    body_mte_polys: Sequence[gdstk.Polygon] | None = None,
 ) -> SignalNetResult:
-    """Build a full shunt ``SignalNetResult`` from a chosen connector plate."""
-    cfg = config or SignalBuildConfig()
-    ground_obs = _ground_mbe_obstacles(classification, ground_plates, layermap, cfg)
-    endpoints = signal_endpoints(preserved, classification, cfg)
-    signal_pads = _signal_pad_polygons(classification, layermap, cfg)
-    net_polys = union_signal_net(preserved, connector, layermap, cfg)
-    is_connected, reaches_pad, min_clear, violations = _verify_signal_net(
-        net_polys, connector.polygon, signal_pads, ground_obs, cfg
+    """Draw one extension from the preserved collar overlapping resonator-body MTE."""
+    preserved_polys = _preserved_mte_polys(preserved)
+    collar_tp = select_preserved_collar_mte(
+        preserved,
+        body_mte_polys or [],
+        min_overlap_um2=0.01,
+        precision=cfg.boolean_precision,
     )
+    if collar_tp is None:
+        return SignalNetResult(
+            endpoints=_empty_endpoints(preserved),
+            connector=SignalPlate(
+                polygon=gdstk.Polygon([(0.0, 0.0)], layer=0, datatype=0),
+                centerline=[],
+                shape_name="none",
+            ),
+            net_polygons=[],
+            preserved_collar_polygons=preserved_polys,
+            n_net_polygons=0,
+            signal_terminal="MBE",
+            signal_drawable=False,
+            is_connected=False,
+            min_ground_spacing_um=float("nan"),
+            drc_violations=[],
+        )
+
+    mte_layer, mte_datatype = layermap.pair(cfg.mte_layer)
+    extension, intercept, tip = draw_mte_from_preserved_collar(
+        collar_tp, layermap, cfg
+    )
+    if (extension.layer, extension.datatype) != (mte_layer, mte_datatype):
+        raise ValueError(
+            f"extension on {(extension.layer, extension.datatype)}, "
+            f"expected {(mte_layer, mte_datatype)}"
+        )
+
+    violations = check_mte_attached_to_collar(
+        extension, collar_tp.polygon, cfg.boolean_precision
+    )
+    is_connected = not violations
     return SignalNetResult(
-        endpoints=endpoints,
-        connector=connector,
-        net_polygons=net_polys,
-        signal_pad_polygons=signal_pads,
-        n_net_polygons=len(net_polys),
+        endpoints=SignalEndpoints(
+            preserved=collar_tp,
+            metal_point=intercept,
+            pad_point=tip,
+            metal_edge=(intercept, intercept),
+            pad_edge=(tip, tip),
+            clearance_um=cfg.collar_extension_um,
+        ),
+        connector=SignalPlate(
+            polygon=extension,
+            centerline=[intercept, tip],
+            shape_name="collar_extend",
+        ),
+        net_polygons=[extension],
+        preserved_collar_polygons=preserved_polys,
+        n_net_polygons=1,
+        signal_terminal="MTE",
+        signal_drawable=True,
         is_connected=is_connected,
-        reaches_pad=reaches_pad,
-        min_ground_spacing_um=min_clear,
+        min_ground_spacing_um=float("nan"),
         drc_violations=violations,
     )
 
 
-def union_preserved_mte_net(
-    preserved: PreservedMetal,
+class _HasPreserved(Protocol):
+    preserved: PreservedMetal
+    resonator_body_mte: Sequence[gdstk.Polygon]
+
+
+def build_mte_extensions(
+    roles_by_index: Mapping[int, _HasPreserved],
     layermap: LayerMap,
     config: SignalBuildConfig | None = None,
-) -> list[gdstk.Polygon]:
-    """Boolean-OR preserved MTE polygons only (series / on-resonator signal net)."""
+) -> dict[int, SignalNetResult]:
+    """
+    Step 5.3 — draw one ~13 µm MTE extension per resonator.
+
+    Selects the preserved collar that overlaps resonator-body MTE (typically one
+    of two connectMTE pieces). Single entry point: pass ``all_roles`` from 5.1.
+    """
     cfg = config or SignalBuildConfig()
-    mte_pair = layermap.pair(cfg.mte_layer)
-    parts: list[gdstk.Polygon] = [
-        tag.polygon
-        for tag in preserved.mte
-        if layermap.pair(tag.layer_name) == mte_pair
-    ]
-    return _union_polys(parts, cfg.boolean_precision)
-
-
-def union_signal_net(
-    preserved: PreservedMetal,
-    connector: SignalPlate,
-    layermap: LayerMap,
-    config: SignalBuildConfig | None = None,
-) -> list[gdstk.Polygon]:
-    """Boolean-OR all preserved MTE polygons with the connector plate."""
-    cfg = config or SignalBuildConfig()
-    mte_pair = layermap.pair(cfg.mte_layer)
-    parts: list[gdstk.Polygon] = [
-        tag.polygon
-        for tag in preserved.mte
-        if layermap.pair(tag.layer_name) == mte_pair
-    ]
-    parts.append(connector.polygon)
-    return _union_polys(parts, cfg.boolean_precision)
-
-
-def _series_signal_endpoints(
-    preserved: PreservedMetal,
-    arc_start: Point,
-    arc_end: Point,
-) -> SignalEndpoints:
-    """Endpoints for series perimeter strip — arc launch points, no GSG pad."""
-    mte_tag = preserved.mte[0] if preserved.mte else None
-    if mte_tag is None:
-        mte_tag = TaggedPolygon(
-            label="series_boundary",
-            layer_name="BAW_MTE",
-            polygon=gdstk.Polygon([(0.0, 0.0)]),
+    return {
+        idx: _mte_extensions_from_preserved(
+            roles.preserved,
+            layermap,
+            cfg,
+            body_mte_polys=roles.resonator_body_mte,
         )
-    edge: Edge = (arc_start, arc_end)
+        for idx, roles in roles_by_index.items()
+    }
+
+
+def mte_extensions_overview_rows(
+    extensions: Mapping[int, SignalNetResult],
+    *,
+    inst_names: Mapping[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Summary rows for notebook display after ``build_mte_extensions``."""
+    rows: list[dict[str, object]] = []
+    for idx in sorted(extensions):
+        result = extensions[idx]
+        rows.append(
+            {
+                "index": idx,
+                "inst_name": inst_names.get(idx) if inst_names else None,
+                "n_preserved_mte": len(result.preserved_collar_polygons),
+                "n_extensions": result.n_net_polygons,
+                "is_connected": result.is_connected,
+            }
+        )
+    return rows
+
+
+def _empty_endpoints(preserved: PreservedMetal) -> SignalEndpoints:
+    pt = (0.0, 0.0)
+    edge = (pt, pt)
+    preserved_tp = preserved.mte[0] if preserved.mte else (
+        preserved.mbe[0] if preserved.mbe else None
+    )
+    if preserved_tp is None:
+        raise ValueError("no preserved metal for empty signal endpoints")
     return SignalEndpoints(
-        preserved=mte_tag,
-        signal_pad=None,
-        metal_point=arc_start,
-        pad_point=arc_end,
+        preserved=preserved_tp,
+        metal_point=pt,
+        pad_point=pt,
         metal_edge=edge,
         pad_edge=edge,
         clearance_um=float("nan"),
     )
 
 
-def _verify_signal_net(
+def _release_hole_violations(
     net_polys: Sequence[gdstk.Polygon],
-    connector: gdstk.Polygon,
-    signal_pads: Sequence[gdstk.Polygon],
-    ground_obstacles: Sequence[gdstk.Polygon],
-    config: SignalBuildConfig,
-) -> tuple[bool, bool, float, list[str]]:
+    release_holes: ReleaseHoles | None,
+    min_um: float,
+) -> list[str]:
+    if release_holes is None or min_um <= 0:
+        return []
     violations: list[str] = []
-    if not net_polys:
-        return False, False, 0.0, ["signal net is empty"]
-
-    path_poly = _path_net_polygon(net_polys, connector, config.boolean_precision)
-    is_connected = path_poly is not None
-    if not is_connected:
-        violations.append("connector does not merge with any preserved MTE polygon")
-
-    pad_clear = float("inf")
-    reaches_pad = False
-    check_polys = [path_poly] if path_poly is not None else list(net_polys)
-    for pad in signal_pads:
-        for net in check_polys:
-            d, _, _ = _min_spacing(net, pad)
-            pad_clear = min(pad_clear, d)
-            if d <= config.connect_tolerance_um + 1e-6:
-                reaches_pad = True
-    if signal_pads and not reaches_pad:
-        violations.append(
-            f"connector does not reach signal pad within {config.connect_tolerance_um}um "
-            f"(closest {pad_clear:.1f}um)"
-        )
-
-    min_ground = float("inf")
-    violates, d, where = _spacing_violates(
-        connector,
-        ground_obstacles,
-        config.mbe_mte_spacing_um,
-        config.boolean_precision,
-    )
-    min_ground = d
-    if violates or d < config.mbe_mte_spacing_um - 1e-6:
-        violations.append(
-            f"connector/ground MBE spacing at ({where[0]:.1f}, {where[1]:.1f}): "
-            f"{d:.1f}um < {config.mbe_mte_spacing_um:.0f}um"
-        )
-
-    if min_ground == float("inf"):
-        min_ground = float("nan")
-
-    is_success_path = is_connected and reaches_pad
-    return is_success_path, reaches_pad, min_ground, violations
-
-
-def _verify_series_signal_net(
-    net_polys: Sequence[gdstk.Polygon],
-    ground_obstacles: Sequence[gdstk.Polygon],
-    config: SignalBuildConfig,
-) -> tuple[bool, float, list[str]]:
-    """Series on-resonator net: non-empty perimeter strip, DRC vs ground MBE."""
-    violations: list[str] = []
-    if not net_polys:
-        return False, 0.0, ["signal net is empty"]
-
-    min_ground = float("inf")
     for net in net_polys:
-        violates, d, where = _spacing_violates(
-            net,
-            ground_obstacles,
-            config.mbe_mte_spacing_um,
-            config.boolean_precision,
-        )
-        if d < min_ground:
-            min_ground = d
-        if violates or d < config.mbe_mte_spacing_um - 1e-6:
-            violations.append(
-                f"series MTE/ground MBE spacing at ({where[0]:.1f}, {where[1]:.1f}): "
-                f"{d:.1f}um < {config.mbe_mte_spacing_um:.0f}um"
-            )
+        for hole in release_holes.all_items():
+            if gdstk.boolean(net, hole.polygon, "and", precision=1e-3):
+                violations.append(f"release hole {hole.label}: overlap with MTE net")
+            else:
+                bb_n = net.bounding_box()
+                bb_h = hole.polygon.bounding_box()
+                if bb_n and bb_h:
+                    gap = _bbox_gap(bb_n, bb_h)
+                    if gap < min_um:
+                        violations.append(
+                            f"release hole {hole.label}: clearance {gap:.2f} um < {min_um:.2f} um"
+                        )
+    return violations
 
-    if min_ground == float("inf"):
-        min_ground = float("nan")
 
-    return True, min_ground, violations
+def _bbox_gap(a: tuple[Point, Point], b: tuple[Point, Point]) -> float:
+    dx = max(0.0, max(a[0][0] - b[1][0], b[0][0] - a[1][0]))
+    dy = max(0.0, max(a[0][1] - b[1][1], b[0][1] - a[1][1]))
+    return math.hypot(dx, dy)
+
+
+def _ground_mbe_obstacles(
+    ground_plates: GroundPlates,
+    layermap: LayerMap,
+    cfg: SignalBuildConfig,
+) -> list[gdstk.Polygon]:
+    mbe_pair = layermap.pair(cfg.mbe_layer)
+    return [
+        tp.polygon
+        for tp in ground_plates.all_items()
+        if (tp.polygon.layer, tp.polygon.datatype) == mbe_pair
+    ]
 
 
 def build_signal_net(
@@ -812,82 +366,63 @@ def build_signal_net(
     layermap: LayerMap,
     config: SignalBuildConfig | None = None,
     *,
-    res: Resonator | None = None,
-    assembly: RtegFrameAssembly | None = None,
     release_holes: ReleaseHoles | None = None,
+    body_mte_polys: Sequence[gdstk.Polygon] | None = None,
 ) -> SignalNetResult:
-    """Full step-5.3 pipeline: shunt pad route or series on-resonator MTE."""
+    """Legacy wrapper: draw extensions plus optional ground/release DRC."""
     cfg = config or SignalBuildConfig()
-    ground_obs = _ground_mbe_obstacles(classification, ground_plates, layermap, cfg)
-
-    if classification.signal_band == "on_resonator":
-        if res is None or assembly is None or release_holes is None:
-            raise ValueError(
-                "series on_resonator signal net requires res, assembly, and release_holes"
-            )
-        from rteg_series_mte import build_series_boundary_mte
-
-        net_polys, centerline, shape_name, hole_a, hole_b = build_series_boundary_mte(
-            res,
-            assembly,
-            release_holes,
-            layermap,
-            cfg,
-            ground_obstacles=ground_obs,
-        )
-        endpoints = _series_signal_endpoints(
-            preserved, centerline[0], centerline[-1]
-        )
-        connector = SignalPlate(
-            polygon=net_polys[0],
-            centerline=list(centerline),
-            shape_name=shape_name,
-        )
-        is_connected = bool(net_polys)
-        violations: list[str] = []
-        if not is_connected:
-            violations.append("signal net is empty")
-        _, min_clear, drc_violations = _verify_series_signal_net(
-            net_polys, ground_obs, cfg
-        )
-        violations.extend(drc_violations)
+    if not classification.signal_drawable or not preserved.mte:
+        endpoints = _empty_endpoints(preserved)
         return SignalNetResult(
             endpoints=endpoints,
-            connector=connector,
-            net_polygons=net_polys,
-            signal_pad_polygons=[],
-            n_net_polygons=len(net_polys),
-            is_connected=is_connected,
-            reaches_pad=False,
-            min_ground_spacing_um=min_clear,
-            drc_violations=violations,
+            connector=SignalPlate(
+                polygon=gdstk.Polygon([(0.0, 0.0)], layer=0, datatype=0),
+                centerline=[],
+                shape_name="none",
+            ),
+            net_polygons=[],
+            preserved_collar_polygons=[],
+            n_net_polygons=0,
+            signal_terminal=classification.signal_terminal,
+            signal_drawable=False,
+            is_connected=False,
+            min_ground_spacing_um=float("nan"),
+            drc_violations=[],
         )
 
-    endpoints = signal_endpoints(preserved, classification, cfg)
-    signal_pads = _signal_pad_polygons(classification, layermap, cfg)
-    connector = build_signal_plate(
-        endpoints, layermap, cfg, ground_obstacles=ground_obs
+    result = _mte_extensions_from_preserved(
+        preserved, layermap, cfg, body_mte_polys=body_mte_polys
     )
-    net_polys = union_signal_net(preserved, connector, layermap, cfg)
-    is_connected, reaches_pad, min_clear, violations = _verify_signal_net(
-        net_polys, connector.polygon, signal_pads, ground_obs, cfg
+    violations = list(result.drc_violations)
+    min_clear = float("inf")
+    for extension in result.net_polygons:
+        d, drc_v = check_mte_vs_ground_drc(
+            extension,
+            _ground_mbe_obstacles(ground_plates, layermap, cfg),
+            cfg.mbe_mte_spacing_um,
+            cfg.boolean_precision,
+        )
+        if not math.isnan(d) and d < min_clear:
+            min_clear = d
+        violations.extend(drc_v)
+    violations.extend(
+        _release_hole_violations(
+            result.net_polygons, release_holes, cfg.release_hole_clearance_um
+        )
     )
-    return SignalNetResult(
-        endpoints=endpoints,
-        connector=connector,
-        net_polygons=net_polys,
-        signal_pad_polygons=signal_pads,
-        n_net_polygons=len(net_polys),
-        is_connected=is_connected,
-        reaches_pad=reaches_pad,
-        min_ground_spacing_um=min_clear,
-        drc_violations=violations,
-    )
+    if min_clear == float("inf"):
+        min_clear = float("nan")
+
+    result.signal_terminal = classification.signal_terminal
+    result.min_ground_spacing_um = min_clear
+    result.drc_violations = violations
+    result.is_connected = not any("not attached" in v for v in violations)
+    return result
 
 
 @dataclass
 class SignalRtegAssembly:
-    """Step-4 frame assembly with the step-5.3 MTE connector merged for export."""
+    """Step-4 frame assembly with step-5.3 MTE extensions added for export."""
 
     frame: RtegFrameAssembly
     signal: SignalNetResult
@@ -909,16 +444,12 @@ class SignalRtegAssembly:
         return self.frame.library
 
     def flatten(self) -> gdstk.Cell:
-        """Full framed RTEG layout plus the generated MTE connector plate."""
+        """Full framed layout plus new drawn MTE polygons; frame metal unchanged."""
         cell = self.frame.flatten().copy(
             f"rteg_{self.index:02d}_{self.inst_name}_mte"
         )
-        if self.signal.is_on_resonator:
-            for poly in self.signal.net_polygons:
-                cell.add(gdstk.Polygon(poly.points, poly.layer, poly.datatype))
-        else:
-            conn = self.signal.connector.polygon
-            cell.add(gdstk.Polygon(conn.points, conn.layer, conn.datatype))
+        for poly in self.signal.net_polygons:
+            cell.add(gdstk.Polygon(poly.points, poly.layer, poly.datatype))
         return cell
 
 
@@ -926,7 +457,6 @@ def build_signal_rteg_assemblies(
     frame_assemblies: Sequence[RtegFrameAssembly],
     signals: Mapping[int, SignalNetResult],
 ) -> list[SignalRtegAssembly]:
-    """Pair each framed assembly with its built signal net."""
     return [
         SignalRtegAssembly(frame=asm, signal=signals[asm.index])
         for asm in frame_assemblies
@@ -943,13 +473,6 @@ def export_signal_rteg_gds(
     flatten: bool = True,
     write_lyp: bool = True,
 ) -> list[ExportResult]:
-    """
-    Export full framed RTEG layouts with the generated MTE connector to GDS.
-
-    Writes one ``.gds`` (and matching ``.lyp`` when ``layermap`` is set) per
-    resonator under ``output_dir``. Filenames follow the step-4 convention with
-    stage suffix ``mte``.
-    """
     assemblies = build_signal_rteg_assemblies(frame_assemblies, signals)
     return export_gds(
         assemblies,
@@ -963,7 +486,6 @@ def export_signal_rteg_gds(
 
 
 def signal_net_summary_table(result: SignalNetResult) -> list[dict[str, object]]:
-    """Flat rows for notebook display."""
     rows: list[dict[str, object]] = [
         {"section": "summary", **result.summary()},
         {"section": "endpoints", **result.endpoints.summary()},
@@ -974,11 +496,14 @@ def signal_net_summary_table(result: SignalNetResult) -> list[dict[str, object]]
             {
                 "section": "net_polygon",
                 "index": i,
+                "layer": (poly.layer, poly.datatype),
                 "vertices": len(poly.points),
                 "bbox": (
                     (round(bb[0][0], 1), round(bb[0][1], 1)),
                     (round(bb[1][0], 1), round(bb[1][1], 1)),
-                ),
+                )
+                if bb
+                else None,
             }
         )
     for v in result.drc_violations:
@@ -986,247 +511,15 @@ def signal_net_summary_table(result: SignalNetResult) -> list[dict[str, object]]
     return rows
 
 
-def _union_bbox(
-    boxes: Sequence[tuple[Point, Point]], margin_um: float = 0.0
-) -> tuple[Point, Point]:
-    xs: list[float] = []
-    ys: list[float] = []
-    for (x0, y0), (x1, y1) in boxes:
-        xs.extend([x0, x1])
-        ys.extend([y0, y1])
-    if not xs:
-        return (0.0, 0.0), (0.0, 0.0)
-    return (
-        (min(xs) - margin_um, min(ys) - margin_um),
-        (max(xs) + margin_um, max(ys) + margin_um),
-    )
-
-
-def _bbox_intersects(a: tuple[Point, Point], b: tuple[Point, Point]) -> bool:
-    return not (a[1][0] < b[0][0] or a[0][0] > b[1][0] or a[1][1] < b[0][1] or a[0][1] > b[1][1])
-
-
-def _crop_svg_to_bbox(
-    svg: str, focus: tuple[Point, Point], *, max_width_px: float = 320.0
-) -> str:
-    """Crop gdstk SVG to a GDS bbox and cap rendered pixel width."""
-    (x0, y0), (x1, y1) = focus
-    width = x1 - x0
-    height = y1 - y0
-    if width <= 0 or height <= 0:
-        return svg
-    px_w = max_width_px
-    px_h = max_width_px * (height / width)
-    header = (
-        f'width="{px_w:g}" height="{px_h:g}" '
-        f'viewBox="{x0:g} {-y1:g} {width:g} {height:g}"'
-    )
-    return re.sub(
-        r'width="[^"]+" height="[^"]+" viewBox="[^"]+"',
-        header,
-        svg,
-        count=1,
-    )
-
-
-def _copy_flat_cell(flat: gdstk.Cell, name: str) -> gdstk.Cell:
-    """Clone a flattened layout cell for preview overlays."""
-    return flat.copy(name)
-
-
-def preview_signal_net_svg(
-    result: SignalNetResult,
-    layermap: LayerMap,
-    *,
-    assembly: RtegFrameAssembly | None = None,
-    classification: NodeClassification | None = None,
-    ground_plates: GroundPlates | None = None,
-    show_ground_context: bool = True,
-    focus_margin_um: float = 40.0,
-    max_width_px: float = 320.0,
-    config: SignalBuildConfig | None = None,
-) -> str:
-    """
-    Render the signal MTE route on top of the full RTEG frame assembly.
-
-    Pass ``assembly`` (step-4 ``RtegFrameAssembly``) to show the resonator, GSG
-    pads, frame, and filler at the same scale as ``prep_rteg_frame.preview_assembly_svg``.
-    The new connector plate is drawn in translucent red; the centerline and
-    launch squares are orange.
-
-    Without ``assembly``, falls back to a cropped route-only view (legacy).
-    """
-    cfg = config or SignalBuildConfig()
-    mte_pair = layermap.pair(cfg.mte_layer)
-    mbe_pair = layermap.pair(cfg.mbe_layer)
-    edge_pair = layermap.pair("BAW_EDGE")
-    connector_dt = mte_pair[1] + 100
-    overlay_pair = (edge_pair[0], edge_pair[1] + 1)
-
-    if assembly is not None:
-        cell = _copy_flat_cell(assembly.flatten(), "signal_mte_preview")
-        focus_bb = None
-    else:
-        ground_dt = mbe_pair[1] + 10
-        signal_dt = mbe_pair[1] + 11
-        mp, pp = result.endpoints.metal_point, result.endpoints.pad_point
-        focus_bb = _union_bbox(
-            [
-                *(poly.bounding_box() for poly in result.net_polygons),
-                result.connector.polygon.bounding_box(),
-                *((p.bounding_box() for p in result.signal_pad_polygons)),
-                ((mp[0] - 8.0, mp[1] - 8.0), (mp[0] + 8.0, mp[1] + 8.0)),
-                ((pp[0] - 8.0, pp[1] - 8.0), (pp[0] + 8.0, pp[1] + 8.0)),
-            ],
-            margin_um=focus_margin_um,
-        )
-        cell = gdstk.Cell("signal_mte_preview")
-        if show_ground_context and classification is not None and ground_plates is not None:
-            for node in classification.nodes:
-                if node.net == "ground":
-                    for tagged in node.polygons:
-                        if layermap.pair(tagged.layer_name) != mbe_pair:
-                            continue
-                        if not _bbox_intersects(tagged.bbox or focus_bb, focus_bb):
-                            continue
-                        cell.add(
-                            gdstk.Polygon(
-                                tagged.polygon.points, mbe_pair[0], ground_dt
-                            )
-                        )
-            for tagged in ground_plates.filler:
-                if layermap.pair(tagged.layer_name) != mbe_pair:
-                    continue
-                if not _bbox_intersects(tagged.bbox or focus_bb, focus_bb):
-                    continue
-                cell.add(
-                    gdstk.Polygon(
-                        tagged.polygon.points, mbe_pair[0], ground_dt
-                    )
-                )
-        for pad in result.signal_pad_polygons:
-            cell.add(gdstk.Polygon(pad.points, mbe_pair[0], signal_dt))
-        for poly in result.net_polygons:
-            cell.add(gdstk.Polygon(poly.points, *mte_pair))
-
-    if result.is_on_resonator:
-        for poly in result.net_polygons:
-            cell.add(
-                gdstk.Polygon(poly.points, mte_pair[0], connector_dt)
-            )
-        if len(result.connector.centerline) >= 2:
-            cell.add(
-                gdstk.FlexPath(
-                    result.connector.centerline,
-                    1.5,
-                    layer=overlay_pair[0],
-                    datatype=overlay_pair[1],
-                )
-            )
-        for pt in (result.endpoints.metal_point, result.endpoints.pad_point):
-            cell.add(
-                gdstk.rectangle(
-                    (pt[0] - 4.0, pt[1] - 4.0),
-                    (pt[0] + 4.0, pt[1] + 4.0),
-                    layer=overlay_pair[0],
-                    datatype=overlay_pair[1],
-                )
-            )
-    else:
-        cell.add(
-            gdstk.Polygon(
-                result.connector.polygon.points, mte_pair[0], connector_dt
-            )
-        )
-
-        if len(result.connector.centerline) >= 2:
-            cell.add(
-                gdstk.FlexPath(
-                    result.connector.centerline,
-                    1.5,
-                    layer=overlay_pair[0],
-                    datatype=overlay_pair[1],
-                )
-            )
-
-        for pt in (result.endpoints.metal_point, result.endpoints.pad_point):
-            cell.add(
-                gdstk.rectangle(
-                    (pt[0] - 4.0, pt[1] - 4.0),
-                    (pt[0] + 4.0, pt[1] + 4.0),
-                    layer=overlay_pair[0],
-                    datatype=overlay_pair[1],
-                )
-            )
-
-    shape_style: dict[tuple[int, int], dict[str, str]] = {}
-    if result.is_on_resonator:
-        shape_style = {
-            (mte_pair[0], connector_dt): {
-                "fill": "#e74c3c",
-                "fill-opacity": "0.55",
-                "stroke": "#c0392b",
-                "stroke-width": "2",
-            },
-            overlay_pair: {
-                "fill": "#f39c12",
-                "stroke": "#d35400",
-                "stroke-width": "2",
-                "stroke-dasharray": "5,3",
-            },
-        }
-    elif not result.is_on_resonator:
-        shape_style = {
-            (mte_pair[0], connector_dt): {
-                "fill": "#e74c3c",
-                "fill-opacity": "0.55",
-                "stroke": "#c0392b",
-                "stroke-width": "2",
-            },
-            overlay_pair: {
-                "fill": "#f39c12",
-                "stroke": "#d35400",
-                "stroke-width": "2",
-                "stroke-dasharray": "5,3",
-            },
-        }
-    if assembly is None:
-        ground_dt = mbe_pair[1] + 10
-        signal_dt = mbe_pair[1] + 11
-        shape_style.update(
-            {
-                (mbe_pair[0], ground_dt): {
-                    "fill": "#cccccc",
-                    "fill-opacity": "0.25",
-                    "stroke": "#999999",
-                    "stroke-width": "0.75",
-                },
-                (mbe_pair[0], signal_dt): {
-                    "fill": "#4a90d9",
-                    "fill-opacity": "0.45",
-                    "stroke": "#1a5276",
-                    "stroke-width": "1.5",
-                },
-                mte_pair: {
-                    "fill": "#e74c3c",
-                    "fill-opacity": "0.8",
-                    "stroke": "#922b21",
-                    "stroke-width": "1.5",
-                },
-            }
-        )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        svg_path = Path(tmp) / "signal_mte.svg"
-        cell.write_svg(
-            str(svg_path),
-            scaling=1.0,
-            background="#fafafa",
-            shape_style=shape_style,
-            pad="0",
-            sort_function=lambda p1, p2: (p1.layer, p1.datatype) < (p2.layer, p2.datatype),
-        )
-        svg = svg_path.read_text(encoding="utf-8")
-        if assembly is None:
-            return _crop_svg_to_bbox(svg, focus_bb, max_width_px=max_width_px)
-        return svg
+__all__ = [
+    "SignalBuildConfig",
+    "SignalNetResult",
+    "SignalRtegAssembly",
+    "build_mte_extensions",
+    "build_signal_net",
+    "build_signal_rteg_assemblies",
+    "draw_mte_from_preserved_collar",
+    "export_signal_rteg_gds",
+    "mte_extensions_overview_rows",
+    "signal_net_summary_table",
+]

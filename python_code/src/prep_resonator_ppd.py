@@ -15,8 +15,9 @@ from pathlib import Path
 import gdstk
 import pandas as pd
 
+from layermap import LayerMap
 from rteg_utils import bbox_center, frame_top_cell, resonator_world_bbox, translate_bbox
-from separate import Resonator
+from separate import IdentificationResult, Resonator
 
 # GSG PPD pad / frame metal vs resonator MBE+MTE (same layers, different cells).
 PPD_PAD_LAYERS = frozenset({(33, 0), (81, 0), (202, 0), (2, 0)})
@@ -26,6 +27,10 @@ RELEASE_HOLE_LAYERS = frozenset({(33, 0), (36, 0)})
 MIN_KEEPOUT_POLY_AREA = 10.0
 MIN_FRAME_CLEARANCE_UM = 10.0
 MIN_RELEASE_HOLE_CLEARANCE_UM = 6.0
+# Orientation placement must keep at least this gap to GSG pads (PDK6 MBE/MTE min).
+ORIENTATION_MIN_CLEARANCE_UM = 14.0
+ORIENTATION_SEARCH_STEP_UM = 10.0
+ORIENTATION_SEARCH_RADIUS_UM = 60.0
 
 
 @dataclass(frozen=True)
@@ -369,6 +374,7 @@ class ResonatorPpdAssembly:
     resonator_origin: tuple[float, float]
     centering_shift: tuple[float, float]
     clearance_shift: tuple[float, float]
+    orientation_shift: tuple[float, float]
     min_release_clearance_um: float
     shift: tuple[float, float]
     assembly_center: tuple[float, float]
@@ -392,6 +398,8 @@ class ResonatorPpdAssembly:
             "centering_shift_y": round(self.centering_shift[1], 1),
             "clearance_shift_x": round(self.clearance_shift[0], 1),
             "clearance_shift_y": round(self.clearance_shift[1], 1),
+            "orientation_shift_x": round(self.orientation_shift[0], 1),
+            "orientation_shift_y": round(self.orientation_shift[1], 1),
             "min_release_clearance_um": round(self.min_release_clearance_um, 1),
             "shift_x": round(self.shift[0], 1),
             "shift_y": round(self.shift[1], 1),
@@ -431,6 +439,87 @@ def _load_ppd_cell(
     return lib, cell
 
 
+def find_orientation_placement_shift(
+    res: Resonator,
+    base_dx: float,
+    base_dy: float,
+    ppd_cell: gdstk.Cell,
+    *,
+    ppd_origin: tuple[float, float] = (0.0, 0.0),
+    min_metal_gap: float = ORIENTATION_MIN_CLEARANCE_UM,
+    min_release_gap: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
+    search_step_um: float = ORIENTATION_SEARCH_STEP_UM,
+    search_radius_um: float = ORIENTATION_SEARCH_RADIUS_UM,
+) -> tuple[float, float]:
+    """
+    Extra ``(dx, dy)`` moving the resonator in any direction while keeping a
+    significant clearance gap to GSG pad metal.
+
+    Scans a square window around the base placement and picks the offset that
+    maximizes minimum metal/release clearance to pads without overlap.
+    """
+    keepouts = ppd_pad_keepout_polys(ppd_cell, ppd_origin)
+    if not keepouts:
+        return 0.0, 0.0
+
+    def _evaluate(extra_dx: float, extra_dy: float) -> float | None:
+        tx, ty = base_dx + extra_dx, base_dy + extra_dy
+        metal = resonator_metal_polys(res, tx, ty)
+        release = resonator_release_hole_polys(res, tx, ty)
+        if not ppd_clearance_satisfied(
+            metal,
+            release,
+            keepouts,
+            min_metal_gap=min_metal_gap,
+            min_release_gap=min_release_gap,
+        ):
+            return None
+        metal_clear = min_clearance_um(metal, keepouts)
+        release_clear = (
+            min_clearance_um(release, keepouts) if release else float("inf")
+        )
+        return min(metal_clear, release_clear)
+
+    best_shift = (0.0, 0.0)
+    best_clear = _evaluate(0.0, 0.0)
+    if best_clear is None:
+        best_clear = -1.0
+
+    steps = max(1, int(search_radius_um / search_step_um))
+    # Center-first spiral-ish order: try (0,0) then expanding rings
+    candidates: list[tuple[float, float]] = [(0.0, 0.0)]
+    for ring in range(1, steps + 1):
+        d = ring * search_step_um
+        for extra_dx in (-d, 0.0, d):
+            for extra_dy in (-d, 0.0, d):
+                if extra_dx == 0.0 and extra_dy == 0.0:
+                    continue
+                candidates.append((extra_dx, extra_dy))
+
+    for extra_dx, extra_dy in candidates:
+        score = _evaluate(extra_dx, extra_dy)
+        if score is not None and score > best_clear:
+            best_clear = score
+            best_shift = (extra_dx, extra_dy)
+            if score >= min_metal_gap * 2.0:
+                break
+
+    return best_shift
+
+
+def _orientation_placement_shift(
+    res: Resonator,
+    ppd_master: gdstk.Cell,
+    ppd_origin: tuple[float, float],
+    dx: float,
+    dy: float,
+) -> tuple[float, float]:
+    """Extra placement shift maximizing pad clearance (any axis)."""
+    return find_orientation_placement_shift(
+        res, dx, dy, ppd_master, ppd_origin=ppd_origin
+    )
+
+
 def prep_resonator_ppd(
     res_df: pd.DataFrame,
     resonators: Sequence[Resonator],
@@ -438,6 +527,8 @@ def prep_resonator_ppd(
     *,
     ppd_origin: tuple[float, float] = (0.0, 0.0),
     ppd_cell: gdstk.Cell | None = None,
+    identification: IdentificationResult | None = None,
+    layermap: LayerMap | None = None,
     min_frame_clearance: float = MIN_FRAME_CLEARANCE_UM,
     min_release_hole_clearance: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
 ) -> list[ResonatorPpdAssembly]:
@@ -474,6 +565,15 @@ def prep_resonator_ppd(
         )
         dx = center_dx + clear_dx
         dy = center_dy + clear_dy
+        orient_dx, orient_dy = _orientation_placement_shift(
+            res,
+            ppd_master,
+            ppd_origin,
+            dx,
+            dy,
+        )
+        dx += orient_dx
+        dy += orient_dy
         release_polys = resonator_release_hole_polys(res, dx, dy)
         min_release_clear = (
             min_clearance_um(release_polys, keepouts) if release_polys else float("inf")
@@ -509,6 +609,7 @@ def prep_resonator_ppd(
                 resonator_origin=rteg_origin,
                 centering_shift=(center_dx, center_dy),
                 clearance_shift=(clear_dx, clear_dy),
+                orientation_shift=(orient_dx, orient_dy),
                 min_release_clearance_um=min_release_clear,
                 shift=(dx, dy),
                 assembly_center=center,

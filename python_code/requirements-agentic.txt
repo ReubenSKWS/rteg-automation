@@ -1,4 +1,0 @@
-# Optional deps for series MTE width experiment (agent loop).
-# Install: pip install -r requirements-agentic.txt
-anthropic>=0.40.0
-python-dotenv>=1.0.0

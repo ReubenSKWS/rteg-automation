@@ -532,6 +532,136 @@ def build_signal_plate(
     return SignalPlate(polygon=poly, centerline=centerline, shape_name="straight")
 
 
+@dataclass(frozen=True)
+class ShuntRouteOption:
+    """One shunt pad-route candidate for agent selection."""
+
+    candidate_id: int
+    shape_name: str
+    length_um: float
+    drc_clean: bool
+    reaches_pad: bool
+    min_ground_spacing_um: float
+    violations: tuple[str, ...]
+
+
+def enumerate_shunt_routes(
+    preserved: PreservedMetal,
+    classification: NodeClassification,
+    ground_plates: GroundPlates,
+    layermap: LayerMap,
+    config: SignalBuildConfig | None = None,
+) -> tuple[SignalEndpoints, list[ShuntRouteOption], list[SignalPlate]]:
+    """
+    Evaluate all orthogonal / 45° pad routes for agent or debug use.
+
+    Returns endpoints, ranked option summaries, and the matching connector plates.
+    """
+    cfg = config or SignalBuildConfig()
+    ground_obs = _ground_mbe_obstacles(classification, ground_plates, layermap, cfg)
+    endpoints = signal_endpoints(preserved, classification, cfg)
+    signal_pads = _signal_pad_polygons(classification, layermap, cfg)
+    mte_pair = layermap.pair(cfg.mte_layer)
+    width = _infer_plate_width(endpoints.preserved, cfg)
+    p1, p2 = endpoints.metal_point, endpoints.pad_point
+    metal_bb = endpoints.preserved.bbox
+    pad_bb = endpoints.signal_pad.bbox
+    extend_um = max(cfg.connect_tolerance_um, width * 0.5)
+
+    options: list[ShuntRouteOption] = []
+    plates: list[SignalPlate] = []
+
+    for shape_name, centerline in _route_candidates(
+        p1, p2, margin_um=cfg.jog_search_margin_um
+    ):
+        for i in range(1, len(centerline)):
+            if not _segment_is_45_90(centerline[i - 1], centerline[i]):
+                break
+        else:
+            extended = _extend_centerline(
+                centerline,
+                extend_um,
+                metal_bb=metal_bb,
+                pad_bb=pad_bb,
+            )
+            poly = _stroke_polygon(extended, width, mte_pair[0], mte_pair[1])
+            plate = SignalPlate(
+                polygon=poly, centerline=extended, shape_name=shape_name
+            )
+            net_polys = union_signal_net(preserved, plate, layermap, cfg)
+            _, reaches_pad, min_clear, violations = _verify_signal_net(
+                net_polys, plate.polygon, signal_pads, ground_obs, cfg
+            )
+            cid = len(plates)
+            plates.append(plate)
+            options.append(
+                ShuntRouteOption(
+                    candidate_id=cid,
+                    shape_name=shape_name,
+                    length_um=round(_centerline_length(centerline), 1),
+                    drc_clean=not violations,
+                    reaches_pad=reaches_pad,
+                    min_ground_spacing_um=round(min_clear, 3)
+                    if min_clear == min_clear
+                    else float("nan"),
+                    violations=tuple(violations),
+                )
+            )
+
+    ranked = sorted(
+        zip(options, plates, strict=True),
+        key=lambda pair: (
+            not pair[0].drc_clean,
+            not pair[0].reaches_pad,
+            pair[0].length_um,
+        ),
+    )
+    options = [
+        ShuntRouteOption(
+            candidate_id=i,
+            shape_name=opt.shape_name,
+            length_um=opt.length_um,
+            drc_clean=opt.drc_clean,
+            reaches_pad=opt.reaches_pad,
+            min_ground_spacing_um=opt.min_ground_spacing_um,
+            violations=opt.violations,
+        )
+        for i, (opt, _) in enumerate(ranked)
+    ]
+    plates = [plate for _, plate in ranked]
+    return endpoints, options, plates
+
+
+def build_shunt_signal_net_from_plate(
+    preserved: PreservedMetal,
+    classification: NodeClassification,
+    ground_plates: GroundPlates,
+    layermap: LayerMap,
+    connector: SignalPlate,
+    config: SignalBuildConfig | None = None,
+) -> SignalNetResult:
+    """Build a full shunt ``SignalNetResult`` from a chosen connector plate."""
+    cfg = config or SignalBuildConfig()
+    ground_obs = _ground_mbe_obstacles(classification, ground_plates, layermap, cfg)
+    endpoints = signal_endpoints(preserved, classification, cfg)
+    signal_pads = _signal_pad_polygons(classification, layermap, cfg)
+    net_polys = union_signal_net(preserved, connector, layermap, cfg)
+    is_connected, reaches_pad, min_clear, violations = _verify_signal_net(
+        net_polys, connector.polygon, signal_pads, ground_obs, cfg
+    )
+    return SignalNetResult(
+        endpoints=endpoints,
+        connector=connector,
+        net_polygons=net_polys,
+        signal_pad_polygons=signal_pads,
+        n_net_polygons=len(net_polys),
+        is_connected=is_connected,
+        reaches_pad=reaches_pad,
+        min_ground_spacing_um=min_clear,
+        drc_violations=violations,
+    )
+
+
 def union_preserved_mte_net(
     preserved: PreservedMetal,
     layermap: LayerMap,

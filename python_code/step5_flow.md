@@ -374,3 +374,17 @@ signal = build_signal_net(
 | 7 | `seriesq3_…84748` | 270° | ~22 µm |
 
 Indices 2 and 3 share the same master cell; identical arc in resonator-local coordinates, different world orientation relative to the MBE filler.
+
+---
+
+## Series MTE experiment (parallel path)
+
+Notebook `notebook_step53_series_mte_experiment.ipynb` runs shunt pad routing plus series **offset-ring** MTE (margin × band sweep + optional agent) and exports full framed layouts.
+
+| Artifact | Location |
+|----------|----------|
+| Margin/band sweep CSV | `artifacts/mte_experiment/margin_band_sweep.csv` |
+| Agent traces | `artifacts/mte_experiment/traces/` |
+| GDS + LYP | `draft_output/MTE_experiment/` |
+
+Optional agent deps: `pip install -r requirements-agentic.txt` (`anthropic`).

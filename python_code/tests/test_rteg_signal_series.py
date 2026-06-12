@@ -166,6 +166,92 @@ class TestRtegSignalSeries(unittest.TestCase):
                 self.assertGreaterEqual(len(signal.connector.centerline), 2)
                 self.assertGreater(signal.n_net_polygons, 0)
 
+    def test_series_narrow_width_builds(self):
+        """2 µm outward offset ring builds and passes invariants on KB331 index 3."""
+        layermap, id_result, rteg = _kb331_pipeline()
+        idx = 3
+        res = id_result.resonators[idx]
+        roles = collect_geometry_roles(
+            rteg[idx], res, id_result, layermap, RtegCollectConfig()
+        )
+        classification = classify_nodes(
+            roles.ground_plates,
+            roles.preserved,
+            res_type=res.res_type,
+            config=ClassifyNodesConfig(),
+        )
+        from rteg_signal import _ground_mbe_obstacles
+        from rteg_series_mte import build_series_strip, _verify_series_boundary_invariants
+
+        cfg = SignalBuildConfig()
+        ground = list(
+            _ground_mbe_obstacles(classification, roles.ground_plates, layermap, cfg)
+        )
+        result = build_series_strip(
+            res,
+            rteg[idx],
+            roles.release_holes,
+            layermap,
+            cfg,
+            margin_um=2.0,
+            band_thickness_um=2.0,
+            build_mode="offset_ring",
+            apply_drc_finalize=True,
+            ground_obstacles=ground,
+            verify=True,
+        )
+        self.assertAlmostEqual(result.band_thickness_um, 2.0)
+        self.assertEqual(result.build_mode, "offset_ring")
+        self.assertLess(result.body_overlap_fraction, 0.05)
+        _verify_series_boundary_invariants(
+            result.strip,
+            result.centerline,
+            result.body,
+            result.hole_a,
+            result.hole_b,
+            roles.release_holes.all_items(),
+            res,
+            cfg,
+            build_mode="offset_ring",
+        )
+
+    def test_series_narrow_width_drc_idx2(self):
+        """2 µm ring on idx 2 may still violate filler-side DRC without finalize."""
+        layermap, id_result, rteg = _kb331_pipeline()
+        idx = 2
+        res = id_result.resonators[idx]
+        roles = collect_geometry_roles(
+            rteg[idx], res, id_result, layermap, RtegCollectConfig()
+        )
+        classification = classify_nodes(
+            roles.ground_plates,
+            roles.preserved,
+            res_type=res.res_type,
+            config=ClassifyNodesConfig(),
+        )
+        from rteg_signal import _ground_mbe_obstacles
+        from rteg_series_mte import build_series_strip
+
+        cfg = SignalBuildConfig()
+        ground = list(
+            _ground_mbe_obstacles(classification, roles.ground_plates, layermap, cfg)
+        )
+        result = build_series_strip(
+            res,
+            rteg[idx],
+            roles.release_holes,
+            layermap,
+            cfg,
+            margin_um=2.0,
+            band_thickness_um=2.0,
+            build_mode="offset_ring",
+            apply_drc_finalize=True,
+            ground_obstacles=ground,
+            verify=True,
+        )
+        self.assertLess(result.body_overlap_fraction, 0.05)
+        self.assertTrue(result.is_drc_clean)
+
 
 if __name__ == "__main__":
     unittest.main()

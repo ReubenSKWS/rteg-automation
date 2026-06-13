@@ -681,6 +681,23 @@ def collect_geometry_roles(
     )
 
 
+def mte_extension_frame_obstacles(
+    roles: RtegGeometryRoles,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> list[gdstk.Polygon]:
+    """Die-frame MBE geometry the horizontal MTE cap must not intersect."""
+    cfg = config or RtegCollectConfig()
+    obstacles: list[gdstk.Polygon] = []
+    if roles.frame_boundary.ring is not None:
+        obstacles.append(roles.frame_boundary.ring.polygon)
+    mbe_pair = layermap.pair(cfg.mbe_layer)
+    for tp in roles.ground_plates.all_items():
+        if (tp.polygon.layer, tp.polygon.datatype) == mbe_pair:
+            obstacles.append(tp.polygon)
+    return obstacles
+
+
 def geometry_roles_summary_table(roles: RtegGeometryRoles) -> list[dict[str, object]]:
     """Flat rows for a pandas DataFrame in the notebook."""
     rows: list[dict[str, object]] = []

@@ -51,6 +51,11 @@ class RtegCollectConfig:
     boundary_layer: str = "BAW_EDGE"
 
     preserved_overlap_margin_um: float = 10.0
+    collar_association_gap_um: float = 35.0
+    stadium_collar_area_um2: float = 2500.0
+    max_edge_collar_area_um2: float = 800.0
+    min_body_interface_collar_area_um2: float = 100.0
+    max_body_interface_collar_area_um2: float = 2000.0
     release_hole_margin_um: float = 10.0
     filler_bbox_tol_um: float = 1.0
     frame_ring_min_area_um2: float = 10_000.0
@@ -368,6 +373,154 @@ def collect_ground_plates(
     return GroundPlates(top=top, center=center, bottom=bottom, filler=filler)
 
 
+def _bbox_gap(a: Bbox, b: Bbox) -> float:
+    (ax0, ay0), (ax1, ay1) = a
+    (bx0, by0), (bx1, by1) = b
+    gap_x = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+    gap_y = max(0.0, max(ay0, by0) - min(ay1, by1))
+    return max(gap_x, gap_y)
+
+
+def polys_touch(
+    poly_a: gdstk.Polygon,
+    poly_b: gdstk.Polygon,
+    *,
+    precision: float = 1e-3,
+    min_overlap_um2: float = 0.1,
+) -> bool:
+    """True when two polygons share a measurable boolean overlap."""
+    inter = gdstk.boolean(poly_a, poly_b, "and", precision=precision)
+    if not inter:
+        return False
+    return sum(abs(p.area()) for p in inter) >= min_overlap_um2
+
+
+def polys_associated(
+    poly_a: gdstk.Polygon,
+    poly_b: gdstk.Polygon,
+    *,
+    gap_um: float,
+    precision: float = 1e-3,
+) -> bool:
+    """True when two polygons touch or their bboxes are within ``gap_um``."""
+    bb_a, bb_b = poly_a.bounding_box(), poly_b.bounding_box()
+    if bb_a is None or bb_b is None:
+        return False
+    if _bbox_gap(bb_a, bb_b) <= gap_um:
+        return True
+    return bool(gdstk.boolean(poly_a, poly_b, "and", precision=precision))
+
+
+def _polygon_key(poly: gdstk.Polygon) -> tuple[float, float, float, float, float]:
+    bb = poly.bounding_box()
+    if bb is None:
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+    (x0, y0), (x1, y1) = bb
+    return (round(abs(poly.area()), 3), round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3))
+
+
+def _associate_stadium_mte_collars(
+    seeds: list[gdstk.Polygon],
+    candidates: Sequence[gdstk.Polygon],
+    cfg: RtegCollectConfig,
+) -> list[gdstk.Polygon]:
+    """
+    When only a stadium-sized MTE piece is in ``seeds``, add nearby edge tabs.
+
+    Edge collars can sit just outside the resonator bbox window (~31 µm from the
+    stadium in KB331) while still belonging to the same resonator interconnect.
+    """
+    large = [p for p in seeds if abs(p.area()) >= cfg.stadium_collar_area_um2]
+    small = [p for p in seeds if abs(p.area()) < cfg.stadium_collar_area_um2]
+    if len(large) != 1 or small:
+        return list(seeds)
+
+    anchor_bb = _expand_bbox(large[0].bounding_box(), cfg.collar_association_gap_um)  # type: ignore[arg-type]
+    seen = {_polygon_key(p) for p in seeds}
+    collected = list(seeds)
+    for poly in candidates:
+        key = _polygon_key(poly)
+        if key in seen:
+            continue
+        bb = poly.bounding_box()
+        if bb is None or not _bbox_overlap(bb, anchor_bb):
+            continue
+        if abs(poly.area()) >= cfg.max_edge_collar_area_um2:
+            continue
+        if not polys_touch(poly, large[0], precision=1e-3):
+            continue
+        seen.add(key)
+        collected.append(poly)
+    return collected
+
+
+def _stadium_mte_polys(
+    mte_polys: Sequence[gdstk.Polygon], cfg: RtegCollectConfig
+) -> list[gdstk.Polygon]:
+    return [p for p in mte_polys if abs(p.area()) >= cfg.stadium_collar_area_um2]
+
+
+def _has_stadium_touching_collar(
+    mte_polys: Sequence[gdstk.Polygon], cfg: RtegCollectConfig
+) -> bool:
+    """True when a non-stadium preserved piece boolean-touches the stadium shell."""
+    stadiums = _stadium_mte_polys(mte_polys, cfg)
+    if not stadiums:
+        return False
+    stadium_keys = {_polygon_key(p) for p in stadiums}
+    for poly in mte_polys:
+        if _polygon_key(poly) in stadium_keys:
+            continue
+        if abs(poly.area()) >= cfg.stadium_collar_area_um2:
+            continue
+        if any(
+            polys_touch(poly, stadium, precision=1e-3) for stadium in stadiums
+        ):
+            return True
+    return False
+
+
+def _augment_preserved_mte_interface_collars(
+    mte_polys: list[gdstk.Polygon],
+    body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: RtegCollectConfig,
+) -> list[gdstk.Polygon]:
+    """
+  Add the body-side collar tab when connectMTE yields only the stadium shell.
+
+    Series resonators often show a closed stadium outline plus a separate collar
+    polygon in layout. The collar boolean-touches the body stadium and the filter
+    connectMTE stadium at the interconnect mouth.
+    """
+    stadiums = _stadium_mte_polys(mte_polys, cfg)
+    if not stadiums or _has_stadium_touching_collar(mte_polys, cfg):
+        return mte_polys
+
+    body_significant = [
+        p
+        for p in body_mte_polys
+        if abs(p.area()) >= cfg.min_body_interface_collar_area_um2
+    ]
+    if len(body_significant) < 2:
+        return mte_polys
+
+    body_stadium = max(body_significant, key=lambda p: abs(p.area()))
+    seen = {_polygon_key(p) for p in mte_polys}
+    candidates = [
+        p
+        for p in body_significant
+        if p is not body_stadium
+        and abs(p.area()) <= cfg.max_body_interface_collar_area_um2
+        and _polygon_key(p) not in seen
+        and polys_touch(p, body_stadium, precision=1e-3)
+        and any(polys_touch(p, stadium, precision=1e-3) for stadium in stadiums)
+    ]
+    if not candidates:
+        return mte_polys
+    collar = min(candidates, key=lambda p: abs(p.area()))
+    return [*mte_polys, collar]
+
+
 def preserved_collars_at_shift(
     res: Resonator,
     identification: IdentificationResult,
@@ -392,6 +545,8 @@ def preserved_collars_at_shift(
     dx, dy = shift
 
     out: dict[str, list[gdstk.Polygon]] = {cfg.mte_layer: [], cfg.mbe_layer: []}
+    mte_candidates: list[gdstk.Polygon] = []
+    mte_seeds_filter: list[gdstk.Polygon] = []
     for suffix, layer_name in (
         ("connectMTE", cfg.mte_layer),
         ("connectMBE", cfg.mbe_layer),
@@ -405,16 +560,34 @@ def preserved_collars_at_shift(
                 continue
             if abs(poly.area()) < cfg.min_polygon_area_um2:
                 continue
+            if layer_name == cfg.mte_layer:
+                mte_candidates.append(poly)
             bb = poly.bounding_box()
             if bb is None or not _bbox_overlap(bb, filter_bb):
                 continue
-            out[layer_name].append(
-                gdstk.Polygon(
-                    [(x + dx, y + dy) for x, y in poly.points],
-                    layer=poly.layer,
-                    datatype=poly.datatype,
-                )
+            shifted = gdstk.Polygon(
+                [(x + dx, y + dy) for x, y in poly.points],
+                layer=poly.layer,
+                datatype=poly.datatype,
             )
+            out[layer_name].append(shifted)
+            if layer_name == cfg.mte_layer:
+                mte_seeds_filter.append(poly)
+
+    if mte_candidates and mte_seeds_filter:
+        associated = _associate_stadium_mte_collars(
+            mte_seeds_filter, mte_candidates, cfg
+        )
+        if len(associated) > len(mte_seeds_filter):
+            out[cfg.mte_layer] = [
+                gdstk.Polygon(
+                    [(x + dx, y + dy) for x, y in p.points],
+                    layer=p.layer,
+                    datatype=p.datatype,
+                )
+                for p in associated
+            ]
+
     return out[cfg.mte_layer], out[cfg.mbe_layer]
 
 
@@ -433,20 +606,32 @@ def collect_preserved_metal(
     into RTEG world space via the same shift as ``resonator_metal_polys``.
     """
     cfg = config or RtegCollectConfig()
+    shift = _resonator_shift(res, assembly)
     mte_polys, mbe_polys = preserved_collars_at_shift(
         res,
         identification,
         layermap,
-        shift=_resonator_shift(res, assembly),
+        shift=shift,
         config=cfg,
     )
+    n_connect = len(mte_polys)
+    body_mte = collect_resonator_body_mte(res, assembly, layermap, cfg)
+    mte_polys = _augment_preserved_mte_interface_collars(mte_polys, body_mte, cfg)
     return PreservedMetal(
         mbe=[
             TaggedPolygon(f"preserved_{cfg.mbe_layer}[{i}]", cfg.mbe_layer, p)
             for i, p in enumerate(mbe_polys)
         ],
         mte=[
-            TaggedPolygon(f"preserved_{cfg.mte_layer}[{i}]", cfg.mte_layer, p)
+            TaggedPolygon(
+                (
+                    f"preserved_{cfg.mte_layer}[{i}]"
+                    if i < n_connect
+                    else f"preserved_{cfg.mte_layer}_interface[{i - n_connect}]"
+                ),
+                cfg.mte_layer,
+                p,
+            )
             for i, p in enumerate(mte_polys)
         ],
     )

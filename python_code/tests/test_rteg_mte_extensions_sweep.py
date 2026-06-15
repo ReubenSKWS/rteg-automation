@@ -15,7 +15,7 @@ for p in (str(SRC), str(TESTS)):
         sys.path.insert(0, p)
 
 from kb331_pipeline import load_kb331_pipeline
-from rteg_collect import collect_geometry_roles, preserved_mte_overlap_with_body
+from rteg_collect import collect_geometry_roles
 from rteg_mte_extensions import (
     MteBuildConfig,
     _body_centroid,
@@ -25,6 +25,7 @@ from rteg_mte_extensions import (
     find_outward_lip_ab,
     select_extension_collar,
 )
+from test_rteg_mte_placement import collar_touches_stadium, stadium_pieces
 
 
 class TestMteExtensionsSweep(unittest.TestCase):
@@ -138,34 +139,45 @@ class TestMteExtensionsSweep(unittest.TestCase):
                 0.99,
                 msg=f"index {index}",
             )
-            overlapping = [
-                tp
-                for tp in roles.preserved.mte
-                if preserved_mte_overlap_with_body(
-                    tp.polygon, roles.resonator_body_mte, precision=self.cfg.boolean_precision
+
+    def test_kb331_extensions_on_visible_collar(self):
+        results = build_mte_extensions(
+            {
+                asm.index: collect_geometry_roles(
+                    asm,
+                    res,
+                    self.ctx["identification"],
+                    self.ctx["layermap"],
                 )
-                >= self.cfg.min_collar_overlap_um2
-            ]
-            if len(overlapping) >= 2:
-                self.assertEqual(
-                    collar,
-                    min(overlapping, key=lambda tp: abs(tp.polygon.area())),
+                for asm, res in zip(
+                    self.ctx["frame_assemblies"],
+                    self.ctx["res_list"],
+                    strict=True,
+                )
+            },
+            self.ctx["layermap"],
+            self.cfg,
+        )
+        for index, result in results.items():
+            roles = collect_geometry_roles(
+                self.ctx["frame_assemblies"][index],
+                self.ctx["res_list"][index],
+                self.ctx["identification"],
+                self.ctx["layermap"],
+            )
+            if not roles.preserved.mte or result.extension is None:
+                continue
+            self.assertTrue(result.is_connected, msg=f"index {index}")
+            if index in (5, 6, 7):
+                collar = select_extension_collar(
+                    roles.preserved, roles.resonator_body_mte, self.cfg
+                )
+                assert collar is not None
+                self.assertLess(collar.area_um2, self.cfg.stadium_collar_area_um2)
+                self.assertTrue(
+                    collar_touches_stadium(collar.polygon, roles.preserved, self.cfg),
                     msg=f"index {index}",
                 )
-
-    def test_index4_selects_edge_collar_not_stadium(self):
-        index = 4
-        roles = collect_geometry_roles(
-            self.ctx["frame_assemblies"][index],
-            self.ctx["res_list"][index],
-            self.ctx["identification"],
-            self.ctx["layermap"],
-        )
-        collar = select_extension_collar(
-            roles.preserved, roles.resonator_body_mte, self.cfg
-        )
-        assert collar is not None
-        self.assertLess(abs(collar.polygon.area()), 3000.0)
 
 
 if __name__ == "__main__":

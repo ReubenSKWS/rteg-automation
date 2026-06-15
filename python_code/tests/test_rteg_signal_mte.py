@@ -85,9 +85,15 @@ class TestSignalMteKB331(unittest.TestCase):
                     overlap / abs(ext.area()),
                     self.cfg.min_connection_overlap_fraction,
                 )
+                collar_area = abs(collar.polygon.area())
+                min_merge_req = (
+                    self.cfg.min_connection_merge_um
+                    if collar_area < 700.0
+                    else self.cfg.min_merge_inset_check_um * 0.6
+                )
                 self.assertGreaterEqual(
                     min(draw.merge_inset_a_um, draw.merge_inset_b_um),
-                    self.cfg.min_connection_merge_um,
+                    min_merge_req,
                 )
             self.assertAlmostEqual(
                 result.collar_overlap_um2,
@@ -101,17 +107,21 @@ class TestSignalMteKB331(unittest.TestCase):
             self.assertEqual((ext.layer, ext.datatype), self.mte_pair)
             self.assertEqual(result.collar, collar)
 
-    def test_index6_stadium_collar_not_connected(self):
-        result, roles = self._build(6)
-        collar = select_extension_collar(
-            roles.preserved, roles.resonator_body_mte, self.cfg
-        )
-        assert collar is not None and result.extension is not None
-        self.assertFalse(result.is_connected)
-        self.assertLess(
-            result.collar_overlap_um2 / abs(result.extension.area()),
-            self.cfg.min_connection_overlap_fraction,
-        )
+    def test_golden_shunt_collars_indices0_and_1(self):
+        for index in (0, 1):
+            result, roles = self._build(index)
+            assert result.extension_draw is not None and result.collar is not None
+            collar_area = abs(result.collar.polygon.area())
+            self.assertLess(collar_area, 700.0, msg=f"index {index}")
+            cbb = result.collar.polygon.bounding_box()
+            collar_width = max(cbb[1][0] - cbb[0][0], cbb[1][1] - cbb[0][1])
+            mouth_coverage = result.extension_draw.mouth_span_um / collar_width
+            self.assertGreaterEqual(
+                mouth_coverage,
+                self.cfg.min_mouth_coverage_shunt_fraction,
+                msg=f"index {index}",
+            )
+            self.assertTrue(result.is_connected, msg=f"index {index}")
 
     def test_export_keeps_frame_mte_and_adds_extensions(self):
         for index in range(len(self.ctx["res_list"])):

@@ -134,7 +134,7 @@ class TestMteRouteKB331(unittest.TestCase):
             self.assertIsNone(result.routed_net)
             self.assertEqual(result.extension, base.extension)
 
-    def test_pick_route_start_uses_outer_edge_when_cap_faces_pad(self):
+    def test_pick_route_start_index4_uses_outer_edge_when_cap_faces_pad(self):
         index = 4
         draw = self.extensions[index].extension_draw
         assert draw is not None
@@ -146,14 +146,15 @@ class TestMteRouteKB331(unittest.TestCase):
         )
         start = pick_route_start(draw, toward_point=pad_ref)
         self.assertGreater(start.width_um, 0.0)
-        mid = (
+        outer_mid = (
             (draw.outer_edge[0][0] + draw.outer_edge[1][0]) / 2.0,
             (draw.outer_edge[0][1] + draw.outer_edge[1][1]) / 2.0,
         )
-        self.assertAlmostEqual(start.center[0], mid[0], places=3)
-        self.assertAlmostEqual(start.center[1], mid[1], places=3)
+        self.assertAlmostEqual(start.center[0], outer_mid[0], places=3)
+        self.assertAlmostEqual(start.center[1], outer_mid[1], places=3)
 
-    def test_pick_route_start_uses_mouth_edge_when_cap_faces_away(self):
+    def test_pick_route_start_index6_uses_outer_edge_when_cap_faces_pad(self):
+        """Index 6 stadium tab lip extrudes toward the pad; route leaves from the outer cap."""
         index = 6
         draw = self.extensions[index].extension_draw
         assert draw is not None
@@ -164,21 +165,12 @@ class TestMteRouteKB331(unittest.TestCase):
             (pad_bb[0][1] + pad_bb[1][1]) / 2.0,
         )
         start = pick_route_start(draw, toward_point=pad_ref)
-        inner_mid = (
-            (draw.intercept_a[0] + draw.intercept_b[0]) / 2.0,
-            (draw.intercept_a[1] + draw.intercept_b[1]) / 2.0,
-        )
         outer_mid = (
             (draw.outer_edge[0][0] + draw.outer_edge[1][0]) / 2.0,
             (draw.outer_edge[0][1] + draw.outer_edge[1][1]) / 2.0,
         )
-        self.assertAlmostEqual(start.center[0], inner_mid[0], places=3)
-        self.assertAlmostEqual(start.center[1], inner_mid[1], places=3)
-        self.assertGreater(
-            (start.center[0] - outer_mid[0]) ** 2
-            + (start.center[1] - outer_mid[1]) ** 2,
-            1.0,
-        )
+        self.assertAlmostEqual(start.center[0], outer_mid[0], places=3)
+        self.assertAlmostEqual(start.center[1], outer_mid[1], places=3)
 
     def test_build_mte_pad_route_none_for_collar_extend(self):
         index = 0

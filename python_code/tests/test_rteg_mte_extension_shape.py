@@ -17,7 +17,29 @@ for p in (str(SRC), str(TESTS)):
 
 from kb331_pipeline import load_kb331_pipeline
 from rteg_collect import TaggedPolygon
-from rteg_mte_extensions import MteBuildConfig, draw_collar_extension, find_collar_mouth_intercepts
+from rteg_mte_extensions import (
+    MteBuildConfig,
+    draw_collar_extension,
+    find_outward_lip_ab,
+)
+
+
+def _body_below_collar(collar: gdstk.Polygon) -> list[gdstk.Polygon]:
+    """Synthetic resonator-body MTE under the collar (for unit tests)."""
+    xmin, ymin = collar.bounding_box()[0]
+    xmax, ymax = collar.bounding_box()[1]
+    return [
+        gdstk.Polygon(
+            [
+                (xmin, ymin - 20.0),
+                (xmax, ymin - 20.0),
+                (xmax, ymin),
+                (xmin, ymin),
+            ],
+            layer=collar.layer,
+            datatype=collar.datatype,
+        )
+    ]
 
 
 def _outer_edge_is_straight(poly: gdstk.Polygon) -> bool:
@@ -43,12 +65,13 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             layer=5,
             datatype=0,
         )
-        mouth = find_collar_mouth_intercepts(collar)
-        self.assertAlmostEqual(mouth.intercept_a[0], 20.0)
-        self.assertAlmostEqual(mouth.intercept_a[1], 3.0)
-        self.assertAlmostEqual(mouth.intercept_b[0], 0.0)
-        self.assertAlmostEqual(mouth.intercept_b[1], 3.0)
-        self.assertAlmostEqual(mouth.outward_normal[1], 1.0, places=3)
+        body = _body_below_collar(collar)
+        lip = find_outward_lip_ab(collar, body)
+        self.assertAlmostEqual(lip.point_a[0], 20.0)
+        self.assertAlmostEqual(lip.point_a[1], 3.0)
+        self.assertAlmostEqual(lip.point_b[0], 0.0)
+        self.assertAlmostEqual(lip.point_b[1], 3.0)
+        self.assertAlmostEqual(lip.outward_normal[1], 1.0, places=3)
 
     def test_rectangular_collar_has_four_sided_extension(self):
         collar = gdstk.Polygon(
@@ -56,8 +79,11 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             layer=5,
             datatype=0,
         )
+        body = _body_below_collar(collar)
         tp = TaggedPolygon("test", "BAW_MTE", collar)
-        ext = draw_collar_extension(tp, self.layermap, MteBuildConfig()).polygon
+        ext = draw_collar_extension(
+            tp, self.layermap, MteBuildConfig(), body_mte_polys=body
+        ).polygon
         self.assertGreaterEqual(len(ext.points), 4)
         self.assertTrue(gdstk.boolean(ext, collar, "and", precision=1e-3))
         self.assertTrue(_outer_edge_is_straight(ext))
@@ -74,8 +100,11 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             layer=5,
             datatype=0,
         )
+        body = _body_below_collar(collar)
         tp = TaggedPolygon("test", "BAW_MTE", collar)
-        ext = draw_collar_extension(tp, self.layermap, MteBuildConfig()).polygon
+        ext = draw_collar_extension(
+            tp, self.layermap, MteBuildConfig(), body_mte_polys=body
+        ).polygon
         self.assertGreaterEqual(len(ext.points), 4)
         self.assertTrue(gdstk.boolean(ext, collar, "and", precision=1e-3))
         self.assertTrue(_outer_edge_is_straight(ext))

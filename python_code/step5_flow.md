@@ -9,7 +9,7 @@ This document explains how the notebook (`single_run.ipynb`) goes from a **step-
 | 3 | `prep_resonator_ppd.py`, `rteg_orientation.py`, `rteg_collect.py` | `prep_resonator_ppd`, `analyze_orientation`, `preserved_collars_at_shift` |
 | 5.1 | `rteg_collect.py` | `collect_geometry_roles` |
 | 5.2 | `rteg_orientation.py`, `rteg_classify.py` | `collect_orientation_inputs`, `classify_nodes` |
-| 5.3 | `rteg_mte_extensions.py` | `build_mte_extensions`, `find_collar_mouth_intercepts`, `draw_collar_extension` |
+| 5.3 | `rteg_mte_extensions.py` | `build_mte_extensions`, `find_outward_lip_ab`, `draw_collar_extension` |
 | export | `rteg_mte_extensions.py`, `export_gds.py` | `export_mte_extensions_gds` |
 
 **Modules:** `rteg_collect.py` (5.1) · `rteg_orientation.py` + `rteg_classify.py` (5.2) · `rteg_mte_extensions.py` (5.3)
@@ -90,11 +90,9 @@ Net rules:
 When `classification.signal_drawable`:
 
 1. Resolve `mte_pair = layermap.pair("BAW_MTE")`
-2. `select_edge_collar_mte` — smallest preserved MTE piece overlapping resonator-body MTE (edge collar, not stadium outline)
-3. `find_collar_mouth_intercepts` — corner A, walk long-side lip to corner B
-4. `draw_collar_extension` — extrude outward ~13 µm with cap parallel to mouth; inner edge inset 0.5 µm for merge overlap
-5. `_validate_extension` — boolean AND with collar must be ≥ 0.01 µm² and overlap/collar area < 50%; failure skips export for that resonator
-6. Frame cap-height shrink via `mte_extension_frame_obstacles` from `rteg_collect.py`
+2. `select_extension_collar` — smallest preserved MTE piece overlapping resonator-body MTE
+3. `find_outward_lip_ab` — outward long edge (farther from body centroid); corners A and B
+4. `draw_lip_extension` — extrude ~30 µm with straight closing cap
 
 When `signal_terminal == "MBE"`: no extension (`n_extensions=0`).
 

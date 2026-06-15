@@ -105,8 +105,8 @@ class TestMteExtensionsSweep(unittest.TestCase):
                     msg=f"index {index}",
                 )
 
-    def test_index5_selects_edge_collar_not_stadium(self):
-        index = 5
+    def test_index4_selects_edge_collar_not_stadium(self):
+        index = 4
         roles = collect_geometry_roles(
             self.ctx["frame_assemblies"][index],
             self.ctx["res_list"][index],

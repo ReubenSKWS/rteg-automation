@@ -21,6 +21,7 @@ from rteg_mte_extensions import (
     _body_centroid,
     _collar_overlap_area,
     build_mte_extensions,
+    extension_is_connected,
     find_outward_lip_ab,
     select_extension_collar,
 )
@@ -65,9 +66,24 @@ class TestMteExtensionsSweep(unittest.TestCase):
             self.assertEqual(
                 result.n_extensions,
                 1,
-                msg=f"index {index}: {result.drc_violations}",
+                msg=f"index {index}: {getattr(result, 'drc_violations', '')}",
             )
-            self.assertTrue(result.is_connected, msg=f"index {index}")
+            collar = select_extension_collar(
+                roles.preserved, roles.resonator_body_mte, self.cfg
+            )
+            assert collar is not None
+            assert result.extension is not None
+            assert result.extension_draw is not None
+            self.assertEqual(
+                result.is_connected,
+                extension_is_connected(
+                    result.extension,
+                    collar.polygon,
+                    result.extension_draw,
+                    self.cfg,
+                ),
+                msg=f"index {index}",
+            )
 
     def test_successful_extensions_attach_with_modest_overlap(self):
         for index in range(len(self.ctx["res_list"])):

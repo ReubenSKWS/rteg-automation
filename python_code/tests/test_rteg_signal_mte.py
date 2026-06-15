@@ -22,6 +22,7 @@ from rteg_mte_extensions import (
     _collar_overlap_area,
     build_mte_extensions,
     export_mte_extensions_gds,
+    extension_is_connected,
     select_extension_collar,
 )
 
@@ -59,18 +60,58 @@ class TestSignalMteKB331(unittest.TestCase):
                 continue
 
             self.assertEqual(result.n_extensions, 1)
-            self.assertTrue(result.is_connected)
             ext = result.extension
             assert ext is not None
-            self.assertTrue(
-                gdstk.boolean(ext, collar.polygon, "and", precision=1e-3),
-                f"index {index}: extension must overlap selected collar",
+            draw = result.extension_draw
+            assert draw is not None
+            connected = extension_is_connected(
+                ext, collar.polygon, draw, self.cfg
             )
-            overlap = _collar_overlap_area(ext, collar.polygon, self.cfg.boolean_precision)
-            self.assertGreaterEqual(overlap, self.cfg.min_collar_overlap_um2)
-            self.assertLess(overlap / abs(collar.polygon.area()), 0.99)
+            self.assertEqual(
+                result.is_connected,
+                connected,
+                f"index {index}: is_connected must match extension_is_connected",
+            )
+            if result.is_connected:
+                self.assertTrue(
+                    gdstk.boolean(ext, collar.polygon, "and", precision=1e-3),
+                    f"index {index}: extension must overlap selected collar",
+                )
+                overlap = _collar_overlap_area(
+                    ext, collar.polygon, self.cfg.boolean_precision
+                )
+                self.assertGreaterEqual(overlap, self.cfg.min_collar_overlap_um2)
+                self.assertGreaterEqual(
+                    overlap / abs(ext.area()),
+                    self.cfg.min_connection_overlap_fraction,
+                )
+                self.assertGreaterEqual(
+                    min(draw.merge_inset_a_um, draw.merge_inset_b_um),
+                    self.cfg.min_connection_merge_um,
+                )
+            self.assertAlmostEqual(
+                result.collar_overlap_um2,
+                _collar_overlap_area(ext, collar.polygon, self.cfg.boolean_precision),
+                places=2,
+            )
+            self.assertLess(
+                result.collar_overlap_um2 / abs(collar.polygon.area()),
+                0.99,
+            )
             self.assertEqual((ext.layer, ext.datatype), self.mte_pair)
             self.assertEqual(result.collar, collar)
+
+    def test_index6_stadium_collar_not_connected(self):
+        result, roles = self._build(6)
+        collar = select_extension_collar(
+            roles.preserved, roles.resonator_body_mte, self.cfg
+        )
+        assert collar is not None and result.extension is not None
+        self.assertFalse(result.is_connected)
+        self.assertLess(
+            result.collar_overlap_um2 / abs(result.extension.area()),
+            self.cfg.min_connection_overlap_fraction,
+        )
 
     def test_export_keeps_frame_mte_and_adds_extensions(self):
         for index in range(len(self.ctx["res_list"])):

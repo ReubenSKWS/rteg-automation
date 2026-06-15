@@ -47,6 +47,8 @@ class MteBuildConfig:
     lip_long_edge_min_um: float = 8.0
     max_overlap_fraction: float = 0.99
     min_merge_inset_check_um: float = 0.5
+    min_connection_overlap_fraction: float = 0.10
+    min_connection_merge_um: float = 1.0
     boolean_precision: float = 1e-3
     inside_probe_half_um: float = 0.25
     feasible_merge_search_iterations: int = 24
@@ -90,7 +92,10 @@ class MteExtensionResult:
     preserved_collar_polygons: list[gdstk.Polygon]
     n_extensions: int
     is_connected: bool
+    collar_overlap_um2: float = 0.0
     extension_draw: CollarExtensionDraw | None = None
+    route_draw: object | None = None  # MteRouteDraw when step 5.4 routed
+    routed_net: gdstk.Polygon | None = None
     drc_violations: list[str] = field(default_factory=list)
 
 
@@ -481,6 +486,32 @@ def _collar_overlap_area(
     return sum(abs(p.area()) for p in inter) if inter else 0.0
 
 
+def extension_is_connected(
+    ext: gdstk.Polygon,
+    collar: gdstk.Polygon,
+    draw: CollarExtensionDraw,
+    cfg: MteBuildConfig,
+) -> bool:
+    """
+    True when the extension is materially merged into the collar, not merely
+    touching at a boolean sliver.
+
+    Requires meaningful overlap area, both mouth corners merged into the collar
+    by at least ``min_connection_merge_um``, and overlap covering at least
+    ``min_connection_overlap_fraction`` of the extension polygon.
+    """
+    overlap = _collar_overlap_area(ext, collar, cfg.boolean_precision)
+    if overlap < cfg.min_collar_overlap_um2:
+        return False
+    ext_area = abs(ext.area())
+    if ext_area > 1e-6 and overlap / ext_area < cfg.min_connection_overlap_fraction:
+        return False
+    min_merge = min(draw.merge_inset_a_um, draw.merge_inset_b_um)
+    if min_merge < cfg.min_connection_merge_um:
+        return False
+    return True
+
+
 def _validate_extension(
     ext: gdstk.Polygon,
     collar: gdstk.Polygon,
@@ -589,12 +620,19 @@ def _extension_for_roles(
         body_mte_polys=roles.resonator_body_mte,
         resonator_index=resonator_index,
     )
+    overlap = _collar_overlap_area(
+        draw.polygon, collar_tp.polygon, cfg.boolean_precision
+    )
+    connected = extension_is_connected(
+        draw.polygon, collar_tp.polygon, draw, cfg
+    )
     return MteExtensionResult(
         collar=collar_tp,
         extension=draw.polygon,
         preserved_collar_polygons=preserved_polys,
         n_extensions=1,
-        is_connected=True,
+        is_connected=connected,
+        collar_overlap_um2=overlap,
         extension_draw=draw,
     )
 
@@ -625,6 +663,7 @@ def mte_extensions_overview_rows(
                 "inst_name": inst_names.get(idx) if inst_names else None,
                 "n_preserved_mte": len(result.preserved_collar_polygons),
                 "n_extensions": result.n_extensions,
+                "collar_overlap_um2": round(result.collar_overlap_um2, 2),
                 "is_connected": result.is_connected,
             }
         )
@@ -710,9 +749,9 @@ class MteRtegAssembly:
 
     def flatten(self) -> gdstk.Cell:
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
-        if self.extension.extension is not None:
-            p = self.extension.extension
-            cell.add(gdstk.Polygon(p.points, p.layer, p.datatype))
+        net = self.extension.routed_net or self.extension.extension
+        if net is not None:
+            cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
         return cell
 
 
@@ -752,6 +791,7 @@ __all__ = [
     "draw_collar_extension",
     "draw_lip_extension",
     "export_mte_extensions_gds",
+    "extension_is_connected",
     "find_outward_lip_ab",
     "mte_extensions_overview_rows",
     "mte_intercept_breakdown_rows",

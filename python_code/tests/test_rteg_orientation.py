@@ -16,8 +16,6 @@ from rteg_orientation import (
     bbox_summary,
     collar_axis,
     mte_faces_center_pad,
-    mte_faces_signal_pad,
-    mte_opposite_center_pad_east_west,
     pad_facing_direction,
     recommend_placement_shift,
 )
@@ -79,9 +77,6 @@ class TestPadFacing(unittest.TestCase):
         body = bbox_summary(_rect(140.0, 250.0, 260.0, 330.0))
         mte = bbox_summary(_rect(200.0, 300.0, 245.0, 318.0))
         assert body is not None and mte is not None
-        self.assertTrue(
-            mte_opposite_center_pad_east_west(mte, body, PADS["center"])
-        )
         self.assertFalse(
             mte_faces_center_pad(
                 mte, PADS, body_bbox=body, axis="east_west"
@@ -109,12 +104,6 @@ class TestPadFacing(unittest.TestCase):
         assert body is not None and mte is not None
         self.assertTrue(
             mte_faces_center_pad(mte, PADS, body_bbox=body)
-        )
-
-    def test_mte_faces_signal_pad_alias(self):
-        toward_top = bbox_summary(_rect(150.0, 305.0, 175.0, 335.0))
-        self.assertFalse(
-            mte_faces_signal_pad(toward_top, "top", PADS, mte_polys=[_rect(150.0, 305.0, 175.0, 335.0)])
         )
 
 

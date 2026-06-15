@@ -7,8 +7,7 @@ uses this to decide which terminal (MTE / MBE) is the signal connection and
 which pad band is the signal pad — replacing the old ``res_type`` table.
 
 All functions take bounding boxes / polygons in and return plain values; no
-resonator or assembly objects are referenced inside, so the same helpers serve
-both the deterministic orchestrator and any future agent tool-call.
+resonator or assembly objects are referenced inside.
 """
 from __future__ import annotations
 
@@ -141,29 +140,6 @@ def _pad_center(bb: Bbox) -> Point:
     return ((bb[0][0] + bb[1][0]) / 2.0, (bb[0][1] + bb[1][1]) / 2.0)
 
 
-def mte_opposite_center_pad_east_west(
-    mte_bbox: BboxSummary,
-    body_bbox: BboxSummary,
-    center_pad_bb: Bbox | None,
-) -> bool:
-    """
-    True when east-west MTE sits on the far side of the body from the center pad.
-
-    GSG pads sit west of the resonator; MTE on the east half (past the pad–body
-    midpoint in X) is directly opposite the center pad even if Y aligns with the
-    center band.
-    """
-    if center_pad_bb is None:
-        return False
-    pad_cx = _pad_center(center_pad_bb)[0]
-    body_cx = body_bbox.center[0]
-    mte_cx = mte_bbox.center[0]
-    mid_x = (pad_cx + body_cx) / 2.0
-    if pad_cx <= body_cx:
-        return mte_cx > mid_x
-    return mte_cx < mid_x
-
-
 def _mte_body_overlap_area(
     mte: gdstk.Polygon,
     body_polys: Sequence[gdstk.Polygon],
@@ -293,28 +269,6 @@ def mte_route_target(
     ):
         return "center_pad"
     return "collar_extend"
-
-
-def mte_faces_signal_pad(
-    mte_bbox: BboxSummary | None,
-    facing_pad: Band,
-    pad_bboxes_by_band: Mapping[str, Bbox | None],
-    *,
-    body_bbox: BboxSummary | None = None,
-    axis: Axis | None = None,
-    mte_polys: Sequence[gdstk.Polygon] | None = None,
-    body_polys: Sequence[gdstk.Polygon] | None = None,
-) -> bool:
-    """Deprecated alias — use ``mte_faces_center_pad``."""
-    _ = facing_pad
-    return mte_faces_center_pad(
-        mte_bbox,
-        pad_bboxes_by_band,
-        body_bbox=body_bbox,
-        axis=axis,
-        mte_polys=mte_polys,
-        body_polys=body_polys,
-    )
 
 
 def recommend_placement_shift(

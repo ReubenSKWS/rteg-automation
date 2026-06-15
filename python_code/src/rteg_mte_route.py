@@ -183,18 +183,6 @@ def pick_pad_attachment_edge(
     )
 
 
-def pick_pad_entry(
-    signal_polys: Sequence[gdstk.Polygon],
-    from_point: Point,
-    *,
-    touch_overlap_um: float,
-) -> Point:
-    """Midpoint of the pad attachment edge (with overlap)."""
-    return pick_pad_attachment_edge(
-        signal_polys, from_point, touch_overlap_um=touch_overlap_um
-    ).pad_entry
-
-
 def _outer_vertices(draw: CollarExtensionDraw) -> tuple[Point, Point]:
     """Return ``(outer_b, outer_a)`` matching ``draw_lip_extension`` vertex order."""
     return draw.outer_edge[0], draw.outer_edge[1]
@@ -518,7 +506,6 @@ __all__ = [
     "collar_mouth_facing_pad",
     "mte_route_overview_rows",
     "pick_pad_attachment_edge",
-    "pick_pad_entry",
     "pick_route_start",
     "stretch_extension_to_pad",
     "validate_pad_attachment",

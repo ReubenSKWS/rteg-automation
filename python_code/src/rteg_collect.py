@@ -202,38 +202,6 @@ def _resonator_shift(res: Resonator, assembly: RtegFrameAssembly) -> Point:
     return (rteg_origin[0] - res.origin[0], rteg_origin[1] - res.origin[1])
 
 
-def resonator_placement_summary(
-    res: Resonator, assembly: RtegFrameAssembly
-) -> dict[str, object]:
-    """Debug summary: filter vs RTEG placement for one resonator instance."""
-    import math
-
-    shift = _resonator_shift(res, assembly)
-    ppd = assembly.ppd_assembly
-    rteg_origin = (
-        float(assembly.assembly_origin[0] + ppd.resonator_origin[0]),
-        float(assembly.assembly_origin[1] + ppd.resonator_origin[1]),
-    )
-    return {
-        "inst_name": res.inst_name,
-        "master_name": res.master_name,
-        "filter_origin": (round(res.origin[0], 3), round(res.origin[1], 3)),
-        "rotation_deg": round(math.degrees(res.rotation), 1),
-        "x_reflection": res.x_reflection,
-        "magnification": res.magnification,
-        "rteg_resonator_origin": (round(rteg_origin[0], 3), round(rteg_origin[1], 3)),
-        "rteg_shift": (round(float(shift[0]), 3), round(float(shift[1]), 3)),
-        "assembly_origin": (
-            round(float(assembly.assembly_origin[0]), 3),
-            round(float(assembly.assembly_origin[1]), 3),
-        ),
-        "ppd_resonator_origin": (
-            round(float(ppd.resonator_origin[0]), 3),
-            round(float(ppd.resonator_origin[1]), 3),
-        ),
-    }
-
-
 def _resonator_rteg_bbox(
     res: Resonator, assembly: RtegFrameAssembly
 ) -> Bbox:

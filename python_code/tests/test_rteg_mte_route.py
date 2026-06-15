@@ -1,4 +1,4 @@
-"""Step 5.4 — MTE pad routing from 5.3 extensions."""
+"""Step 5.4 — MTE pad stretch routing from 5.3 extensions."""
 from __future__ import annotations
 
 import sys
@@ -20,44 +20,63 @@ from rteg_collect import collect_geometry_roles, collect_orientation_inputs
 from rteg_mte_extensions import MteBuildConfig, build_mte_extensions
 from rteg_mte_route import (
     MteRouteConfig,
-    build_corridor_route,
     build_mte_pad_route,
     build_mte_pad_routes,
-    pick_pad_entry,
+    pick_pad_attachment_edge,
     pick_route_start,
-    union_mte_net,
+    stretch_extension_to_pad,
 )
 
 
+def _pad_bbox_corners(signal_polys: list[gdstk.Polygon]) -> tuple[float, float, float, float]:
+    bb = signal_polys[0].bounding_box()
+    assert bb is not None
+    (x0, y0), (x1, y1) = bb
+    return x0, y0, x1, y1
+
+
 class TestMteRouteSynthetic(unittest.TestCase):
-    def test_straight_corridor_reaches_pad(self):
-        cfg = MteRouteConfig()
-        route, waypoints = build_corridor_route(
-            (50.0, 50.0),
-            (10.0, 50.0),
-            6.0,
-            [],
-            5,
-            0,
-            cfg,
-        )
+    def test_pick_pad_attachment_edge_right_side(self):
         pad = gdstk.rectangle((0.0, 40.0), (12.0, 60.0), layer=2, datatype=0)
-        entry = pick_pad_entry([pad], (50.0, 50.0), touch_overlap_um=0.5)
-        self.assertLess(entry[0], 12.0)
-        self.assertGreaterEqual(len(waypoints), 2)
-        inter = gdstk.boolean(route, pad, "and", precision=cfg.boolean_precision)
+        attachment = pick_pad_attachment_edge(
+            [pad], (50.0, 50.0), touch_overlap_um=0.5
+        )
+        self.assertAlmostEqual(attachment.corner_low[0], 11.5, places=3)
+        self.assertAlmostEqual(attachment.corner_high[0], 11.5, places=3)
+        self.assertAlmostEqual(attachment.corner_low[1], 40.0, places=3)
+        self.assertAlmostEqual(attachment.corner_high[1], 60.0, places=3)
+        self.assertGreater(attachment.span_um, 19.0)
+
+    def test_stretch_reaches_pad_corners(self):
+        cfg = MteRouteConfig()
+        pad = gdstk.rectangle((0.0, 40.0), (12.0, 60.0), layer=2, datatype=0)
+        inner_a = (50.0, 48.0)
+        inner_b = (50.0, 52.0)
+        outer_b = (40.0, 48.0)
+        outer_a = (40.0, 52.0)
+        from rteg_mte_extensions import CollarExtensionDraw
+
+        draw = CollarExtensionDraw(
+            polygon=gdstk.Polygon([inner_a, inner_b, outer_b, outer_a], layer=5, datatype=0),
+            intercept_a=inner_a,
+            intercept_b=inner_b,
+            outer_edge=(outer_b, outer_a),
+            extension_um=14.0,
+            target_extension_um=14.0,
+            mouth_span_um=4.0,
+        )
+        stretched, attachment = stretch_extension_to_pad(
+            draw, [pad], cfg, 5, 0, from_point=(45.0, 50.0)
+        )
+        self.assertAlmostEqual(stretched.points[0][0], inner_a[0], places=3)
+        self.assertAlmostEqual(stretched.points[1][0], inner_b[0], places=3)
+        self.assertAlmostEqual(stretched.points[2][0], 11.5, places=3)
+        self.assertAlmostEqual(stretched.points[3][0], 11.5, places=3)
+        self.assertAlmostEqual(stretched.points[2][1], 40.0, places=3)
+        self.assertAlmostEqual(stretched.points[3][1], 60.0, places=3)
+        inter = gdstk.boolean(stretched, pad, "and", precision=cfg.boolean_precision)
         self.assertTrue(inter)
         self.assertGreater(sum(abs(p.area()) for p in inter), 0.01)
-
-    def test_union_covers_extension_and_route(self):
-        ext = gdstk.rectangle((40.0, 47.0), (60.0, 53.0), layer=5, datatype=0)
-        cfg = MteRouteConfig()
-        route, _ = build_corridor_route(
-            (50.0, 50.0), (15.0, 50.0), 6.0, [], 5, 0, cfg
-        )
-        net = union_mte_net(ext, route, precision=cfg.boolean_precision)
-        self.assertTrue(gdstk.boolean(net, ext, "and", precision=cfg.boolean_precision))
-        self.assertTrue(gdstk.boolean(net, route, "and", precision=cfg.boolean_precision))
 
 
 class TestMteRouteKB331(unittest.TestCase):
@@ -105,8 +124,37 @@ class TestMteRouteKB331(unittest.TestCase):
             cls.route_cfg,
         )
 
+    def _assert_stretch_to_pad_corners(self, index: int) -> None:
+        base = self.extensions[index]
+        result = self.routed[index]
+        classification = self.all_classify[index]
+        assert base.extension_draw is not None
+        assert result.route_draw is not None
+        assert result.routed_net is not None
+
+        pads = [tp.polygon for tp in classification.signal_polygons()]
+        x0, y0, x1, y1 = _pad_bbox_corners(pads)
+        overlap_x = x1 - self.route_cfg.pad_touch_overlap_um
+        outer_pts = result.routed_net.points[2:]
+        ys = sorted(p[1] for p in outer_pts)
+        xs = [p[0] for p in outer_pts]
+        self.assertAlmostEqual(min(xs), overlap_x, places=1)
+        self.assertAlmostEqual(max(xs), overlap_x, places=1)
+        self.assertAlmostEqual(ys[0], y0, places=1)
+        self.assertAlmostEqual(ys[1], y1, places=1)
+
+    def _assert_53_mouth_preserved(self, index: int) -> None:
+        draw = self.extensions[index].extension_draw
+        routed_draw = self.routed[index].route_draw
+        assert draw is not None and routed_draw is not None
+        net = routed_draw.routed_net_polygon
+        self.assertAlmostEqual(net.points[0][0], draw.intercept_a[0], places=3)
+        self.assertAlmostEqual(net.points[0][1], draw.intercept_a[1], places=3)
+        self.assertAlmostEqual(net.points[1][0], draw.intercept_b[0], places=3)
+        self.assertAlmostEqual(net.points[1][1], draw.intercept_b[1], places=3)
+
     def test_center_pad_indices_routed(self):
-        for index in (4, 6):
+        for index in (1, 3, 4, 6):
             result = self.routed[index]
             classification = self.all_classify[index]
             self.assertEqual(classification.mte_route_target, "center_pad")
@@ -125,8 +173,32 @@ class TestMteRouteKB331(unittest.TestCase):
                 )
             )
 
+    def test_index3_stretch_reaches_pad_corners(self):
+        self._assert_stretch_to_pad_corners(3)
+
+    def test_index3_stretch_uses_collar_pad_facing_mouth(self):
+        draw = self.extensions[3].extension_draw
+        result = self.routed[3]
+        assert draw is not None and result.routed_net is not None
+        inner_pts = result.routed_net.points[:2]
+        inner_y_span = abs(inner_pts[0][1] - inner_pts[1][1])
+        self.assertGreater(inner_y_span, 15.0)
+        self.assertAlmostEqual(draw.intercept_a[1], draw.intercept_b[1], places=1)
+        self.assertLess(abs(draw.intercept_a[1] - draw.intercept_b[1]), 1.0)
+
+    def test_index4_stretch_reaches_pad_corners(self):
+        self._assert_stretch_to_pad_corners(4)
+        self._assert_53_mouth_preserved(4)
+
+    def test_index6_stretch_reaches_pad_corners(self):
+        self._assert_stretch_to_pad_corners(6)
+        self._assert_53_mouth_preserved(6)
+
+    def test_index6_collar_mouth_unchanged(self):
+        self._assert_53_mouth_preserved(6)
+
     def test_collar_extend_indices_unchanged(self):
-        for index in (0, 1, 2, 3, 5, 7):
+        for index in (0, 2, 5, 7):
             base = self.extensions[index]
             result = self.routed[index]
             self.assertEqual(self.all_classify[index].mte_route_target, "collar_extend")
@@ -154,7 +226,6 @@ class TestMteRouteKB331(unittest.TestCase):
         self.assertAlmostEqual(start.center[1], outer_mid[1], places=3)
 
     def test_pick_route_start_index6_uses_outer_edge_when_cap_faces_pad(self):
-        """Index 6 stadium tab lip extrudes toward the pad; route leaves from the outer cap."""
         index = 6
         draw = self.extensions[index].extension_draw
         assert draw is not None

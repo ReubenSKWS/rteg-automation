@@ -1,21 +1,23 @@
 """
-Step 5.4 — Route 5.3 MTE collar extensions to the center signal pad.
+Step 5.4 — Stretch 5.3 MTE collar extensions to the center signal pad.
 
-When ``mte_route_target == "center_pad"``, build a constant-width corridor from the
-5.3 extension outer cap into the classified signal pad with configurable overlap.
+When ``mte_route_target == "center_pad"``, move the pad-facing outer cap of the
+5.3 extension to the nearest signal-pad edge corners (with overlap). The collar
+mouth is taken from the 5.3 extension unless that mouth has negligible span
+along the pad edge — then the full collar edge facing the pad is used instead.
 """
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import gdstk
 
 from layermap import LayerMap
 from rteg_classify import NodeClassification
-from rteg_collect import GroundPlates, RtegGeometryRoles
-from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
+from rteg_collect import RtegGeometryRoles
+from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult, _body_centroid, _edge_length, _edge_outward_normal, _edge_points
 from rteg_utils import assign_layer, polys_bbox
 
 Point = tuple[float, float]
@@ -25,14 +27,13 @@ Edge = tuple[Point, Point]
 
 @dataclass(frozen=True)
 class MteRouteConfig:
-    """Tunable parameters for step 5.4 pad routing."""
+    """Tunable parameters for step 5.4 pad stretch routing."""
 
     mte_layer: str = "BAW_MTE"
     pad_touch_overlap_um: float = 0.5
+    collar_merge_inset_um: float = 4.0
     min_pad_overlap_um2: float = 0.01
-    route_width_um: float | None = None
-    min_ground_clearance_um: float = 14.0
-    allow_45_degree_corners: bool = True
+    min_mouth_span_fraction: float = 0.5
     boolean_precision: float = 1e-3
     inside_probe_half_um: float = 0.25
 
@@ -44,6 +45,17 @@ class RouteStart:
     center: Point
     width_um: float
     outer_edge: Edge
+
+
+@dataclass(frozen=True)
+class PadAttachmentEdge:
+    """Pad bbox edge corners shifted inward for overlap."""
+
+    corner_low: Point
+    corner_high: Point
+    inward_normal: tuple[float, float]
+    pad_entry: Point
+    span_um: float
 
 
 @dataclass(frozen=True)
@@ -60,13 +72,6 @@ class MteRouteDraw:
 
 def _dist(a: Point, b: Point) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
-
-
-def _unit(dx: float, dy: float) -> tuple[float, float]:
-    length = math.hypot(dx, dy)
-    if length < 1e-12:
-        return (0.0, 0.0)
-    return (dx / length, dy / length)
 
 
 def _pad_reference_point(signal_polys: Sequence[gdstk.Polygon]) -> Point:
@@ -86,8 +91,7 @@ def pick_route_start(
     Midpoint and width on the extension edge that faces ``toward_point``.
 
     When the 5.3 lip extrudes away from the route target (outer cap on the far
-  side), attach on the collar-mouth edge instead so the corridor leaves from the
-    pad-facing side of the extension.
+    side), use the collar-mouth edge as the pad-facing reference instead.
     """
     p0, p1 = extension_draw.outer_edge
     outer_center = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
@@ -123,223 +127,222 @@ def _union_pad_bbox(signal_polys: Sequence[gdstk.Polygon]) -> Bbox | None:
     return polys_bbox(list(signal_polys)) if signal_polys else None
 
 
-def pick_pad_entry(
+def _facing_pad_edge(
+    bbox: Bbox,
+    from_point: Point,
+) -> tuple[Point, Point, tuple[float, float]]:
+    """Return both corners of the pad bbox edge that faces ``from_point``."""
+    (x0, y0), (x1, y1) = bbox
+    fx, fy = from_point
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    dx, dy = fx - cx, fy - cy
+
+    if abs(dx) >= abs(dy):
+        if dx >= 0.0:
+            return ((x1, y0), (x1, y1), (-1.0, 0.0))
+        return ((x0, y0), (x0, y1), (1.0, 0.0))
+    if dy >= 0.0:
+        return ((x0, y1), (x1, y1), (0.0, -1.0))
+    return ((x0, y0), (x1, y0), (0.0, 1.0))
+
+
+def pick_pad_attachment_edge(
     signal_polys: Sequence[gdstk.Polygon],
     from_point: Point,
     *,
     touch_overlap_um: float,
-) -> Point:
+) -> PadAttachmentEdge:
     """
-    Point inside the signal pad nearest ``from_point``, shifted ``touch_overlap_um``
-    inward from the closest pad bbox edge.
+    Both corners of the signal-pad edge nearest ``from_point``, shifted
+    ``touch_overlap_um`` inward so the stretched extension overlaps the pad.
     """
     bbox = _union_pad_bbox(signal_polys)
     if bbox is None:
         raise ValueError("signal pad has no geometry")
 
-    (x0, y0), (x1, y1) = bbox
-    fx, fy = from_point
-    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-
-    candidates: list[tuple[float, Point, tuple[float, float]]] = []
-    if fx >= x0:
-        candidates.append((fx - x1, (x1, cy), (-1.0, 0.0)))
-    if fx <= x1:
-        candidates.append((x0 - fx, (x0, cy), (1.0, 0.0)))
-    if fy >= y0:
-        candidates.append((fy - y1, (cx, y1), (0.0, -1.0)))
-    if fy <= y1:
-        candidates.append((y0 - fy, (cx, y0), (0.0, 1.0)))
-
-    if not candidates:
-        return (cx, cy)
-
-    _, edge_pt, inward = min(candidates, key=lambda item: abs(item[0]))
-    return (
-        edge_pt[0] + inward[0] * touch_overlap_um,
-        edge_pt[1] + inward[1] * touch_overlap_um,
+    corner_low, corner_high, inward = _facing_pad_edge(bbox, from_point)
+    ix, iy = inward
+    corner_low = (
+        corner_low[0] + ix * touch_overlap_um,
+        corner_low[1] + iy * touch_overlap_um,
+    )
+    corner_high = (
+        corner_high[0] + ix * touch_overlap_um,
+        corner_high[1] + iy * touch_overlap_um,
+    )
+    pad_entry = (
+        (corner_low[0] + corner_high[0]) / 2.0,
+        (corner_low[1] + corner_high[1]) / 2.0,
+    )
+    return PadAttachmentEdge(
+        corner_low=corner_low,
+        corner_high=corner_high,
+        inward_normal=inward,
+        pad_entry=pad_entry,
+        span_um=_dist(corner_low, corner_high),
     )
 
 
-def _inflate_bbox(bbox: Bbox, margin: float) -> Bbox:
-    (x0, y0), (x1, y1) = bbox
-    return ((x0 - margin, y0 - margin), (x1 + margin, y1 + margin))
+def _outer_vertices(draw: CollarExtensionDraw) -> tuple[Point, Point]:
+    """Return ``(outer_b, outer_a)`` matching ``draw_lip_extension`` vertex order."""
+    return draw.outer_edge[0], draw.outer_edge[1]
 
 
-def _segment_bbox_intersects(p0: Point, p1: Point, bbox: Bbox) -> bool:
-    (x0, y0), (x1, y1) = bbox
-    min_x, max_x = min(p0[0], p1[0]), max(p0[0], p1[0])
-    min_y, max_y = min(p0[1], p1[1]), max(p0[1], p1[1])
-    if max_x < x0 or min_x > x1 or max_y < y0 or min_y > y1:
-        return False
-    return True
+def _mouth_span_along_pad_edge(
+    mouth_a: Point,
+    mouth_b: Point,
+    inward_normal: tuple[float, float],
+) -> float:
+    """Span of a mouth segment along the axis parallel to the pad attachment edge."""
+    ix, iy = inward_normal
+    if abs(ix) >= abs(iy):
+        return abs(mouth_a[1] - mouth_b[1])
+    return abs(mouth_a[0] - mouth_b[0])
 
 
-def _ground_obstacle_bboxes(ground_plates: GroundPlates) -> list[Bbox]:
-    obstacles: list[Bbox] = []
-    for group in (ground_plates.top, ground_plates.bottom):
-        bb = polys_bbox([tp.polygon for tp in group])
-        if bb is not None:
-            obstacles.append(bb)
-    return obstacles
-
-
-def _path_clearance_score(
-    waypoints: Sequence[Point],
-    obstacles: Sequence[Bbox],
+def collar_mouth_facing_pad(
+    collar: gdstk.Polygon,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    signal_polys: Sequence[gdstk.Polygon],
     *,
-    half_width: float,
-    clearance_um: float,
-) -> int:
-    margin = clearance_um + half_width
-    violations = 0
-    for i in range(len(waypoints) - 1):
-        p0, p1 = waypoints[i], waypoints[i + 1]
-        for bb in obstacles:
-            if _segment_bbox_intersects(p0, p1, _inflate_bbox(bb, margin)):
-                violations += 1
-    return violations
-
-
-def _strip_polygon(
-    p0: Point,
-    p1: Point,
-    width_um: float,
-    layer: int,
-    datatype: int,
-) -> gdstk.Polygon | None:
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    length = math.hypot(dx, dy)
-    if length < 1e-9:
-        return None
-    tx, ty = dx / length, dy / length
-    nx, ny = -ty, tx
-    hw = width_um / 2.0
-    pts = [
-        (p0[0] + nx * hw, p0[1] + ny * hw),
-        (p0[0] - nx * hw, p0[1] - ny * hw),
-        (p1[0] - nx * hw, p1[1] - ny * hw),
-        (p1[0] + nx * hw, p1[1] + ny * hw),
-    ]
-    return gdstk.Polygon(pts, layer=layer, datatype=datatype)
-
-
-def _chamfer_corner(
-    prev: Point,
-    corner: Point,
-    nxt: Point,
-    *,
-    chamfer_um: float,
+    merge_inset_um: float,
+    min_edge_um: float = 5.0,
 ) -> tuple[Point, Point]:
-    v1x, v1y = _unit(corner[0] - prev[0], corner[1] - prev[1])
-    v2x, v2y = _unit(nxt[0] - corner[0], nxt[1] - corner[1])
-    d1 = min(chamfer_um, _dist(prev, corner) * 0.45)
-    d2 = min(chamfer_um, _dist(corner, nxt) * 0.45)
+    """
+    Collar intercept pair on the edge whose outward normal best aligns with the pad.
+
+    Endpoints are shifted ``merge_inset_um`` inward from the collar boundary.
+    """
+    pad_ref = _pad_reference_point(signal_polys)
+    body_centroid = _body_centroid(body_mte_polys)
+    pts = [(float(p[0]), float(p[1])) for p in collar.points]
+    if len(pts) < 4:
+        raise ValueError("collar must have at least 4 vertices")
+
+    n = len(pts)
+    best: tuple[tuple[float, float], Edge, tuple[float, float]] | None = None
+    for edge_idx in range(n):
+        p0, p1 = _edge_points(pts, edge_idx)
+        edge_len = _edge_length(p0, p1)
+        if edge_len < min_edge_um:
+            continue
+        outward = _edge_outward_normal((p0, p1), body_centroid)
+        mid = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
+        to_pad = (pad_ref[0] - mid[0], pad_ref[1] - mid[1])
+        to_pad_len = math.hypot(to_pad[0], to_pad[1])
+        if to_pad_len < 1e-9:
+            continue
+        alignment = (
+            outward[0] * to_pad[0] / to_pad_len + outward[1] * to_pad[1] / to_pad_len
+        )
+        score = (alignment, edge_len)
+        if best is None or score > best[0]:
+            best = (score, (p0, p1), outward)
+
+    if best is None:
+        raise ValueError("collar has no edge facing the signal pad")
+
+    _, (p0, p1), outward = best
+    inward = (-outward[0], -outward[1])
     return (
-        (corner[0] - v1x * d1, corner[1] - v1y * d1),
-        (corner[0] + v2x * d2, corner[1] + v2y * d2),
-    )
-
-
-def _polyline_strips(
-    waypoints: Sequence[Point],
-    width_um: float,
-    layer: int,
-    datatype: int,
-    *,
-    allow_45: bool,
-    precision: float,
-) -> list[gdstk.Polygon]:
-    if len(waypoints) < 2:
-        return []
-    pts = list(waypoints)
-    if allow_45 and len(pts) == 3:
-        a, b, c = pts
-        chamfer = min(width_um, 4.0)
-        p0, p1 = _chamfer_corner(a, b, c, chamfer_um=chamfer)
-        segs = [(a, p0), (p0, p1), (p1, c)]
-    else:
-        segs = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
-
-    strips: list[gdstk.Polygon] = []
-    for s0, s1 in segs:
-        strip = _strip_polygon(s0, s1, width_um, layer, datatype)
-        if strip is not None:
-            strips.append(strip)
-    return strips
-
-
-def _boolean_or_polys(
-    polys: Sequence[gdstk.Polygon], precision: float
-) -> gdstk.Polygon | None:
-    if not polys:
-        return None
-    acc: list[gdstk.Polygon] = [polys[0]]
-    for poly in polys[1:]:
-        merged = gdstk.boolean(acc, [poly], "or", precision=precision)
-        acc = list(merged) if merged else acc
-    if not acc:
-        return None
-    if len(acc) == 1:
-        return acc[0]
-    merged = gdstk.boolean(acc, "or", precision=precision)
-    return merged[0] if merged else acc[0]
-
-
-def build_corridor_route(
-    start: Point,
-    end: Point,
-    width_um: float,
-    obstacles: Sequence[Bbox],
-    layer: int,
-    datatype: int,
-    cfg: MteRouteConfig,
-) -> tuple[gdstk.Polygon, list[Point]]:
-    """Manhattan corridor from ``start`` to ``end`` with constant width."""
-    half_w = width_um / 2.0
-    corner_hv = (end[0], start[1])
-    corner_vh = (start[0], end[1])
-    candidates = [
-        [start, corner_hv, end],
-        [start, corner_vh, end],
-        [start, end],
-    ]
-    best = min(
-        candidates,
-        key=lambda path: (
-            _path_clearance_score(
-                path,
-                obstacles,
-                half_width=half_w,
-                clearance_um=cfg.min_ground_clearance_um,
-            ),
-            sum(_dist(path[i], path[i + 1]) for i in range(len(path) - 1)),
+        (
+            p0[0] + inward[0] * merge_inset_um,
+            p0[1] + inward[1] * merge_inset_um,
+        ),
+        (
+            p1[0] + inward[0] * merge_inset_um,
+            p1[1] + inward[1] * merge_inset_um,
         ),
     )
-    strips = _polyline_strips(
-        best,
-        width_um,
-        layer,
-        datatype,
-        allow_45=cfg.allow_45_degree_corners,
-        precision=cfg.boolean_precision,
-    )
-    route = _boolean_or_polys(strips, cfg.boolean_precision)
-    if route is None:
-        raise ValueError("corridor route is degenerate")
-    return route, best
 
 
-def union_mte_net(
-    extension_poly: gdstk.Polygon,
-    route_poly: gdstk.Polygon,
+def _resolve_stretch_inner_mouth(
+    draw: CollarExtensionDraw,
+    signal_polys: Sequence[gdstk.Polygon],
+    cfg: MteRouteConfig,
     *,
-    precision: float,
-) -> gdstk.Polygon:
-    merged = gdstk.boolean([extension_poly], [route_poly], "or", precision=precision)
-    if not merged:
-        raise ValueError("failed to union extension and route")
-    return merged[0] if len(merged) == 1 else _boolean_or_polys(merged, precision)  # type: ignore[arg-type]
+    collar: gdstk.Polygon | None,
+    body_mte_polys: Sequence[gdstk.Polygon] | None,
+    from_point: Point,
+) -> tuple[Point, Point]:
+    """Pick collar-side vertices for the stretched trapezoid."""
+    inner_a = draw.intercept_a
+    inner_b = draw.intercept_b
+    if collar is None or body_mte_polys is None:
+        return inner_a, inner_b
+
+    attachment = pick_pad_attachment_edge(
+        signal_polys, from_point, touch_overlap_um=cfg.pad_touch_overlap_um
+    )
+    pad_facing = collar_mouth_facing_pad(
+        collar,
+        body_mte_polys,
+        signal_polys,
+        merge_inset_um=cfg.collar_merge_inset_um,
+    )
+    span_53 = _mouth_span_along_pad_edge(
+        inner_a, inner_b, attachment.inward_normal
+    )
+    span_pad = _mouth_span_along_pad_edge(
+        pad_facing[0], pad_facing[1], attachment.inward_normal
+    )
+    if span_pad > 1e-6 and span_53 < cfg.min_mouth_span_fraction * span_pad:
+        return pad_facing
+    return inner_a, inner_b
+
+
+def stretch_extension_to_pad(
+    draw: CollarExtensionDraw,
+    signal_polys: Sequence[gdstk.Polygon],
+    cfg: MteRouteConfig,
+    layer: int,
+    datatype: int,
+    *,
+    from_point: Point | None = None,
+    collar: gdstk.Polygon | None = None,
+    body_mte_polys: Sequence[gdstk.Polygon] | None = None,
+) -> tuple[gdstk.Polygon, PadAttachmentEdge]:
+    """
+    Morph the 5.3 extension: collar mouth on the pad-facing side, outer cap on pad.
+
+    Returns the stretched polygon and pad attachment metadata.
+    """
+    outer_b, outer_a = _outer_vertices(draw)
+
+    ref = from_point
+    if ref is None:
+        ref = (
+            (outer_a[0] + outer_b[0]) / 2.0,
+            (outer_a[1] + outer_b[1]) / 2.0,
+        )
+
+    inner_a, inner_b = _resolve_stretch_inner_mouth(
+        draw,
+        signal_polys,
+        cfg,
+        collar=collar,
+        body_mte_polys=body_mte_polys,
+        from_point=ref,
+    )
+
+    attachment = pick_pad_attachment_edge(
+        signal_polys, ref, touch_overlap_um=cfg.pad_touch_overlap_um
+    )
+
+    pad_low = attachment.corner_low
+    pad_high = attachment.corner_high
+
+    if outer_b[1] <= outer_a[1]:
+        outer_b_new, outer_a_new = pad_low, pad_high
+    else:
+        outer_b_new, outer_a_new = pad_high, pad_low
+
+    stretched = gdstk.Polygon(
+        [inner_a, inner_b, outer_b_new, outer_a_new],
+        layer=layer,
+        datatype=datatype,
+    )
+    return stretched, attachment
 
 
 def _pad_overlap_area(
@@ -379,7 +382,8 @@ def build_mte_pad_route(
     *,
     resonator_index: int | None = None,
 ) -> MteRouteDraw | None:
-    """Build pad connector when ``mte_route_target == center_pad``; else ``None``."""
+    """Stretch extension to pad when ``mte_route_target == center_pad``; else ``None``."""
+    _ = roles  # reserved for future clearance checks
     c = cfg or MteRouteConfig()
     if classification.mte_route_target != "center_pad":
         return None
@@ -394,46 +398,34 @@ def build_mte_pad_route(
 
     layer, datatype = layermap.pair(c.mte_layer)
     signal_polys = [tp.polygon for tp in signal_tps]
+    draw = mte_result.extension_draw
     pad_ref = _pad_reference_point(signal_polys)
-    start_info = pick_route_start(
-        mte_result.extension_draw,
-        toward_point=pad_ref,
-    )
-    width = c.route_width_um if c.route_width_um is not None else start_info.width_um
-    if width <= 0:
-        raise ValueError(f"resonator {resonator_index}: route width must be positive")
+    start_info = pick_route_start(draw, toward_point=pad_ref)
 
-    pad_entry = pick_pad_entry(
+    collar_poly = mte_result.collar.polygon if mte_result.collar is not None else None
+    stretched, attachment = stretch_extension_to_pad(
+        draw,
         signal_polys,
-        start_info.center,
-        touch_overlap_um=c.pad_touch_overlap_um,
-    )
-    obstacles = _ground_obstacle_bboxes(roles.ground_plates)
-    route_poly, waypoints = build_corridor_route(
-        start_info.center,
-        pad_entry,
-        width,
-        obstacles,
+        c,
         layer,
         datatype,
-        c,
+        from_point=start_info.center,
+        collar=collar_poly,
+        body_mte_polys=roles.resonator_body_mte,
     )
-    route_poly = assign_layer(route_poly, layermap, c.mte_layer)
-    ext = mte_result.extension
-    routed_net = union_mte_net(ext, route_poly, precision=c.boolean_precision)
-    routed_net = assign_layer(routed_net, layermap, c.mte_layer)
+    stretched = assign_layer(stretched, layermap, c.mte_layer)
     overlap = validate_pad_attachment(
-        routed_net,
-        [tp.polygon for tp in signal_tps],
+        stretched,
+        signal_polys,
         c,
         resonator_index=resonator_index,
     )
     return MteRouteDraw(
-        route_polygon=route_poly,
-        routed_net_polygon=routed_net,
-        waypoints=waypoints,
-        pad_entry=pad_entry,
-        route_width_um=width,
+        route_polygon=stretched,
+        routed_net_polygon=stretched,
+        waypoints=[attachment.corner_low, attachment.corner_high],
+        pad_entry=attachment.pad_entry,
+        route_width_um=attachment.span_um,
         pad_overlap_um2=overlap,
     )
 
@@ -459,7 +451,7 @@ def build_mte_pad_routes(
     layermap: LayerMap,
     config: MteRouteConfig | None = None,
 ) -> dict[int, MteExtensionResult]:
-    """Run 5.4 pad routing for every resonator index present in ``extensions``."""
+    """Run 5.4 pad stretch routing for every resonator index in ``extensions``."""
     cfg = config or MteRouteConfig()
     out: dict[int, MteExtensionResult] = {}
     for idx, result in extensions.items():
@@ -506,14 +498,15 @@ def mte_route_overview_rows(
 __all__ = [
     "MteRouteConfig",
     "MteRouteDraw",
+    "PadAttachmentEdge",
     "RouteStart",
     "apply_mte_pad_route",
-    "build_corridor_route",
     "build_mte_pad_route",
     "build_mte_pad_routes",
+    "collar_mouth_facing_pad",
     "mte_route_overview_rows",
-    "pick_pad_entry",
+    "pick_pad_attachment_edge",
     "pick_route_start",
-    "union_mte_net",
+    "stretch_extension_to_pad",
     "validate_pad_attachment",
 ]

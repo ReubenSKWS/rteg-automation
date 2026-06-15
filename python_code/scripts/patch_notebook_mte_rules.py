@@ -29,10 +29,8 @@ All MTE geometry must launch from **preserved filter MTE** — never from arbitr
 
 set_cell(
     29,
-    '''from src.rteg_classify import ClassifyNodesConfig, classify_nodes, classification_summary_table
+    '''from src.rteg_classify import classify_nodes, classification_summary_table
 from src.rteg_collect import collect_orientation_inputs
-
-CLASSIFY_CONFIG = ClassifyNodesConfig()
 
 all_classify: dict[int, object] = {}
 classify_overview_rows: list[dict[str, object]] = []
@@ -53,7 +51,6 @@ for idx, roles in all_roles.items():
         roles.preserved,
         orientation=orientation,
         res_type=res.res_type,
-        config=CLASSIFY_CONFIG,
     )
     all_classify[idx] = classification
     collar = classification.collar_orientation

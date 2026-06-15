@@ -7,8 +7,7 @@ uses this to decide which terminal (MTE / MBE) is the signal connection and
 which pad band is the signal pad — replacing the old ``res_type`` table.
 
 All functions take bounding boxes / polygons in and return plain values; no
-resonator or assembly objects are referenced inside, so the same helpers serve
-both the deterministic orchestrator and any future agent tool-call.
+resonator or assembly objects are referenced inside.
 """
 from __future__ import annotations
 
@@ -28,6 +27,7 @@ Band = Literal["top", "center", "bottom"]
 MteRouteTarget = Literal["center_pad", "collar_extend"]
 
 _ELONGATION_RATIO = 2.5
+_STADIUM_COLLAR_AREA_UM2 = 2500.0
 
 
 @dataclass(frozen=True)
@@ -140,27 +140,70 @@ def _pad_center(bb: Bbox) -> Point:
     return ((bb[0][0] + bb[1][0]) / 2.0, (bb[0][1] + bb[1][1]) / 2.0)
 
 
-def mte_opposite_center_pad_east_west(
-    mte_bbox: BboxSummary,
-    body_bbox: BboxSummary,
-    center_pad_bb: Bbox | None,
-) -> bool:
-    """
-    True when east-west MTE sits on the far side of the body from the center pad.
+def _mte_body_overlap_area(
+    mte: gdstk.Polygon,
+    body_polys: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+) -> float:
+    total = 0.0
+    for body in body_polys:
+        inter = gdstk.boolean(mte, body, "and", precision=precision)
+        if inter:
+            total += sum(abs(p.area()) for p in inter)
+    return total
 
-    GSG pads sit west of the resonator; MTE on the east half (past the pad–body
-    midpoint in X) is directly opposite the center pad even if Y aligns with the
-    center band.
+
+def _collar_reference_point(
+    mte_polys: Sequence[gdstk.Polygon],
+    pad_bboxes_by_band: Mapping[str, Bbox | None] | None = None,
+    body_polys: Sequence[gdstk.Polygon] | None = None,
+    *,
+    stadium_area_um2: float = _STADIUM_COLLAR_AREA_UM2,
+    min_body_overlap_um2: float = 0.01,
+) -> Point | None:
     """
-    if center_pad_bb is None:
-        return False
-    pad_cx = _pad_center(center_pad_bb)[0]
-    body_cx = body_bbox.center[0]
-    mte_cx = mte_bbox.center[0]
-    mid_x = (pad_cx + body_cx) / 2.0
-    if pad_cx <= body_cx:
-        return mte_cx > mid_x
-    return mte_cx < mid_x
+    Mouth-tab center for routing — mirrors 5.3 collar pick.
+
+    Among connectMTE tabs (area < stadium), prefer the smallest piece that
+    overlaps resonator body MTE; tie-break toward the center signal pad.
+    """
+    tabs = [p for p in mte_polys if abs(p.area()) < stadium_area_um2]
+    if not tabs:
+        return None
+
+    def _bbox_center(poly: gdstk.Polygon) -> Point:
+        bb = poly.bounding_box()
+        if bb is None:
+            return (0.0, 0.0)
+        return ((bb[0][0] + bb[1][0]) / 2.0, (bb[0][1] + bb[1][1]) / 2.0)
+
+    pool = tabs
+    if body_polys:
+        with_body = [
+            p
+            for p in tabs
+            if _mte_body_overlap_area(p, body_polys) >= min_body_overlap_um2
+        ]
+        if with_body:
+            pool = with_body
+
+    center_bb = pad_bboxes_by_band.get("center") if pad_bboxes_by_band else None
+    if center_bb is not None:
+        pad_cx, pad_cy = _pad_center(center_bb)
+        tab = min(
+            pool,
+            key=lambda p: (
+                abs(p.area()),
+                math.hypot(
+                    _bbox_center(p)[0] - pad_cx,
+                    _bbox_center(p)[1] - pad_cy,
+                ),
+            ),
+        )
+    else:
+        tab = min(pool, key=lambda p: abs(p.area()))
+    return _bbox_center(tab)
 
 
 def mte_faces_center_pad(
@@ -169,22 +212,41 @@ def mte_faces_center_pad(
     *,
     body_bbox: BboxSummary | None = None,
     axis: Axis | None = None,
+    mte_polys: Sequence[gdstk.Polygon] | None = None,
+    body_polys: Sequence[gdstk.Polygon] | None = None,
 ) -> bool:
     """
-    True when MTE may route to the center signal pad.
+    True when the MTE mouth tab should route to the center signal pad.
 
-    Requires nearest band **center**, and for east-west collars MTE must sit on
-    the pad side of the body (not directly opposite across the body midline).
+    Uses the **smallest** preserved connectMTE tab (not the stadium/bus union).
+    Routes when the collar is closer to the center pad than the resonator body
+    center is — i.e. the collar sits on the pad side of the body, in front of
+    the pad, even though it is geometrically attached to the resonator edge.
     """
-    if mte_bbox is None:
+    _ = axis
+    if body_bbox is None:
         return False
-    if _nearest_band(mte_bbox.center, pad_bboxes_by_band) != "center":
+    center_bb = pad_bboxes_by_band.get("center")
+    if center_bb is None:
         return False
-    if axis == "east_west" and body_bbox is not None:
-        center_bb = pad_bboxes_by_band.get("center")
-        if mte_opposite_center_pad_east_west(mte_bbox, body_bbox, center_bb):
+
+    ref = (
+        _collar_reference_point(
+            mte_polys, pad_bboxes_by_band, body_polys
+        )
+        if mte_polys
+        else None
+    )
+    if ref is None:
+        if mte_bbox is None:
             return False
-    return True
+        ref = mte_bbox.center
+
+    pad_cx, pad_cy = _pad_center(center_bb)
+    bcx, bcy = body_bbox.center
+    d_collar_pad = math.hypot(ref[0] - pad_cx, ref[1] - pad_cy)
+    d_body_pad = math.hypot(bcx - pad_cx, bcy - pad_cy)
+    return d_collar_pad < d_body_pad
 
 
 def mte_route_target(
@@ -193,28 +255,20 @@ def mte_route_target(
     *,
     body_bbox: BboxSummary | None = None,
     axis: Axis | None = None,
+    mte_polys: Sequence[gdstk.Polygon] | None = None,
+    body_polys: Sequence[gdstk.Polygon] | None = None,
 ) -> MteRouteTarget:
-    """``center_pad`` when MTE faces center; else a short collar extension only."""
+    """``center_pad`` when collar is closer to pad than body center is; else extend."""
     if mte_faces_center_pad(
-        mte_bbox, pad_bboxes_by_band, body_bbox=body_bbox, axis=axis
+        mte_bbox,
+        pad_bboxes_by_band,
+        body_bbox=body_bbox,
+        axis=axis,
+        mte_polys=mte_polys,
+        body_polys=body_polys,
     ):
         return "center_pad"
     return "collar_extend"
-
-
-def mte_faces_signal_pad(
-    mte_bbox: BboxSummary | None,
-    facing_pad: Band,
-    pad_bboxes_by_band: Mapping[str, Bbox | None],
-    *,
-    body_bbox: BboxSummary | None = None,
-    axis: Axis | None = None,
-) -> bool:
-    """Deprecated alias — use ``mte_faces_center_pad``."""
-    _ = facing_pad
-    return mte_faces_center_pad(
-        mte_bbox, pad_bboxes_by_band, body_bbox=body_bbox, axis=axis
-    )
 
 
 def recommend_placement_shift(
@@ -274,10 +328,20 @@ def analyze_orientation(
     axis = collar_axis(mte, mbe, body)
     facing_pad = pad_facing_direction(collar_summary, pad_bboxes_by_band)
     faces_center = mte_faces_center_pad(
-        mte, pad_bboxes_by_band, body_bbox=body, axis=axis
+        mte,
+        pad_bboxes_by_band,
+        body_bbox=body,
+        axis=axis,
+        mte_polys=mte_polys,
+        body_polys=body_polys,
     )
     route = mte_route_target(
-        mte, pad_bboxes_by_band, body_bbox=body, axis=axis
+        mte,
+        pad_bboxes_by_band,
+        body_bbox=body,
+        axis=axis,
+        mte_polys=mte_polys,
+        body_polys=body_polys,
     )
     shift = recommend_placement_shift(
         axis, collar_summary, pad_bboxes_by_band.get("center"), body

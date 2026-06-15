@@ -2,8 +2,8 @@
 Step 5.2 — Classify GSG node blocks as signal or ground from collar orientation.
 
 MTE routing has two modes only:
-- **center pad** — when preserved MTE faces center, try to connect to center signal pad
-- **collar extend** — otherwise extend preserved MTE ~13 µm (no pad connection)
+- **center pad** — when preserved MTE faces center, route to center signal pad
+- **collar extend** — otherwise extend preserved MTE ~14 µm (no pad connection)
 
 ``filler_plate`` is always ground and is not a GSG probe node.
 """
@@ -21,11 +21,6 @@ SignalTerminal = Literal["MTE", "MBE"]
 ClassifyMethod = Literal["orientation"]
 
 _BAND_ORDER: tuple[NodeBand, ...] = ("top", "center", "bottom")
-
-
-@dataclass(frozen=True)
-class ClassifyNodesConfig:
-    """Reserved for future tunables (no geometry thresholds today)."""
 
 
 @dataclass
@@ -72,10 +67,6 @@ class NodeClassification:
             return []
         return list(self.by_band()["center"].polygons)
 
-    def ground_route_polygons(self) -> list[TaggedPolygon]:
-        """Unused — collar-extend mode does not route to ground pads."""
-        return []
-
     def ground_node_polygons(self) -> list[TaggedPolygon]:
         out: list[TaggedPolygon] = []
         for node in self.nodes:
@@ -98,15 +89,13 @@ def classify_nodes(
     *,
     orientation: OrientationAnalysis,
     res_type: str = "",
-    config: ClassifyNodesConfig | None = None,
 ) -> NodeClassification:
     """
     Assign signal vs ground to each GSG band from collar orientation.
 
     MTE drawable when preserved filter MTE exists. Route target is center pad
-    (signal) when MTE faces center; otherwise route preserved MTE to ground.
+    when MTE faces center; otherwise extend preserved MTE at the collar only.
     """
-    _ = config
     bands = _band_items(ground_plates)
     collar = orientation.collar
     route = collar.mte_route_target
@@ -118,9 +107,9 @@ def classify_nodes(
     if not has_mte:
         note = "no preserved MTE — nothing to draw"
     elif route == "center_pad":
-        note = "preserved MTE faces center pad — draw MTE span to center signal pad"
+        note = "preserved MTE faces center pad — route MTE to center signal pad"
     else:
-        note = "preserved MTE not facing center — extend preserved MTE ~13 µm only"
+        note = "preserved MTE not facing center — extend preserved MTE at collar only"
 
     nodes: list[ClassifiedNode] = []
     for band in _BAND_ORDER:

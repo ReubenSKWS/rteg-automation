@@ -74,10 +74,9 @@ class TestPadFacing(unittest.TestCase):
         collar = bbox_summary(_rect(150.0, -35.0, 175.0, -5.0))
         self.assertEqual(pad_facing_direction(collar, PADS), "bottom")
 
-    def test_mte_faces_center_rejects_east_west_opposite(self):
-        """Y near center band but MTE east of pad–body midpoint → not center_pad."""
+    def test_mte_faces_center_rejects_when_closer_to_body(self):
+        """MTE near body center but Y aligns with center band → collar_extend."""
         body = bbox_summary(_rect(140.0, 250.0, 260.0, 330.0))
-        # MTE on east half of body; center pad west (x ~ 90)
         mte = bbox_summary(_rect(200.0, 300.0, 245.0, 318.0))
         assert body is not None and mte is not None
         self.assertTrue(
@@ -89,7 +88,7 @@ class TestPadFacing(unittest.TestCase):
             )
         )
 
-    def test_mte_faces_center_accepts_west_side_east_west(self):
+    def test_mte_faces_center_when_closer_to_pad_than_body(self):
         body = bbox_summary(_rect(140.0, 250.0, 260.0, 330.0))
         pads = {
             "top": ((80.0, 300.0), (120.0, 340.0)),
@@ -98,18 +97,25 @@ class TestPadFacing(unittest.TestCase):
         }
         mte = bbox_summary(_rect(125.0, 283.0, 148.0, 297.0))
         assert body is not None and mte is not None
-        self.assertFalse(
-            mte_opposite_center_pad_east_west(mte, body, pads["center"])
-        )
         self.assertTrue(
             mte_faces_center_pad(
                 mte, pads, body_bbox=body, axis="east_west"
             )
         )
 
+    def test_mte_faces_center_distance_rule_synthetic(self):
+        body = bbox_summary(_rect(100.0, 100.0, 200.0, 200.0))
+        mte = bbox_summary(_rect(175.0, 155.0, 195.0, 165.0))
+        assert body is not None and mte is not None
+        self.assertTrue(
+            mte_faces_center_pad(mte, PADS, body_bbox=body)
+        )
+
     def test_mte_faces_signal_pad_alias(self):
         toward_top = bbox_summary(_rect(150.0, 305.0, 175.0, 335.0))
-        self.assertFalse(mte_faces_signal_pad(toward_top, "top", PADS))
+        self.assertFalse(
+            mte_faces_signal_pad(toward_top, "top", PADS, mte_polys=[_rect(150.0, 305.0, 175.0, 335.0)])
+        )
 
 
 class TestPlacementShift(unittest.TestCase):

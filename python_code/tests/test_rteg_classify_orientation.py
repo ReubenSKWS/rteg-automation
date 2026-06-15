@@ -25,7 +25,32 @@ class TestClassifyOrientationKB331(unittest.TestCase):
         except FileNotFoundError:
             raise unittest.SkipTest("KB331 input files not available")
 
-    def test_kb331_index2_series_opposite_center_is_collar_extend(self):
+    def test_kb331_index3_collar_in_front_of_pad_is_center_pad(self):
+        ctx = load_kb331_pipeline()
+        idx = 3
+        roles = collect_geometry_roles(
+            ctx["frame_assemblies"][idx],
+            ctx["res_list"][idx],
+            ctx["identification"],
+            ctx["layermap"],
+        )
+        orientation = collect_orientation_inputs(
+            ctx["frame_assemblies"][idx],
+            ctx["res_list"][idx],
+            ctx["identification"],
+            ctx["layermap"],
+            ground_plates=roles.ground_plates,
+        )
+        classification = classify_nodes(
+            roles.ground_plates,
+            roles.preserved,
+            orientation=orientation,
+            res_type=ctx["res_list"][idx].res_type,
+        )
+        self.assertEqual(classification.mte_route_target, "center_pad")
+        self.assertTrue(classification.collar_orientation.mte_faces_center)
+
+    def test_kb331_index2_series_closer_to_body_is_collar_extend(self):
         ctx = load_kb331_pipeline()
         idx = 2
         roles = collect_geometry_roles(

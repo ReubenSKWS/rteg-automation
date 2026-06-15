@@ -1,12 +1,12 @@
 """
 Step 5.3 — MTE collar extensions.
 
-1. select_extension_collar — smallest preserved BAW_MTE piece with body overlap
-   (fallback: smallest piece if none overlap).
+1. select_extension_collar — smallest preserved BAW_MTE piece with body overlap;
+   if only a large stadium piece overlaps, prefer the much smaller edge collar.
 2. find_outward_lip_ab — best single long edge whose midpoint is farther from
    body MTE centroid than the collar centroid; A and B are that edge's corners.
-3. draw_lip_extension — inner lip (0.5 µm inset) + outward extrusion with
-   straight cap; default 30 µm; unequal heights at A/B when corner normals differ.
+3. draw_lip_extension — inward merge (default 4 µm), optional shift into the collar
+   so edges meet in layout viewers, then 14 µm outward cap.
 """
 from __future__ import annotations
 
@@ -31,16 +31,25 @@ from rteg_utils import assign_layer
 Point = tuple[float, float]
 Edge = tuple[Point, Point]
 
-_COLLAR_INSET_UM = 0.5
-_MAX_OVERLAP_FRACTION = 0.5
-
 
 @dataclass(frozen=True)
 class MteBuildConfig:
+    """Tunable parameters for step 5.3 MTE collar extensions."""
+
     mte_layer: str = "BAW_MTE"
-    collar_extension_um: float = 30.0
-    boolean_precision: float = 1e-3
+    collar_extension_um: float = 14.0
+    collar_merge_inset_um: float = 4.0
+    collar_touch_overlap_um: float = 0.5
     min_collar_overlap_um2: float = 0.01
+    stadium_collar_area_um2: float = 2500.0
+    stadium_edge_area_ratio: float = 0.6
+    lip_long_edge_peak_fraction: float = 0.15
+    lip_long_edge_min_um: float = 8.0
+    max_overlap_fraction: float = 0.99
+    min_merge_inset_check_um: float = 0.5
+    boolean_precision: float = 1e-3
+    inside_probe_half_um: float = 0.25
+    feasible_merge_search_iterations: int = 24
 
 
 @dataclass(frozen=True)
@@ -52,10 +61,6 @@ class LipIntercept:
     lip_vertex_indices: list[int]
     outward_normal: tuple[float, float]
     lip_edges: list[int]
-
-
-# Backward-compatible alias
-CollarMouthIntercepts = LipIntercept
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,8 @@ class CollarExtensionDraw:
     mouth_vertices: int = 0
     collar_intercept_a: Point = (0.0, 0.0)
     collar_intercept_b: Point = (0.0, 0.0)
+    merge_inset_a_um: float = 0.0
+    merge_inset_b_um: float = 0.0
 
 
 @dataclass
@@ -137,9 +144,14 @@ def _edge_points(pts: Sequence[Point], edge_idx: int) -> Edge:
     )
 
 
-def _long_edge_indices(lengths: Sequence[float]) -> set[int]:
+def _long_edge_indices(
+    lengths: Sequence[float],
+    *,
+    peak_fraction: float,
+    min_um: float,
+) -> set[int]:
     peak = max(lengths) if lengths else 0.0
-    threshold = max(peak * 0.15, 8.0)
+    threshold = max(peak * peak_fraction, min_um)
     return {i for i, length in enumerate(lengths) if length > threshold}
 
 
@@ -163,34 +175,6 @@ def _edge_outward_normal(edge: Edge, body_centroid: Point) -> tuple[float, float
     return (-ty, tx)
 
 
-def _vertex_outward_normal(
-    pts: Sequence[Point],
-    vertex_idx: int,
-    body_centroid: Point,
-) -> tuple[float, float]:
-    n = len(pts)
-    prev_edge = _edge_points(pts, (vertex_idx - 1) % n)
-    next_edge = _edge_points(pts, vertex_idx)
-    n_prev = _edge_outward_normal(prev_edge, body_centroid)
-    n_next = _edge_outward_normal(next_edge, body_centroid)
-    nx = n_prev[0] + n_next[0]
-    ny = n_prev[1] + n_next[1]
-    length = math.hypot(nx, ny)
-    if length < 1e-9:
-        return n_next
-    return (nx / length, ny / length)
-
-
-def _extend_long_chain(
-    seed: int,
-    long_edges: set[int],
-    n: int,
-) -> list[int]:
-    """Single outward long edge (corner A to corner B)."""
-    del long_edges, n
-    return [seed]
-
-
 def _vertices_from_edge_chain(chain: Sequence[int], n: int) -> list[int]:
     if not chain:
         return []
@@ -205,9 +189,7 @@ def _vertices_from_edge_chain(chain: Sequence[int], n: int) -> list[int]:
 def select_extension_collar(
     preserved: PreservedMetal,
     body_mte_polys: Sequence[gdstk.Polygon],
-    *,
-    min_overlap_um2: float = 0.01,
-    precision: float = 1e-3,
+    cfg: MteBuildConfig | None = None,
 ) -> TaggedPolygon | None:
     """
     Pick the extension collar on ``BAW_MTE`` (layermap 5/0).
@@ -217,26 +199,36 @@ def select_extension_collar(
     edge collar; the extension collar is the smaller piece that touches
     resonator-body MTE.
     """
+    c = cfg or MteBuildConfig()
     if not preserved.mte:
         return None
     overlapping = [
         tp
         for tp in preserved.mte
         if preserved_mte_overlap_with_body(
-            tp.polygon, body_mte_polys, precision=precision
+            tp.polygon, body_mte_polys, precision=c.boolean_precision
         )
-        >= min_overlap_um2
+        >= c.min_collar_overlap_um2
     ]
-    pool = overlapping if overlapping else list(preserved.mte)
-    return min(pool, key=lambda tp: abs(tp.polygon.area()))
-
-
-select_edge_collar_mte = select_extension_collar
+    if overlapping:
+        smallest_overlap = min(overlapping, key=lambda tp: abs(tp.polygon.area()))
+        smallest_all = min(preserved.mte, key=lambda tp: abs(tp.polygon.area()))
+        overlap_area = abs(smallest_overlap.polygon.area())
+        edge_area = abs(smallest_all.polygon.area())
+        if (
+            overlap_area >= c.stadium_collar_area_um2
+            and edge_area < overlap_area * c.stadium_edge_area_ratio
+            and smallest_all not in overlapping
+        ):
+            return smallest_all
+        return smallest_overlap
+    return min(preserved.mte, key=lambda tp: abs(tp.polygon.area()))
 
 
 def find_outward_lip_ab(
     collar: gdstk.Polygon,
     body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: MteBuildConfig | None = None,
 ) -> LipIntercept:
     """
     Find intercept corners A and B on the extension collar mouth.
@@ -245,6 +237,7 @@ def find_outward_lip_ab(
     the collar centroid; A and B are that edge's corners. Orientation and pad
     facing are ignored — outward is inferred from geometry only.
     """
+    c = cfg or MteBuildConfig()
     pts = [(float(p[0]), float(p[1])) for p in collar.points]
     if len(pts) < 4:
         raise ValueError("collar must have at least 4 vertices")
@@ -255,7 +248,11 @@ def find_outward_lip_ab(
 
     n = len(pts)
     lengths = [_edge_length(pts[i], pts[(i + 1) % n]) for i in range(n)]
-    long_edges = _long_edge_indices(lengths)
+    long_edges = _long_edge_indices(
+        lengths,
+        peak_fraction=c.lip_long_edge_peak_fraction,
+        min_um=c.lip_long_edge_min_um,
+    )
     if not long_edges:
         raise ValueError("collar has no long edges")
 
@@ -281,7 +278,7 @@ def find_outward_lip_ab(
             ),
         )
 
-    lip_edges = _extend_long_chain(best_seed, long_edges, n)
+    lip_edges = [best_seed]
     lip_vertices = _vertices_from_edge_chain(lip_edges, n)
     if len(lip_vertices) < 2:
         raise ValueError("outward lip chain is degenerate")
@@ -300,125 +297,180 @@ def find_outward_lip_ab(
     )
 
 
-def find_collar_mouth_intercepts(
-    preserved_collar: gdstk.Polygon,
-    body_mte_polys: Sequence[gdstk.Polygon],
-) -> LipIntercept:
-    """Backward-compatible name for :func:`find_outward_lip_ab`."""
-    return find_outward_lip_ab(preserved_collar, body_mte_polys)
+def _point_inside_polygon(
+    point: Point,
+    polygon: gdstk.Polygon,
+    *,
+    precision: float,
+    probe_half_um: float,
+) -> bool:
+    probe = gdstk.rectangle(
+        (point[0] - probe_half_um, point[1] - probe_half_um),
+        (point[0] + probe_half_um, point[1] + probe_half_um),
+    )
+    return bool(gdstk.boolean(probe, polygon, "and", precision=precision))
 
 
-def _extrusion_heights(
-    point_a: Point,
-    point_b: Point,
-    n_a: tuple[float, float],
-    n_b: tuple[float, float],
+def _feasible_merge_um(
+    point: Point,
+    outward: tuple[float, float],
+    collar: gdstk.Polygon,
     target_um: float,
-) -> tuple[float, float]:
-    """
-    Heights at A and B so the straight cap sits ~target_um from the lip.
-
-    Equal when normals are parallel; otherwise solve for perpendicular mid-distance.
-    """
-    cross = abs(n_a[0] * n_b[1] - n_a[1] * n_b[0])
-    if cross < 0.05:
-        return target_um, target_um
-
-    mid = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
-    dom = (
-        (n_a[0] + n_b[0]) / 2.0,
-        (n_a[1] + n_b[1]) / 2.0,
-    )
-    dom_len = math.hypot(dom[0], dom[1])
-    if dom_len < 1e-9:
-        return target_um, target_um
-    dom = (dom[0] / dom_len, dom[1] / dom_len)
-
-    h_a = target_um
-    o_a = (point_a[0] + n_a[0] * h_a, point_a[1] + n_a[1] * h_a)
-    cap_dir = (point_b[0] - point_a[0], point_b[1] - point_a[1])
-    cap_len = math.hypot(cap_dir[0], cap_dir[1])
-    if cap_len < 1e-9:
-        return target_um, target_um
-    cap_dir = (cap_dir[0] / cap_len, cap_dir[1] / cap_len)
-
-    # Place cap midpoint ~target_um along dominant outward normal from lip mid.
-    desired_mid = (
-        mid[0] + dom[0] * target_um,
-        mid[1] + dom[1] * target_um,
-    )
-    o_b_x = 2.0 * desired_mid[0] - o_a[0]
-    o_b_y = 2.0 * desired_mid[1] - o_a[1]
-    denom = n_b[0] * cap_dir[0] + n_b[1] * cap_dir[1]
-    if abs(denom) < 1e-9:
-        return target_um, target_um
-    t = ((o_b_x - point_b[0]) * cap_dir[0] + (o_b_y - point_b[1]) * cap_dir[1]) / denom
-    h_b = max(t, target_um * 0.25)
-    return h_a, h_b
+    *,
+    precision: float,
+    probe_half_um: float,
+    search_iterations: int,
+) -> float:
+    """Largest inward merge (toward body, ``-outward``) that stays inside the collar."""
+    ix, iy = -outward[0], -outward[1]
+    lo, hi = 0.0, target_um
+    best = 0.0
+    for _ in range(search_iterations):
+        mid = (lo + hi) / 2.0
+        test = (point[0] + ix * mid, point[1] + iy * mid)
+        if _point_inside_polygon(
+            test, collar, precision=precision, probe_half_um=probe_half_um
+        ):
+            best = mid
+            lo = mid
+        else:
+            hi = mid
+    return best
 
 
 def draw_lip_extension(
     collar: gdstk.Polygon,
     lip: LipIntercept,
     body_mte_polys: Sequence[gdstk.Polygon],
-    extension_um: float,
+    cfg: MteBuildConfig,
     layer: int,
     datatype: int,
 ) -> CollarExtensionDraw:
     """
     Draw one new MTE polygon extruding outward from intercepts A and B.
 
-    Inner lip (0.5 µm inset) + outward extrusion with straight cap; default 30 µm
-    (``MteBuildConfig.collar_extension_um``); unequal heights at A/B when corner
-    normals differ so the closing edge stays one straight line.
+    Inset and extrusion use the outward normal from ``find_outward_lip_ab``
+    (perpendicular to the lip, away from resonator-body MTE). The inner edge is
+    shifted ``merge_um`` toward the body; the whole rectangle is then shifted a
+    little further into the collar (``touch_overlap_um``) so it meets preserved
+    metal in layout viewers. The outer edge is ``collar_extension_um`` from the mouth.
     """
+    extension_um = cfg.collar_extension_um
+    merge_um = cfg.collar_merge_inset_um
+    touch_overlap_um = cfg.collar_touch_overlap_um
+    boolean_precision = cfg.boolean_precision
+
     if extension_um <= 0:
         raise ValueError("extension_um must be positive")
+    if merge_um <= 0:
+        raise ValueError("merge_um must be positive")
+    if touch_overlap_um < 0:
+        raise ValueError("touch_overlap_um must be non-negative")
 
-    pts = [(float(p[0]), float(p[1])) for p in collar.points]
-    body_centroid = _body_centroid(body_mte_polys)
-    inward = (-lip.outward_normal[0], -lip.outward_normal[1])
+    _ = body_mte_polys  # lip.outward_normal already encodes body-relative direction
+    ox, oy = lip.outward_normal
+    olen = math.hypot(ox, oy)
+    if olen < 1e-9:
+        raise ValueError("lip outward_normal is degenerate")
+    ox, oy = ox / olen, oy / olen
 
-    inner_chain = [
-        (
-            pts[i][0] + inward[0] * _COLLAR_INSET_UM,
-            pts[i][1] + inward[1] * _COLLAR_INSET_UM,
+    merge_a = _feasible_merge_um(
+        lip.point_a,
+        (ox, oy),
+        collar,
+        merge_um,
+        precision=boolean_precision,
+        probe_half_um=cfg.inside_probe_half_um,
+        search_iterations=cfg.feasible_merge_search_iterations,
+    )
+    merge_b = _feasible_merge_um(
+        lip.point_b,
+        (ox, oy),
+        collar,
+        merge_um,
+        precision=boolean_precision,
+        probe_half_um=cfg.inside_probe_half_um,
+        search_iterations=cfg.feasible_merge_search_iterations,
+    )
+
+    inner_a = (
+        lip.point_a[0] - ox * merge_a,
+        lip.point_a[1] - oy * merge_a,
+    )
+    inner_b = (
+        lip.point_b[0] - ox * merge_b,
+        lip.point_b[1] - oy * merge_b,
+    )
+    outer_a = (
+        lip.point_a[0] + ox * extension_um,
+        lip.point_a[1] + oy * extension_um,
+    )
+    outer_b = (
+        lip.point_b[0] + ox * extension_um,
+        lip.point_b[1] + oy * extension_um,
+    )
+
+    # Shift the whole extension into the collar (−outward) to close sub-µm viewer gaps.
+    if touch_overlap_um > 0:
+        total_a = _feasible_merge_um(
+            lip.point_a,
+            (ox, oy),
+            collar,
+            merge_um + touch_overlap_um,
+            precision=boolean_precision,
+            probe_half_um=cfg.inside_probe_half_um,
+            search_iterations=cfg.feasible_merge_search_iterations,
         )
-        for i in lip.lip_vertex_indices
-    ]
-
-    n_a = _vertex_outward_normal(pts, lip.lip_vertex_indices[0], body_centroid)
-    n_b = _vertex_outward_normal(pts, lip.lip_vertex_indices[-1], body_centroid)
-    h_a, h_b = _extrusion_heights(lip.point_a, lip.point_b, n_a, n_b, extension_um)
-
-    o_a = (lip.point_a[0] + n_a[0] * h_a, lip.point_a[1] + n_a[1] * h_a)
-    o_b = (lip.point_b[0] + n_b[0] * h_b, lip.point_b[1] + n_b[1] * h_b)
+        total_b = _feasible_merge_um(
+            lip.point_b,
+            (ox, oy),
+            collar,
+            merge_um + touch_overlap_um,
+            precision=boolean_precision,
+            probe_half_um=cfg.inside_probe_half_um,
+            search_iterations=cfg.feasible_merge_search_iterations,
+        )
+        shift = min(
+            touch_overlap_um,
+            max(0.0, total_a - merge_a),
+            max(0.0, total_b - merge_b),
+        )
+        if shift > 0:
+            sx, sy = -ox * shift, -oy * shift
+            inner_a = (inner_a[0] + sx, inner_a[1] + sy)
+            inner_b = (inner_b[0] + sx, inner_b[1] + sy)
+            outer_a = (outer_a[0] + sx, outer_a[1] + sy)
+            outer_b = (outer_b[0] + sx, outer_b[1] + sy)
+            merge_a += shift
+            merge_b += shift
 
     polygon = gdstk.Polygon(
-        list(inner_chain) + [o_b, o_a],
+        [inner_a, inner_b, outer_b, outer_a],
         layer=layer,
         datatype=datatype,
     )
     span = _dist(lip.point_a, lip.point_b)
-    n = len(pts)
+    pts = [(float(p[0]), float(p[1])) for p in collar.points]
     edge_a = _edge_points(pts, lip.lip_edges[0])
     edge_b = _edge_points(pts, lip.lip_edges[-1])
 
     return CollarExtensionDraw(
         polygon=polygon,
-        intercept_a=inner_chain[0],
-        intercept_b=inner_chain[-1],
-        outer_edge=(o_b, o_a),
-        extension_um=max(h_a, h_b),
+        intercept_a=inner_a,
+        intercept_b=inner_b,
+        outer_edge=(outer_b, outer_a),
+        extension_um=extension_um,
         target_extension_um=extension_um,
         endcap_edge_a=edge_a,
         endcap_edge_b=edge_b,
         endcap_index_a=lip.lip_edges[0],
         endcap_index_b=lip.lip_edges[-1],
         mouth_span_um=span,
-        mouth_vertices=len(lip.lip_vertex_indices),
+        mouth_vertices=2,
         collar_intercept_a=lip.point_a,
         collar_intercept_b=lip.point_b,
+        merge_inset_a_um=merge_a,
+        merge_inset_b_um=merge_b,
     )
 
 
@@ -432,23 +484,36 @@ def _collar_overlap_area(
 def _validate_extension(
     ext: gdstk.Polygon,
     collar: gdstk.Polygon,
+    cfg: MteBuildConfig,
     *,
-    precision: float,
-    min_overlap_um2: float,
     resonator_index: int | None = None,
+    merge_inset_points: Sequence[Point] | None = None,
+    merge_inset_um: Sequence[float] | None = None,
 ) -> None:
-    overlap = _collar_overlap_area(ext, collar, precision)
+    overlap = _collar_overlap_area(ext, collar, cfg.boolean_precision)
     collar_area = abs(collar.area())
     prefix = f"resonator {resonator_index}: " if resonator_index is not None else ""
-    if overlap < min_overlap_um2:
+    if merge_inset_points and merge_inset_um:
+        for idx, (pt, merge) in enumerate(zip(merge_inset_points, merge_inset_um, strict=True)):
+            if merge >= cfg.min_merge_inset_check_um and not _point_inside_polygon(
+                pt,
+                collar,
+                precision=cfg.boolean_precision,
+                probe_half_um=cfg.inside_probe_half_um,
+            ):
+                raise ValueError(
+                    f"{prefix}MTE extension merge inset {idx} is not inside collar "
+                    f"(placement error, not overlap area)"
+                )
+    if overlap < cfg.min_collar_overlap_um2:
         raise ValueError(
             f"{prefix}MTE extension not attached to collar "
-            f"(overlap {overlap:.2f} um² < {min_overlap_um2:.2f} um²)"
+            f"(overlap {overlap:.2f} um² < {cfg.min_collar_overlap_um2:.2f} um²)"
         )
-    if collar_area > 1e-6 and overlap / collar_area > _MAX_OVERLAP_FRACTION:
+    if collar_area > 1e-6 and overlap / collar_area > cfg.max_overlap_fraction:
         raise ValueError(
             f"{prefix}MTE extension covers too much of collar "
-            f"(overlap/collar = {overlap / collar_area:.2f} > {_MAX_OVERLAP_FRACTION})"
+            f"(overlap/collar = {overlap / collar_area:.2f} > {cfg.max_overlap_fraction})"
         )
 
 
@@ -461,12 +526,12 @@ def draw_collar_extension(
     resonator_index: int | None = None,
 ) -> CollarExtensionDraw:
     layer, datatype = layermap.pair(cfg.mte_layer)
-    lip = find_outward_lip_ab(collar_tp.polygon, body_mte_polys)
+    lip = find_outward_lip_ab(collar_tp.polygon, body_mte_polys, cfg)
     draw = draw_lip_extension(
         collar_tp.polygon,
         lip,
         body_mte_polys,
-        cfg.collar_extension_um,
+        cfg,
         layer,
         datatype,
     )
@@ -486,13 +551,16 @@ def draw_collar_extension(
         mouth_vertices=draw.mouth_vertices,
         collar_intercept_a=draw.collar_intercept_a,
         collar_intercept_b=draw.collar_intercept_b,
+        merge_inset_a_um=draw.merge_inset_a_um,
+        merge_inset_b_um=draw.merge_inset_b_um,
     )
     _validate_extension(
         draw.polygon,
         collar_tp.polygon,
-        precision=cfg.boolean_precision,
-        min_overlap_um2=cfg.min_collar_overlap_um2,
+        cfg,
         resonator_index=resonator_index,
+        merge_inset_points=(draw.intercept_a, draw.intercept_b),
+        merge_inset_um=(draw.merge_inset_a_um, draw.merge_inset_b_um),
     )
     return draw
 
@@ -508,8 +576,7 @@ def _extension_for_roles(
     collar_tp = select_extension_collar(
         roles.preserved,
         roles.resonator_body_mte,
-        min_overlap_um2=cfg.min_collar_overlap_um2,
-        precision=cfg.boolean_precision,
+        cfg,
     )
     if collar_tp is None:
         raise ValueError(
@@ -677,7 +744,6 @@ def export_mte_extensions_gds(
 
 __all__ = [
     "CollarExtensionDraw",
-    "CollarMouthIntercepts",
     "LipIntercept",
     "MteBuildConfig",
     "MteExtensionResult",
@@ -686,10 +752,8 @@ __all__ = [
     "draw_collar_extension",
     "draw_lip_extension",
     "export_mte_extensions_gds",
-    "find_collar_mouth_intercepts",
     "find_outward_lip_ab",
     "mte_extensions_overview_rows",
     "mte_intercept_breakdown_rows",
-    "select_edge_collar_mte",
     "select_extension_collar",
 ]

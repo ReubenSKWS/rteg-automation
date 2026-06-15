@@ -61,21 +61,30 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
 
     def test_rectangular_collar_intercepts_at_mouth_corners(self):
         collar = gdstk.Polygon(
-            [(0.0, 0.0), (20.0, 0.0), (20.0, 3.0), (0.0, 3.0)],
+            [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)],
             layer=5,
             datatype=0,
         )
         body = _body_below_collar(collar)
         lip = find_outward_lip_ab(collar, body)
         self.assertAlmostEqual(lip.point_a[0], 20.0)
-        self.assertAlmostEqual(lip.point_a[1], 3.0)
+        self.assertAlmostEqual(lip.point_a[1], 10.0)
         self.assertAlmostEqual(lip.point_b[0], 0.0)
-        self.assertAlmostEqual(lip.point_b[1], 3.0)
+        self.assertAlmostEqual(lip.point_b[1], 10.0)
         self.assertAlmostEqual(lip.outward_normal[1], 1.0, places=3)
+        merge = MteBuildConfig().collar_merge_inset_um
+        for pt in (
+            (lip.point_a[0], lip.point_a[1] - merge),
+            (lip.point_b[0], lip.point_b[1] - merge),
+        ):
+            probe = gdstk.rectangle(
+                (pt[0] - 0.25, pt[1] - 0.25), (pt[0] + 0.25, pt[1] + 0.25)
+            )
+            self.assertTrue(gdstk.boolean(probe, collar, "and", precision=1e-3))
 
     def test_rectangular_collar_has_four_sided_extension(self):
         collar = gdstk.Polygon(
-            [(0.0, 0.0), (20.0, 0.0), (20.0, 3.0), (0.0, 3.0)],
+            [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)],
             layer=5,
             datatype=0,
         )

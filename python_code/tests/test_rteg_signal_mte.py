@@ -22,7 +22,7 @@ from rteg_mte_extensions import (
     _collar_overlap_area,
     build_mte_extensions,
     export_mte_extensions_gds,
-    select_edge_collar_mte,
+    select_extension_collar,
 )
 
 
@@ -52,8 +52,8 @@ class TestSignalMteKB331(unittest.TestCase):
                 self.assertEqual(result.n_extensions, 0)
                 continue
 
-            collar = select_edge_collar_mte(
-                roles.preserved, roles.resonator_body_mte
+            collar = select_extension_collar(
+                roles.preserved, roles.resonator_body_mte, self.cfg
             )
             if collar is None or result.n_extensions == 0:
                 continue
@@ -68,7 +68,7 @@ class TestSignalMteKB331(unittest.TestCase):
             )
             overlap = _collar_overlap_area(ext, collar.polygon, self.cfg.boolean_precision)
             self.assertGreaterEqual(overlap, self.cfg.min_collar_overlap_um2)
-            self.assertLess(overlap / abs(collar.polygon.area()), 0.5)
+            self.assertLess(overlap / abs(collar.polygon.area()), 0.99)
             self.assertEqual((ext.layer, ext.datatype), self.mte_pair)
             self.assertEqual(result.collar, collar)
 

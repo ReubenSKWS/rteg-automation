@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from kb331_pipeline import load_kb331_pipeline
 from rteg_collect import collect_geometry_roles
-from rteg_mte_extensions import MteBuildConfig, build_mte_extensions, select_edge_collar_mte
+from rteg_mte_extensions import MteBuildConfig, build_mte_extensions, select_extension_collar
 
 
 def main() -> int:
@@ -34,7 +34,7 @@ def main() -> int:
     for asm, res in zip(ctx["frame_assemblies"], ctx["res_list"], strict=True):
         roles = collect_geometry_roles(asm, res, ctx["identification"], layermap)
         result = build_mte_extensions({asm.index: roles}, layermap, cfg)[asm.index]
-        collar = select_edge_collar_mte(roles.preserved, roles.resonator_body_mte)
+        collar = select_extension_collar(roles.preserved, roles.resonator_body_mte, cfg)
         row = [
             str(asm.index),
             asm.inst_name,

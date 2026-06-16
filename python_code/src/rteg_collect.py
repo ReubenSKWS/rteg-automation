@@ -167,6 +167,7 @@ class RtegGeometryRoles:
     release_holes: ReleaseHoles
     frame_boundary: InnerFrameBoundary
     resonator_body_mte: list[gdstk.Polygon] = field(default_factory=list)
+    resonator_body_mbe: list[gdstk.Polygon] = field(default_factory=list)
 
     def group_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -200,6 +201,14 @@ def _resonator_shift(res: Resonator, assembly: RtegFrameAssembly) -> Point:
         assembly.assembly_origin[1] + ppd.resonator_origin[1],
     )
     return (rteg_origin[0] - res.origin[0], rteg_origin[1] - res.origin[1])
+
+
+def resonator_body_polys(
+    res: Resonator, assembly: RtegFrameAssembly
+) -> list[gdstk.Polygon]:
+    """Resonator MBE+MTE body polygons in RTEG world space."""
+    dx, dy = _resonator_shift(res, assembly)
+    return resonator_metal_polys(res, dx, dy)
 
 
 def _resonator_rteg_bbox(
@@ -645,6 +654,47 @@ def select_preserved_collar_mte(
     return best
 
 
+def preserved_mbe_overlap_with_body(
+    preserved_mbe: gdstk.Polygon,
+    body_mbe_polys: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+) -> float:
+    """Shared area between one preserved MBE collar and resonator-body MBE."""
+    overlap = 0.0
+    for body in body_mbe_polys:
+        inter = gdstk.boolean(preserved_mbe, body, "and", precision=precision)
+        if inter:
+            overlap = max(overlap, sum(abs(p.area()) for p in inter))
+    return overlap
+
+
+def select_preserved_collar_mbe(
+    preserved: PreservedMetal,
+    body_mbe_polys: Sequence[gdstk.Polygon],
+    *,
+    min_overlap_um2: float = 0.01,
+    precision: float = 1e-3,
+) -> TaggedPolygon | None:
+    """
+    Pick the preserved MBE collar for step 6.1 extension.
+
+    Uses the same edge-tab-over-stadium rules as MTE ``select_extension_collar``.
+    """
+    from rteg_mte_extensions import MteBuildConfig, select_extension_collar_from_pieces
+
+    cfg = MteBuildConfig(
+        min_collar_overlap_um2=min_overlap_um2,
+        boolean_precision=precision,
+    )
+    return select_extension_collar_from_pieces(
+        preserved.mbe,
+        body_mbe_polys,
+        preserved_mbe_overlap_with_body,
+        cfg,
+    )
+
+
 def collect_resonator_body_mte(
     res: Resonator,
     assembly: RtegFrameAssembly,
@@ -659,6 +709,23 @@ def collect_resonator_body_mte(
         poly
         for poly in resonator_metal_polys(res, dx, dy)
         if (poly.layer, poly.datatype) == mte_pair
+    ]
+
+
+def collect_resonator_body_mbe(
+    res: Resonator,
+    assembly: RtegFrameAssembly,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> list[gdstk.Polygon]:
+    """Resonator-master MBE polygons in RTEG world space (not filter interconnect)."""
+    cfg = config or RtegCollectConfig()
+    dx, dy = _resonator_shift(res, assembly)
+    mbe_pair = layermap.pair(cfg.mbe_layer)
+    return [
+        poly
+        for poly in resonator_metal_polys(res, dx, dy)
+        if (poly.layer, poly.datatype) == mbe_pair
     ]
 
 
@@ -831,6 +898,7 @@ def collect_geometry_roles(
         release_holes=collect_release_holes(assembly, res, layermap, cfg),
         frame_boundary=get_inner_frame_boundary(assembly, layermap, cfg),
         resonator_body_mte=collect_resonator_body_mte(res, assembly, layermap, cfg),
+        resonator_body_mbe=collect_resonator_body_mbe(res, assembly, layermap, cfg),
     )
 
 

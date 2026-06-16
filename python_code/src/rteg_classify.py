@@ -67,6 +67,10 @@ class NodeClassification:
             return []
         return list(self.by_band()["center"].polygons)
 
+    def center_pad_polygons(self) -> list[TaggedPolygon]:
+        """Center GSG band geometry regardless of MTE route target (Step 6.1 MBE pad route)."""
+        return list(self.by_band()["center"].polygons)
+
     def ground_node_polygons(self) -> list[TaggedPolygon]:
         out: list[TaggedPolygon] = []
         for node in self.nodes:
@@ -109,7 +113,10 @@ def classify_nodes(
     elif route == "center_pad":
         note = "preserved MTE faces center pad — route MTE to center signal pad"
     else:
-        note = "preserved MTE not facing center — extend preserved MTE at collar only"
+        note = (
+            "preserved MTE not facing center — extend preserved MTE at collar only; "
+            "MBE extension (Step 6.1) + pad route (Step 6.2) to center signal pad"
+        )
 
     nodes: list[ClassifiedNode] = []
     for band in _BAND_ORDER:

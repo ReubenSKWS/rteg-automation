@@ -213,21 +213,17 @@ def _is_extension_collar_candidate(poly: gdstk.Polygon, cfg: MteBuildConfig) -> 
     return _is_edge_collar_tab(poly, cfg) or _is_stadium_collar(poly, cfg)
 
 
-def _associated_edge_collars(
-    preserved: PreservedMetal,
+def _associated_edge_collars_from_pieces(
+    pieces: Sequence[TaggedPolygon],
     cfg: MteBuildConfig,
 ) -> list[TaggedPolygon]:
     """Small edge tabs that boolean-touch a stadium piece in the same preserved set."""
     stadium_pieces = [
-        tp for tp in preserved.mte if _is_stadium_collar(tp.polygon, cfg)
+        tp for tp in pieces if _is_stadium_collar(tp.polygon, cfg)
     ]
     if not stadium_pieces:
         return []
-    edge_tabs = [
-        tp
-        for tp in preserved.mte
-        if _is_edge_collar_tab(tp.polygon, cfg)
-    ]
+    edge_tabs = [tp for tp in pieces if _is_edge_collar_tab(tp.polygon, cfg)]
     associated: list[TaggedPolygon] = []
     stadium_keys = {_polygon_key(stadium.polygon) for stadium in stadium_pieces}
     for tp in edge_tabs:
@@ -246,30 +242,36 @@ def _associated_edge_collars(
     return associated
 
 
-def select_extension_collar(
+def _associated_edge_collars(
     preserved: PreservedMetal,
-    body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: MteBuildConfig,
+) -> list[TaggedPolygon]:
+    return _associated_edge_collars_from_pieces(preserved.mte, cfg)
+
+
+def select_extension_collar_from_pieces(
+    pieces: Sequence[TaggedPolygon],
+    body_polys: Sequence[gdstk.Polygon],
+    overlap_with_body,
     cfg: MteBuildConfig | None = None,
 ) -> TaggedPolygon | None:
     """
-    Pick the extension collar on ``BAW_MTE`` (layermap 5/0).
+    Pick the extension collar from a preserved metal set.
 
     Prefer the small edge collar tab over the stadium shell when both are
-    present. Step 5.1 often yields two pieces — resonator outline plus edge
+    present. Collect often yields two pieces — resonator outline plus edge
     collar; the extension collar is the smaller piece at the interconnect mouth.
     """
     c = cfg or MteBuildConfig()
-    if not preserved.mte:
+    if not pieces:
         return None
 
-    associated_edges = _associated_edge_collars(preserved, c)
+    associated_edges = _associated_edge_collars_from_pieces(pieces, c)
     if associated_edges:
         with_body = [
             tp
             for tp in associated_edges
-            if preserved_mte_overlap_with_body(
-                tp.polygon, body_mte_polys, precision=c.boolean_precision
-            )
+            if overlap_with_body(tp.polygon, body_polys, precision=c.boolean_precision)
             >= c.min_collar_overlap_um2
         ]
         if with_body:
@@ -278,20 +280,17 @@ def select_extension_collar(
 
     overlapping = [
         tp
-        for tp in preserved.mte
+        for tp in pieces
         if _is_extension_collar_candidate(tp.polygon, c)
-        and preserved_mte_overlap_with_body(
-            tp.polygon, body_mte_polys, precision=c.boolean_precision
-        )
+        and overlap_with_body(tp.polygon, body_polys, precision=c.boolean_precision)
         >= c.min_collar_overlap_um2
     ]
     if overlapping:
         smallest_overlap = min(overlapping, key=lambda tp: abs(tp.polygon.area()))
-        smallest_all = min(preserved.mte, key=lambda tp: abs(tp.polygon.area()))
+        smallest_all = min(pieces, key=lambda tp: abs(tp.polygon.area()))
         overlap_area = abs(smallest_overlap.polygon.area())
-        edge_area = abs(smallest_all.polygon.area())
-        edge_overlap = preserved_mte_overlap_with_body(
-            smallest_all.polygon, body_mte_polys, precision=c.boolean_precision
+        edge_overlap = overlap_with_body(
+            smallest_all.polygon, body_polys, precision=c.boolean_precision
         )
         stadium_targets = [
             tp for tp in overlapping if _is_stadium_collar(tp.polygon, c)
@@ -314,13 +313,25 @@ def select_extension_collar(
             return smallest_all
         return smallest_overlap
 
-    stadium_pieces = [
-        tp for tp in preserved.mte if _is_stadium_collar(tp.polygon, c)
-    ]
+    stadium_pieces = [tp for tp in pieces if _is_stadium_collar(tp.polygon, c)]
     if stadium_pieces:
         return min(stadium_pieces, key=lambda tp: abs(tp.polygon.area()))
 
-    return min(preserved.mte, key=lambda tp: abs(tp.polygon.area()))
+    return min(pieces, key=lambda tp: abs(tp.polygon.area()))
+
+
+def select_extension_collar(
+    preserved: PreservedMetal,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: MteBuildConfig | None = None,
+) -> TaggedPolygon | None:
+    """Pick the extension collar on ``BAW_MTE`` (layermap 5/0)."""
+    return select_extension_collar_from_pieces(
+        preserved.mte,
+        body_mte_polys,
+        preserved_mte_overlap_with_body,
+        cfg,
+    )
 
 
 def _collar_body_overlap_centroid(
@@ -968,6 +979,8 @@ def mte_intercept_breakdown_rows(
 class MteRtegAssembly:
     frame: RtegFrameAssembly
     extension: MteExtensionResult
+    layermap: LayerMap | None = None
+    mbe_extension: object | None = None
 
     @property
     def index(self) -> int:
@@ -990,6 +1003,11 @@ class MteRtegAssembly:
         net = self.extension.routed_net or self.extension.extension
         if net is not None:
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
+        if self.layermap is not None and self.mbe_extension is not None:
+            mbe_net = self.mbe_extension.routed_net or self.mbe_extension.extension
+            if mbe_net is not None and self.mbe_extension.n_extensions > 0:
+                tagged = assign_layer(mbe_net, self.layermap, "BAW_MBE")
+                cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
         return cell
 
 
@@ -999,15 +1017,36 @@ def export_mte_extensions_gds(
     output_dir: str | Path,
     *,
     layermap: LayerMap,
+    mbe_extensions: Mapping[int, object] | None = None,
     parent: str | None = None,
     flatten: bool = True,
     write_lyp: bool = True,
 ) -> list[ExportResult]:
-    assemblies = [
-        MteRtegAssembly(frame=asm, extension=extensions[asm.index])
-        for asm in frame_assemblies
-        if asm.index in extensions and extensions[asm.index].n_extensions > 0
-    ]
+    """
+    Export one GDS per resonator: frame + MTE route/extension (+ optional MBE).
+
+    Pass ``mbe_extensions`` from step 6 to write MTE (5/0) and MBE (2/0) into the
+    same file under ``output_dir``.
+    """
+    mbe_map = mbe_extensions or {}
+    assemblies: list[MteRtegAssembly] = []
+    for asm in frame_assemblies:
+        if asm.index not in extensions:
+            continue
+        mte = extensions[asm.index]
+        mbe = mbe_map.get(asm.index)
+        has_mte = mte.n_extensions > 0
+        has_mbe = mbe is not None and mbe.n_extensions > 0
+        if not has_mte and not has_mbe:
+            continue
+        assemblies.append(
+            MteRtegAssembly(
+                frame=asm,
+                extension=mte,
+                layermap=layermap,
+                mbe_extension=mbe if has_mbe else None,
+            )
+        )
     return export_gds(
         assemblies,
         output_dir,
@@ -1034,4 +1073,5 @@ __all__ = [
     "mte_extensions_overview_rows",
     "mte_intercept_breakdown_rows",
     "select_extension_collar",
+    "select_extension_collar_from_pieces",
 ]

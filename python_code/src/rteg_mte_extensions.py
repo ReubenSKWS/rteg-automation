@@ -1026,10 +1026,126 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
+    def _strip_absorbed_mbe(
+        self,
+        cell: gdstk.Cell,
+        absorbed: Sequence[gdstk.Polygon],
+        *,
+        overlap_fraction: float = 0.85,
+        boolean_precision: float = 1e-3,
+    ) -> None:
+        """Drop preserved MBE polygons already merged into the center-pad filler."""
+        if not absorbed or self.layermap is None:
+            return
+        mbe_pair = self.layermap.pair("BAW_MBE")
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mbe_pair:
+                keep.append(poly)
+                continue
+            drop = False
+            poly_area = abs(poly.area())
+            for target in absorbed:
+                overlap = gdstk.boolean(
+                    poly,
+                    target,
+                    "and",
+                    precision=boolean_precision,
+                )
+                if not overlap:
+                    continue
+                overlap_area = sum(abs(p.area()) for p in overlap)
+                if poly_area > 1e-6 and overlap_area / poly_area >= overlap_fraction:
+                    drop = True
+                    break
+            if not drop:
+                keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
+    def _strip_mbe_inside_filler_bbox(
+        self,
+        cell: gdstk.Cell,
+        filler: gdstk.Polygon,
+        *,
+        tol: float = 1.0,
+    ) -> None:
+        """Clear frame MBE inside the step-4 filler window before writing the body."""
+        if self.layermap is None:
+            return
+        mbe_pair = self.layermap.pair("BAW_MBE")
+        fbb = filler.bounding_box()
+        if fbb is None:
+            return
+        (fx0, fy0), (fx1, fy1) = fbb
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mbe_pair:
+                keep.append(poly)
+                continue
+            bb = poly.bounding_box()
+            if bb is None:
+                keep.append(poly)
+                continue
+            inside = (
+                bb[0][0] >= fx0 - tol
+                and bb[0][1] >= fy0 - tol
+                and bb[1][0] <= fx1 + tol
+                and bb[1][1] <= fy1 + tol
+            )
+            if inside:
+                continue
+            keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
+    def _strip_overlapping_mbe_in_filler(
+        self,
+        cell: gdstk.Cell,
+        filler_polys: Sequence[gdstk.Polygon],
+        *,
+        overlap_fraction: float = 0.85,
+        boolean_precision: float = 1e-3,
+    ) -> None:
+        """Remove frame MBE that substantially duplicates generated filler metal."""
+        if not filler_polys or self.layermap is None:
+            return
+        mbe_pair = self.layermap.pair("BAW_MBE")
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mbe_pair:
+                keep.append(poly)
+                continue
+            poly_area = abs(poly.area())
+            drop = False
+            for filler in filler_polys:
+                overlap = gdstk.boolean(
+                    poly,
+                    filler,
+                    "and",
+                    precision=boolean_precision,
+                )
+                if not overlap:
+                    continue
+                overlap_area = sum(abs(p.area()) for p in overlap)
+                if (
+                    poly_area > 1e-6
+                    and overlap_area / poly_area >= overlap_fraction
+                ):
+                    drop = True
+                    break
+            if not drop:
+                keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
     def flatten(self) -> gdstk.Cell:
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
         if self.mbe_body is not None and getattr(self.mbe_body, "n_pieces", 0) > 0:
             self._strip_raw_filler(cell)
+            absorbed = getattr(self.mbe_body, "absorbed_mbe", None) or []
+            if absorbed:
+                self._strip_absorbed_mbe(cell, absorbed)
         net = self.extension.routed_net or self.extension.extension
         if net is not None:
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
@@ -1043,7 +1159,12 @@ class MteRtegAssembly:
             if getattr(body, "cap", None) is not None:
                 tagged = assign_layer(body.cap, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
-            for poly in getattr(body, "filler", []) or []:
+            filler_polys = getattr(body, "filler", []) or []
+            if len(filler_polys) == 1:
+                self._strip_mbe_inside_filler_bbox(cell, filler_polys[0])
+            elif filler_polys:
+                self._strip_overlapping_mbe_in_filler(cell, filler_polys)
+            for poly in filler_polys:
                 tagged = assign_layer(poly, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
         return cell

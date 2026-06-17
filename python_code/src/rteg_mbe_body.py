@@ -1,18 +1,14 @@
 """
 Step 6.2 — MBE ground body for ``collar_extend`` resonators.
 
-For resonators whose preserved MTE did not face the center signal pad:
-1. Copy the 5.3 MTE extension, keep the outer half, shift ``cap_shift_um`` toward the filler.
-2. Carve the step-4 width filler around the resonator stadium with DRC clearance.
-3. Bridge the cap to the carved filler — straight merge when a stadium curve sits
-   on the cap (intercept chord), otherwise a 1 µm step-back ray cast.
-4. Export cap and carved filler as separate ``BAW_MBE`` polygons (not boolean-merged).
+MBE cap on 5.3 MTE extension + carved filler bridge. Step 6.3 lives in
+``rteg_mbe_body_center_pad.py``.
 """
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import gdstk
 
@@ -20,7 +16,20 @@ from layermap import LayerMap
 from prep_resonator_ppd import _grown_keepout_polys
 from rteg_classify import NodeClassification
 from rteg_collect import RtegGeometryRoles
-from rteg_mbe_extensions import MbeExtensionResult, tag_baw_mbe
+from rteg_mbe_body_common import (
+    MbeBodyResult,
+    base_filler_polygon,
+    carve_filler,
+    empty_mbe_body_result,
+    merge_filler_with_bridge,
+    offset_polys,
+)
+from rteg_mbe_body_center_pad import (
+    MbeBodyCenterPadConfig,
+    build_mbe_body_center_pad,
+    mbe_body_center_pad_applies,
+)
+from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
 from rteg_utils import assign_layer
 
@@ -43,30 +52,26 @@ class MbeBodyConfig:
     filler_bbox_tol_um: float = 1.0
 
 
-@dataclass
-class MbeBodyResult:
-    cap: gdstk.Polygon | None
-    filler: list[gdstk.Polygon]
-    bridge: gdstk.Polygon | None
-    routed_net: list[gdstk.Polygon]
-    n_pieces: int
-    drc_violations: list[str] = field(default_factory=list)
+def _center_pad_config_from_body(cfg: MbeBodyConfig) -> MbeBodyCenterPadConfig:
+    return MbeBodyCenterPadConfig(
+        mbe_layer=cfg.mbe_layer,
+        boolean_precision=cfg.boolean_precision,
+        release_hole_clearance_um=cfg.release_hole_clearance_um,
+    )
 
 
-def mbe_body_applies(classification: NodeClassification) -> bool:
+def mbe_body_collar_extend_applies(classification: NodeClassification) -> bool:
     """Step 6.2 applies when preserved MTE did not face the center signal pad."""
     return classification.mte_route_target == "collar_extend"
 
 
+def mbe_body_applies(classification: NodeClassification) -> bool:
+    """Steps 6.2 or 6.3 apply for collar_extend and center_pad resonators."""
+    return classification.mte_route_target in ("collar_extend", "center_pad")
+
+
 def _empty_mbe_body_result(*, violations: list[str] | None = None) -> MbeBodyResult:
-    return MbeBodyResult(
-        cap=None,
-        filler=[],
-        bridge=None,
-        routed_net=[],
-        n_pieces=0,
-        drc_violations=list(violations or []),
-    )
+    return empty_mbe_body_result(violations=violations)
 
 
 def _normalize_vector(dx: float, dy: float) -> Point:
@@ -202,17 +207,7 @@ def _offset_polys(
     polys: Sequence[gdstk.Polygon],
     distance: float,
 ) -> list[gdstk.Polygon]:
-    grown: list[gdstk.Polygon] = []
-    for poly in polys:
-        if distance <= 0:
-            grown.append(poly)
-            continue
-        offset = gdstk.offset(poly, distance)
-        if offset:
-            grown.extend(offset)
-        else:
-            grown.append(poly)
-    return grown
+    return offset_polys(polys, distance)
 
 
 def _project_along(point: Point, axis: Point) -> float:
@@ -559,7 +554,10 @@ def build_mbe_body_keepouts(
     signal_route: gdstk.Polygon | None,
     cfg: MbeBodyConfig | None = None,
 ) -> list[gdstk.Polygon]:
-    """Stadium, release-hole, and 6.1 signal-route clearance zones."""
+    """Stadium, release-hole, and routed-signal clearance zones for step 6.2.
+
+    ``signal_route`` is the 6.1 MBE routed net.
+    """
     c = cfg or MbeBodyConfig()
     keepouts: list[gdstk.Polygon] = []
 
@@ -579,16 +577,6 @@ def build_mbe_body_keepouts(
     return keepouts
 
 
-def _as_polygon_list(
-    polys: gdstk.Polygon | Sequence[gdstk.Polygon] | None,
-) -> list[gdstk.Polygon]:
-    if polys is None:
-        return []
-    if isinstance(polys, gdstk.Polygon):
-        return [polys]
-    return list(polys)
-
-
 def build_mbe_body_filler(
     base_filler: gdstk.Polygon,
     keepouts: Sequence[gdstk.Polygon],
@@ -596,59 +584,11 @@ def build_mbe_body_filler(
 ) -> tuple[list[gdstk.Polygon], list[str]]:
     """Carve keepouts from the step-4 filler and clip to the filler bbox."""
     c = cfg or MbeBodyConfig()
-    violations: list[str] = []
-
-    carved: list[gdstk.Polygon]
-    if keepouts:
-        result = gdstk.boolean(
-            base_filler,
-            list(keepouts),
-            "not",
-            precision=c.boolean_precision,
-        )
-        carved = result if result else []
-    else:
-        carved = [base_filler]
-
-    if not carved:
-        violations.append("carved filler is empty after keepout subtraction")
-        return [], violations
-
-    filler_bb = base_filler.bounding_box()
-    if filler_bb is not None:
-        clip_rect = gdstk.rectangle(filler_bb[0], filler_bb[1])
-        clipped: list[gdstk.Polygon] = []
-        for piece in carved:
-            result = gdstk.boolean(
-                piece,
-                clip_rect,
-                "and",
-                precision=c.boolean_precision,
-            )
-            if result:
-                clipped.extend(result)
-        if clipped:
-            carved = clipped
-
-    return carved, violations
-
-
-def _clip_polys_to_bbox(
-    polys: Sequence[gdstk.Polygon],
-    bbox_poly: gdstk.Polygon,
-    cfg: MbeBodyConfig,
-) -> list[gdstk.Polygon]:
-    clipped: list[gdstk.Polygon] = []
-    for piece in polys:
-        result = gdstk.boolean(
-            piece,
-            bbox_poly,
-            "and",
-            precision=cfg.boolean_precision,
-        )
-        if result:
-            clipped.extend(result)
-    return clipped if clipped else list(polys)
+    return carve_filler(
+        base_filler,
+        keepouts,
+        boolean_precision=c.boolean_precision,
+    )
 
 
 def _merge_filler_with_bridge(
@@ -657,30 +597,19 @@ def _merge_filler_with_bridge(
     base_filler: gdstk.Polygon,
     cfg: MbeBodyConfig,
 ) -> list[gdstk.Polygon]:
-    if bridge is None:
-        return carved
-    merged = gdstk.boolean(
+    return merge_filler_with_bridge(
         carved,
-        [bridge],
-        "or",
-        precision=cfg.boolean_precision,
+        bridge,
+        base_filler,
+        boolean_precision=cfg.boolean_precision,
     )
-    if not merged:
-        return carved
-    filler_bb = base_filler.bounding_box()
-    if filler_bb is None:
-        return merged
-    clip_rect = gdstk.rectangle(filler_bb[0], filler_bb[1])
-    return _clip_polys_to_bbox(merged, clip_rect, cfg)
 
 
 def _base_filler_polygon(classification: NodeClassification) -> gdstk.Polygon | None:
-    if not classification.filler:
-        return None
-    return classification.filler[0].polygon
+    return base_filler_polygon(classification)
 
 
-def build_mbe_body(
+def build_mbe_body_collar_extend(
     roles: RtegGeometryRoles,
     classification: NodeClassification,
     mte_result: MteExtensionResult,
@@ -688,18 +617,18 @@ def build_mbe_body(
     layermap: LayerMap,
     cfg: MbeBodyConfig | None = None,
 ) -> MbeBodyResult:
-    """Run step 6.2 for a single resonator."""
+    """Run step 6.2 for a single ``collar_extend`` resonator."""
     c = cfg or MbeBodyConfig()
-    if not mbe_body_applies(classification):
+    if not mbe_body_collar_extend_applies(classification):
         return _empty_mbe_body_result()
-
-    mte_ext = mte_result.extension
-    if mte_ext is None:
-        return _empty_mbe_body_result(violations=["missing 5.3 MTE collar extension"])
 
     base_filler = _base_filler_polygon(classification)
     if base_filler is None:
         return _empty_mbe_body_result(violations=["missing step-4 MBE width filler"])
+
+    mte_ext = mte_result.extension
+    if mte_ext is None:
+        return _empty_mbe_body_result(violations=["missing 5.3 MTE collar extension"])
 
     violations: list[str] = []
     cap = draw_mbe_cap_on_mte_extension(
@@ -708,9 +637,7 @@ def build_mbe_body(
         layermap,
         c,
     )
-    overlap = gdstk.boolean(
-        cap, mte_ext, "and", precision=c.boolean_precision
-    )
+    overlap = gdstk.boolean(cap, mte_ext, "and", precision=c.boolean_precision)
     if not overlap:
         violations.append("MBE cap does not overlap 5.3 MTE extension")
 
@@ -719,11 +646,7 @@ def build_mbe_body(
         signal_route = mbe_signal.routed_net or mbe_signal.extension
 
     keepouts = build_mbe_body_keepouts(roles, signal_route, c)
-    carved, filler_violations = build_mbe_body_filler(
-        base_filler,
-        keepouts,
-        c,
-    )
+    carved, filler_violations = build_mbe_body_filler(base_filler, keepouts, c)
     violations.extend(filler_violations)
 
     bridge = _build_filler_bridge(
@@ -744,7 +667,6 @@ def build_mbe_body(
     carved = _merge_filler_with_bridge(carved, bridge, base_filler, c)
 
     export_polys = [*carved, cap]
-
     return MbeBodyResult(
         cap=cap,
         filler=carved,
@@ -755,7 +677,41 @@ def build_mbe_body(
     )
 
 
-def build_mbe_bodies(
+def build_mbe_body(
+    roles: RtegGeometryRoles,
+    classification: NodeClassification,
+    mte_result: MteExtensionResult,
+    mbe_signal: MbeExtensionResult | None,
+    layermap: LayerMap,
+    cfg: MbeBodyConfig | None = None,
+    conn_cfg: MbeConnectionConfig | None = None,
+) -> MbeBodyResult:
+    """Run step 6.2 or 6.3 for a single resonator."""
+    c = cfg or MbeBodyConfig()
+    if not mbe_body_applies(classification):
+        return _empty_mbe_body_result()
+
+    if mbe_body_center_pad_applies(classification):
+        return build_mbe_body_center_pad(
+            roles,
+            classification,
+            mte_result,
+            layermap,
+            _center_pad_config_from_body(c),
+            conn_cfg,
+        )
+
+    return build_mbe_body_collar_extend(
+        roles,
+        classification,
+        mte_result,
+        mbe_signal,
+        layermap,
+        c,
+    )
+
+
+def build_mbe_body_collar_extends(
     roles_by_index: Mapping[int, RtegGeometryRoles],
     classifications: Mapping[int, NodeClassification],
     mte_by_index: Mapping[int, MteExtensionResult],
@@ -765,6 +721,35 @@ def build_mbe_bodies(
 ) -> dict[int, MbeBodyResult]:
     """Run step 6.2 for every resonator index in ``roles_by_index``."""
     cfg = config or MbeBodyConfig()
+    out: dict[int, MbeBodyResult] = {}
+    for idx, roles in roles_by_index.items():
+        classification = classifications[idx]
+        if not mbe_body_collar_extend_applies(classification):
+            out[idx] = _empty_mbe_body_result()
+            continue
+        out[idx] = build_mbe_body_collar_extend(
+            roles,
+            classification,
+            mte_by_index[idx],
+            mbe_signal_by_index.get(idx),
+            layermap,
+            cfg,
+        )
+    return out
+
+
+def build_mbe_bodies(
+    roles_by_index: Mapping[int, RtegGeometryRoles],
+    classifications: Mapping[int, NodeClassification],
+    mte_by_index: Mapping[int, MteExtensionResult],
+    mbe_signal_by_index: Mapping[int, MbeExtensionResult],
+    layermap: LayerMap,
+    config: MbeBodyConfig | None = None,
+    conn_config: MbeConnectionConfig | None = None,
+) -> dict[int, MbeBodyResult]:
+    """Run step 6.2 / 6.3 for every resonator index in ``roles_by_index``."""
+    cfg = config or MbeBodyConfig()
+    conn_cfg = conn_config or MbeConnectionConfig()
     out: dict[int, MbeBodyResult] = {}
     for idx, roles in roles_by_index.items():
         classification = classifications[idx]
@@ -778,6 +763,7 @@ def build_mbe_bodies(
             mbe_signal_by_index.get(idx),
             layermap,
             cfg,
+            conn_cfg,
         )
     return out
 
@@ -810,9 +796,13 @@ __all__ = [
     "MbeBodyResult",
     "build_mbe_bodies",
     "build_mbe_body",
+    "build_mbe_body_collar_extend",
+    "build_mbe_body_collar_extends",
     "build_mbe_body_filler",
     "build_mbe_body_keepouts",
     "draw_mbe_cap_on_mte_extension",
     "mbe_body_applies",
+    "mbe_body_center_pad_applies",
+    "mbe_body_collar_extend_applies",
     "mbe_body_overview_rows",
 ]

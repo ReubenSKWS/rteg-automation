@@ -1,4 +1,4 @@
-"""Step 6.2 — MBE ground body for collar_extend resonators."""
+"""Step 6.2 / 6.3 — MBE ground body for collar_extend and center_pad resonators."""
 from __future__ import annotations
 
 import math
@@ -24,13 +24,28 @@ from rteg_mbe_body import (
     MbeBodyConfig,
     _extension_outer_edge,
     build_mbe_bodies,
+    build_mbe_body_filler,
     build_mbe_body_keepouts,
     draw_mbe_cap_on_mte_extension,
     mbe_body_applies,
+    mbe_body_center_pad_applies,
+    mbe_body_collar_extend_applies,
     mbe_body_overview_rows,
 )
-from rteg_mbe_extensions import MbeConnectionConfig, build_mbe_extensions
+from rteg_mbe_body_center_pad import (
+    MbeBodyCenterPadConfig,
+    build_center_pad_keepouts,
+    build_mbe_body_center_pads,
+    _gds_polygon_count,
+)
+from rteg_mbe_body_common import base_filler_polygon
+from rteg_mbe_extensions import (
+    MbeConnectionConfig,
+    build_mbe_extensions,
+    select_extension_collar_mbe,
+)
 from rteg_mte_extensions import MteBuildConfig, build_mte_extensions, export_mte_extensions_gds
+from rteg_mte_route import MteRouteConfig, build_mte_pad_routes
 
 COLLAR_EXTEND_INDICES = (0, 2, 5, 7)
 CENTER_PAD_INDICES = (1, 3, 4, 6)
@@ -154,8 +169,10 @@ class TestMbeBodyKB331(unittest.TestCase):
         except FileNotFoundError:
             raise unittest.SkipTest("KB331 input files not available")
         cls.mte_cfg = MteBuildConfig()
+        cls.mte_route_cfg = MteRouteConfig()
         cls.mbe_cfg = MbeConnectionConfig()
         cls.body_cfg = MbeBodyConfig()
+        cls.center_pad_cfg = MbeBodyCenterPadConfig()
         cls.all_roles = {}
         cls.all_classify = {}
         for asm, res in zip(
@@ -181,6 +198,13 @@ class TestMbeBodyKB331(unittest.TestCase):
                 res_type=res.res_type,
             )
         cls.all_mte = build_mte_extensions(cls.all_roles, cls.ctx["layermap"], cls.mte_cfg)
+        cls.all_mte = build_mte_pad_routes(
+            cls.all_roles,
+            cls.all_classify,
+            cls.all_mte,
+            cls.ctx["layermap"],
+            cls.mte_route_cfg,
+        )
         cls.all_mbe = build_mbe_extensions(
             cls.all_roles,
             cls.all_classify,
@@ -195,21 +219,241 @@ class TestMbeBodyKB331(unittest.TestCase):
             cls.ctx["layermap"],
             cls.body_cfg,
         )
+        cls.center_pad_body = build_mbe_body_center_pads(
+            cls.all_roles,
+            cls.all_classify,
+            cls.all_mte,
+            cls.ctx["layermap"],
+            cls.center_pad_cfg,
+        )
 
-    def test_gate_center_pad_empty(self):
+    def test_gate_center_pad_drawn(self):
         for index in CENTER_PAD_INDICES:
-            self.assertFalse(mbe_body_applies(self.all_classify[index]))
-            body = self.all_body[index]
-            self.assertEqual(body.n_pieces, 0)
-            self.assertIsNone(body.cap)
+            self.assertTrue(mbe_body_center_pad_applies(self.all_classify[index]))
+            body = self.center_pad_body[index]
+            self.assertGreater(body.n_pieces, 0, msg=f"index {index}")
+            self.assertIsNone(body.cap, msg=f"index {index}")
+            self.assertIsNone(body.bridge, msg=f"index {index}")
+            self.assertTrue(body.filler, msg=f"index {index}")
 
     def test_gate_collar_extend_drawn(self):
         for index in COLLAR_EXTEND_INDICES:
-            self.assertTrue(mbe_body_applies(self.all_classify[index]))
+            self.assertTrue(mbe_body_collar_extend_applies(self.all_classify[index]))
             body = self.all_body[index]
             self.assertGreater(body.n_pieces, 0, msg=f"index {index}")
             self.assertIsNotNone(body.cap, msg=f"index {index}")
             self.assertTrue(body.filler, msg=f"index {index}")
+
+    def test_center_pad_no_cap(self):
+        for index in CENTER_PAD_INDICES:
+            body = self.center_pad_body[index]
+            self.assertIsNone(body.cap, msg=f"index {index}")
+            self.assertEqual(body.routed_net, body.filler, msg=f"index {index}")
+
+    def test_center_pad_filler_single_closed_polygon(self):
+        """MBE ground filler must be one GDS-safe closed polygon."""
+        for index in CENTER_PAD_INDICES:
+            body = self.center_pad_body[index]
+            self.assertEqual(len(body.filler), 1, msg=f"index {index}")
+            filler = body.filler[0]
+            gds_count = _gds_polygon_count(
+                filler,
+                boolean_precision=self.center_pad_cfg.boolean_precision,
+            )
+            self.assertEqual(
+                gds_count,
+                1,
+                msg=f"index {index}: filler must export as one GDS polygon",
+            )
+            overlap = gdstk.boolean(
+                filler,
+                body.absorbed_mbe[0],
+                "and",
+                precision=self.center_pad_cfg.boolean_precision,
+            )
+            self.assertTrue(
+                overlap and sum(abs(p.area()) for p in overlap) > 1e-6,
+                msg=f"index {index}: filler must overlap MBE collar",
+            )
+            base = base_filler_polygon(self.all_classify[index])
+            self.assertIsNotNone(base, msg=f"index {index}")
+            base_bb = base.bounding_box()
+            filler_bb = filler.bounding_box()
+            assert base_bb is not None and filler_bb is not None
+            self.assertAlmostEqual(
+                filler_bb[0][1],
+                base_bb[0][1],
+                places=2,
+                msg=f"index {index}: filler should span full step-4 height",
+            )
+            self.assertAlmostEqual(
+                filler_bb[1][1],
+                base_bb[1][1],
+                places=2,
+                msg=f"index {index}: filler should span full step-4 height",
+            )
+
+    def test_center_pad_filler_touches_collar(self):
+        for index in CENTER_PAD_INDICES:
+            body = self.center_pad_body[index]
+            roles = self.all_roles[index]
+            classification = self.all_classify[index]
+            signal_polys = [tp.polygon for tp in classification.center_pad_polygons()]
+            collar_tp = select_extension_collar_mbe(
+                roles.preserved,
+                roles.resonator_body_mbe,
+                self.mbe_cfg,
+                signal_polys=signal_polys or None,
+            )
+            self.assertIsNotNone(collar_tp, msg=f"index {index}")
+            gap = _min_gap_um(body.filler, [collar_tp.polygon])
+            self.assertLess(
+                gap,
+                1.0,
+                msg=f"index {index}: filler should reach MBE collar (gap={gap:.3f} µm)",
+            )
+
+    def test_center_pad_filler_respects_center_pad_keepouts(self):
+        for index in CENTER_PAD_INDICES:
+            body = self.center_pad_body[index]
+            roles = self.all_roles[index]
+            classification = self.all_classify[index]
+            signal_polys = [tp.polygon for tp in classification.center_pad_polygons()]
+            collar_tp = select_extension_collar_mbe(
+                roles.preserved,
+                roles.resonator_body_mbe,
+                self.mbe_cfg,
+                signal_polys=signal_polys or None,
+            )
+            self.assertIsNotNone(collar_tp, msg=f"index {index}")
+            keepouts = build_center_pad_keepouts(
+                roles,
+                self.all_mte[index],
+                collar_tp.polygon,
+                self.center_pad_cfg,
+            )
+            clearance_poly = body.filler[0]
+            for absorbed in body.absorbed_mbe:
+                trimmed = gdstk.boolean(
+                    clearance_poly,
+                    absorbed,
+                    "not",
+                    precision=self.center_pad_cfg.boolean_precision,
+                )
+                if trimmed:
+                    clearance_poly = max(trimmed, key=lambda p: abs(p.area()))
+            overlap = gdstk.boolean(
+                [clearance_poly],
+                keepouts,
+                "and",
+                precision=self.center_pad_cfg.boolean_precision,
+            )
+            if overlap:
+                hits = [
+                    (float(x), float(y))
+                    for x, y in clearance_poly.points
+                    if abs(float(x) - clearance_poly.bounding_box()[0][0]) <= 0.1
+                ]
+                if len(hits) >= 2:
+                    hit_bot = min(hits, key=lambda p: p[1])
+                    hit_top = max(hits, key=lambda p: p[1])
+                    filler_bb = body.filler[0].bounding_box()
+                    assert filler_bb is not None
+                    allowed_band = gdstk.rectangle(
+                        (filler_bb[0][0], hit_bot[1] - 2.0),
+                        (filler_bb[1][0], hit_top[1] + 2.0),
+                    )
+                    trimmed: list[gdstk.Polygon] = []
+                    for piece in overlap:
+                        outside = gdstk.boolean(
+                            piece,
+                            allowed_band,
+                            "not",
+                            precision=self.center_pad_cfg.boolean_precision,
+                        )
+                        if outside:
+                            trimmed.extend(outside)
+                    overlap = trimmed
+            self.assertFalse(
+                overlap,
+                msg=(
+                    f"index {index}: center-pad filler should trace keepouts and only "
+                    "enter the exempt collar-access band"
+                ),
+            )
+
+    def test_center_pad_export_merges_absorbed_collar(self):
+        merged_body = {**self.all_body, **self.center_pad_body}
+        with tempfile.TemporaryDirectory() as tmp:
+            results = export_mte_extensions_gds(
+                self.ctx["frame_assemblies"],
+                self.all_mte,
+                tmp,
+                layermap=self.ctx["layermap"],
+                mbe_extensions=self.all_mbe,
+                mbe_bodies=merged_body,
+            )
+            mbe_pair = self.ctx["layermap"].pair("BAW_MBE")
+            by_index = {r.index: r for r in results}
+            for index in CENTER_PAD_INDICES:
+                body = self.center_pad_body[index]
+                self.assertTrue(body.absorbed_mbe, msg=f"index {index}")
+                collar = body.absorbed_mbe[0]
+                lib = gdstk.read_gds(by_index[index].path)
+                mbe_polys = [
+                    p
+                    for cell in lib.cells
+                    for p in cell.flatten().polygons
+                    if (p.layer, p.datatype) == mbe_pair
+                ]
+                collar_area = abs(collar.area())
+                standalone_collar = 0
+                for poly in mbe_polys:
+                    overlap = gdstk.boolean(
+                        poly,
+                        collar,
+                        "and",
+                        precision=self.center_pad_cfg.boolean_precision,
+                    )
+                    if not overlap:
+                        continue
+                    overlap_area = sum(abs(p.area()) for p in overlap)
+                    poly_area = abs(poly.area())
+                    if (
+                        collar_area > 1e-6
+                        and overlap_area / collar_area >= 0.85
+                        and poly_area > 1e-6
+                        and overlap_area / poly_area >= 0.85
+                    ):
+                        standalone_collar += 1
+                self.assertEqual(
+                    standalone_collar,
+                    0,
+                    msg=f"index {index}: preserved collar should not export separately",
+                )
+
+    def test_export_center_pad_includes_filler(self):
+        merged_body = {**self.all_body, **self.center_pad_body}
+        with tempfile.TemporaryDirectory() as tmp:
+            results = export_mte_extensions_gds(
+                self.ctx["frame_assemblies"],
+                self.all_mte,
+                tmp,
+                layermap=self.ctx["layermap"],
+                mbe_extensions=self.all_mbe,
+                mbe_bodies=merged_body,
+            )
+            mbe_pair = self.ctx["layermap"].pair("BAW_MBE")
+            by_index = {r.index: r for r in results}
+            for index in CENTER_PAD_INDICES:
+                lib = gdstk.read_gds(by_index[index].path)
+                mbe_polys = [
+                    p
+                    for cell in lib.cells
+                    for p in cell.flatten().polygons
+                    if (p.layer, p.datatype) == mbe_pair
+                ]
+                self.assertGreater(len(mbe_polys), 1, msg=f"index {index}")
 
     def test_cap_overlaps_mte_extension(self):
         for index in COLLAR_EXTEND_INDICES:
@@ -346,7 +590,7 @@ class TestMbeBodyKB331(unittest.TestCase):
         rows = mbe_body_overview_rows(self.all_body, inst_names=inst_names)
         self.assertEqual(len(rows), 8)
         drawn = [r for r in rows if r["n_pieces"] > 0]
-        self.assertEqual(len(drawn), len(COLLAR_EXTEND_INDICES))
+        self.assertEqual(len(drawn), 8)
 
 
 if __name__ == "__main__":

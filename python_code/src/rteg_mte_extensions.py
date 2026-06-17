@@ -981,6 +981,7 @@ class MteRtegAssembly:
     extension: MteExtensionResult
     layermap: LayerMap | None = None
     mbe_extension: object | None = None
+    mbe_body: object | None = None
 
     @property
     def index(self) -> int:
@@ -998,8 +999,37 @@ class MteRtegAssembly:
     def library(self) -> gdstk.Library:
         return self.frame.library
 
+    def _strip_raw_filler(self, cell: gdstk.Cell) -> None:
+        """Remove the step-4 width filler rectangle before writing the carved body."""
+        if self.layermap is None:
+            return
+        mbe_pair = self.layermap.pair("BAW_MBE")
+        (fx0, fy0), (fx1, fy1) = self.frame.mbe_filler_bbox
+        tol = 1.0
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mbe_pair:
+                keep.append(poly)
+                continue
+            bb = poly.bounding_box()
+            if bb is None:
+                keep.append(poly)
+                continue
+            if (
+                abs(bb[0][0] - fx0) <= tol
+                and abs(bb[0][1] - fy0) <= tol
+                and abs(bb[1][0] - fx1) <= tol
+                and abs(bb[1][1] - fy1) <= tol
+            ):
+                continue
+            keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
     def flatten(self) -> gdstk.Cell:
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
+        if self.mbe_body is not None and getattr(self.mbe_body, "n_pieces", 0) > 0:
+            self._strip_raw_filler(cell)
         net = self.extension.routed_net or self.extension.extension
         if net is not None:
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
@@ -1007,6 +1037,14 @@ class MteRtegAssembly:
             mbe_net = self.mbe_extension.routed_net or self.mbe_extension.extension
             if mbe_net is not None and self.mbe_extension.n_extensions > 0:
                 tagged = assign_layer(mbe_net, self.layermap, "BAW_MBE")
+                cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
+        if self.layermap is not None and self.mbe_body is not None:
+            body = self.mbe_body
+            if getattr(body, "cap", None) is not None:
+                tagged = assign_layer(body.cap, self.layermap, "BAW_MBE")
+                cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
+            for poly in getattr(body, "filler", []) or []:
+                tagged = assign_layer(poly, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
         return cell
 
@@ -1018,6 +1056,7 @@ def export_mte_extensions_gds(
     *,
     layermap: LayerMap,
     mbe_extensions: Mapping[int, object] | None = None,
+    mbe_bodies: Mapping[int, object] | None = None,
     parent: str | None = None,
     flatten: bool = True,
     write_lyp: bool = True,
@@ -1025,19 +1064,22 @@ def export_mte_extensions_gds(
     """
     Export one GDS per resonator: frame + MTE route/extension (+ optional MBE).
 
-    Pass ``mbe_extensions`` from step 6 to write MTE (5/0) and MBE (2/0) into the
-    same file under ``output_dir``.
+    Pass ``mbe_extensions`` from step 6.1 and ``mbe_bodies`` from step 6.2 to
+    write MTE (5/0) and MBE (2/0) into the same file under ``output_dir``.
     """
     mbe_map = mbe_extensions or {}
+    body_map = mbe_bodies or {}
     assemblies: list[MteRtegAssembly] = []
     for asm in frame_assemblies:
         if asm.index not in extensions:
             continue
         mte = extensions[asm.index]
         mbe = mbe_map.get(asm.index)
+        body = body_map.get(asm.index)
         has_mte = mte.n_extensions > 0
         has_mbe = mbe is not None and mbe.n_extensions > 0
-        if not has_mte and not has_mbe:
+        has_body = body is not None and body.n_pieces > 0
+        if not has_mte and not has_mbe and not has_body:
             continue
         assemblies.append(
             MteRtegAssembly(
@@ -1045,6 +1087,7 @@ def export_mte_extensions_gds(
                 extension=mte,
                 layermap=layermap,
                 mbe_extension=mbe if has_mbe else None,
+                mbe_body=body if has_body else None,
             )
         )
     return export_gds(

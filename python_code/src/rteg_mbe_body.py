@@ -31,7 +31,6 @@ from rteg_mbe_body_center_pad import (
 )
 from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
-from rteg_utils import assign_layer
 
 Point = tuple[float, float]
 

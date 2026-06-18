@@ -157,19 +157,21 @@ def build_center_pad_keepouts(
     cfg: MbeBodyCenterPadConfig,
 ) -> list[gdstk.Polygon]:
     """
-    Clearance zones for step 6.3 — same sources as step 6.2 keepouts.
+    Clearance zones for step 6.3 — same MTE sources as step 6.2 keepouts.
 
-    Stadium and preserved / routed MTE are offset by ``stadium_mte_clearance_um``
-  (default 2 µm). Release holes use ``release_hole_clearance_um`` (6 µm).
-    Stadium/MTE keepouts are clipped at the MBE collar mouth so filler can
-    reach the collar; release-hole clearance always applies.
+    Use resonator-body MTE and the step-5.1 extension only. Preserved filter
+    connectMTE collars are not carved here: they are not written into the RTEG
+    cell and must not bite the step-4 top/right/bottom bbox edges.
+
+    Stadium / extension MTE are offset by ``stadium_mte_clearance_um`` (2 µm).
+    Release holes use ``release_hole_clearance_um`` (6 µm). Stadium keepouts
+    are clipped at the MBE collar mouth so filler can reach the collar.
     """
     clearance_um = cfg.stadium_mte_clearance_um
     keepouts: list[gdstk.Polygon] = []
 
     stadium_mte_obstacles: list[gdstk.Polygon] = []
     stadium_mte_obstacles.extend(roles.resonator_body_mte)
-    stadium_mte_obstacles.extend(tp.polygon for tp in roles.preserved.mte)
     if mte_result is not None and mte_result.extension is not None:
         stadium_mte_obstacles.append(mte_result.extension)
 

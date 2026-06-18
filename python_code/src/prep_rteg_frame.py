@@ -17,11 +17,12 @@ from pathlib import Path
 import gdstk
 import pandas as pd
 
-from prep_resonator_ppd import ResonatorPpdAssembly
+from prep_resonator_ppd import RESONATOR_METAL_LAYERS, ResonatorPpdAssembly
 from rteg_utils import bbox_center, frame_top_cell, translate_bbox
 
 DEFAULT_X_MARGIN_PCT = 0.04
 DEFAULT_Y_MARGIN_PCT = 0.07
+DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM = 10.0
 MBE_LAYER = 2
 MBE_DATATYPE = 0
 INNER_FRAME_RING_MIN_AREA = 10_000.0
@@ -89,6 +90,37 @@ def frame_content_center(
     return bbox_center(content_bb)
 
 
+def _resonator_metal_x1_local(assembly: ResonatorPpdAssembly) -> float:
+    """Right edge of resonator MBE/MTE in assembly-local coordinates."""
+    refs = list(assembly.top_cell.references)
+    if len(refs) < 2:
+        raise ValueError(
+            f"Assembly {assembly.top_cell.name} has no resonator reference"
+        )
+    res_ref = refs[1]
+    tmp = gdstk.Cell("_resonator_metal_probe")
+    tmp.add(
+        gdstk.Reference(
+            res_ref.cell,
+            origin=res_ref.origin,
+            rotation=res_ref.rotation,
+            magnification=res_ref.magnification,
+            x_reflection=res_ref.x_reflection,
+        )
+    )
+    x1_values = [
+        bb[1][0]
+        for poly in tmp.flatten().polygons
+        if (poly.layer, poly.datatype) in RESONATOR_METAL_LAYERS
+        and (bb := poly.bounding_box()) is not None
+    ]
+    if not x1_values:
+        raise ValueError(
+            f"Assembly {assembly.top_cell.name} has no resonator metal bounding box"
+        )
+    return max(x1_values)
+
+
 def assembly_placement_origin(
     assembly: ResonatorPpdAssembly,
     content_bb: tuple[tuple[float, float], tuple[float, float]],
@@ -107,6 +139,73 @@ def assembly_placement_origin(
     _acx, acy = bbox_center(asm_bb)
     (cx0, _cy0), (_cx1, _cy1) = content_bb
     return cx0 - ax0, content_center[1] - acy
+
+
+def resonator_filler_right_shift(
+    assembly: ResonatorPpdAssembly,
+    assembly_origin: tuple[float, float],
+    content_bb: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    resonator_filler_right_margin_um: float = DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM,
+) -> tuple[float, float]:
+    """
+    Extra assembly-local shift for the resonator only (negative X moves left).
+
+    Keeps resonator MBE/MTE ``resonator_filler_right_margin_um`` clear of the
+    MBE filler right edge while leaving the PPD/GSG frame at ``assembly_origin``.
+    """
+    (_, _), (cx1, _) = content_bb
+    ox, _oy = assembly_origin
+    res_x1 = _resonator_metal_x1_local(assembly)
+    max_res_x = cx1 - resonator_filler_right_margin_um
+    world_res_x1 = res_x1 + ox
+    if world_res_x1 <= max_res_x + 1e-6:
+        return (0.0, 0.0)
+    return (max_res_x - world_res_x1, 0.0)
+
+
+def _assembly_references(
+    assembly: ResonatorPpdAssembly,
+) -> tuple[gdstk.Reference, gdstk.Reference]:
+    refs = list(assembly.top_cell.references)
+    if len(refs) < 2:
+        raise ValueError(
+            f"Assembly {assembly.top_cell.name} has no resonator reference"
+        )
+    return refs[0], refs[1]
+
+
+def _add_placed_ppd_resonator_refs(
+    top: gdstk.Cell,
+    assembly: ResonatorPpdAssembly,
+    assembly_origin: tuple[float, float],
+    resonator_frame_shift: tuple[float, float],
+) -> None:
+    """Place PPD and resonator separately so only the resonator can be nudged."""
+    ppd_ref, res_ref = _assembly_references(assembly)
+    ox, oy = assembly_origin
+    rsx, rsy = resonator_frame_shift
+    top.add(
+        gdstk.Reference(
+            ppd_ref.cell,
+            origin=(ox + ppd_ref.origin[0], oy + ppd_ref.origin[1]),
+            rotation=ppd_ref.rotation,
+            magnification=ppd_ref.magnification,
+            x_reflection=ppd_ref.x_reflection,
+        )
+    )
+    top.add(
+        gdstk.Reference(
+            res_ref.cell,
+            origin=(
+                ox + res_ref.origin[0] + rsx,
+                oy + res_ref.origin[1] + rsy,
+            ),
+            rotation=res_ref.rotation,
+            magnification=res_ref.magnification,
+            x_reflection=res_ref.x_reflection,
+        )
+    )
 
 
 def mbe_width_filler_polygon(
@@ -187,6 +286,7 @@ class RtegFrameAssembly:
     inst_name: str
     frame_origin: tuple[float, float]
     assembly_origin: tuple[float, float]
+    resonator_frame_shift: tuple[float, float]
     content_center: tuple[float, float]
     inner_die_frame_bbox: tuple[tuple[float, float], tuple[float, float]]
     content_bbox: tuple[tuple[float, float], tuple[float, float]]
@@ -213,6 +313,8 @@ class RtegFrameAssembly:
             "frame_origin_y": round(self.frame_origin[1], 1),
             "assembly_origin_x": round(self.assembly_origin[0], 1),
             "assembly_origin_y": round(self.assembly_origin[1], 1),
+            "resonator_frame_shift_x": round(self.resonator_frame_shift[0], 1),
+            "resonator_frame_shift_y": round(self.resonator_frame_shift[1], 1),
             "content_center_x": round(self.content_center[0], 1),
             "content_center_y": round(self.content_center[1], 1),
             "inner_frame_x0": round(fx0, 1),
@@ -238,14 +340,17 @@ def prep_rteg_in_frame(
     frame_cell: gdstk.Cell | None = None,
     x_margin_pct: float = DEFAULT_X_MARGIN_PCT,
     y_margin_pct: float = DEFAULT_Y_MARGIN_PCT,
+    resonator_filler_right_margin_um: float = DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM,
 ) -> list[RtegFrameAssembly]:
     """
     Build one die-frame + PPD assembly per step-3 object.
 
     Margins are measured from the inner die frame cavity. Each assembly is
-    left-aligned in X (4%) and centered in Y (7%), then an MBE rectangle fills
-    the right side from the inner-frame center to the margined right edge at the
-    same height as the placed assembly.
+    left-aligned in X (4%) and centered in Y (7%). When needed, only the
+    resonator is shifted left to keep its metal clear of the MBE filler right
+    edge; the PPD/GSG frame stays fixed. An MBE rectangle fills the right side
+    from the inner-frame center to the margined right edge at the same height
+    as the placed assembly.
     """
     if not assemblies:
         return []
@@ -263,7 +368,17 @@ def prep_rteg_in_frame(
 
     results: list[RtegFrameAssembly] = []
     for ppd_asm in assemblies:
-        asm_origin = assembly_placement_origin(ppd_asm, content_bb, content_center)
+        asm_origin = assembly_placement_origin(
+            ppd_asm,
+            content_bb,
+            content_center,
+        )
+        res_shift = resonator_filler_right_shift(
+            ppd_asm,
+            asm_origin,
+            content_bb,
+            resonator_filler_right_margin_um=resonator_filler_right_margin_um,
+        )
         filler = mbe_width_filler_polygon(
             ppd_asm, asm_origin, inner_bb, content_bb
         )
@@ -283,7 +398,7 @@ def prep_rteg_in_frame(
         cell_name = f"rteg_{ppd_asm.index}_{ppd_asm.inst_name}"
         top = gdstk.Cell(cell_name)
         top.add(gdstk.Reference(frame_master, origin=frame_origin))
-        top.add(gdstk.Reference(ppd_asm.top_cell, origin=asm_origin))
+        _add_placed_ppd_resonator_refs(top, ppd_asm, asm_origin, res_shift)
         top.add(filler)
 
         out_lib = gdstk.Library()
@@ -299,6 +414,7 @@ def prep_rteg_in_frame(
                 inst_name=ppd_asm.inst_name,
                 frame_origin=frame_origin,
                 assembly_origin=asm_origin,
+                resonator_frame_shift=res_shift,
                 content_center=content_center,
                 inner_die_frame_bbox=inner_bb,
                 content_bbox=content_bb,

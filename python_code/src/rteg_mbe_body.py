@@ -1,7 +1,9 @@
 """
 Step 6.2 — MBE ground body for ``collar_extend`` resonators.
 
-MBE cap on 5.3 MTE extension + carved filler bridge. Step 6.3 lives in
+MBE cap on 5.3 MTE extension + carved filler bridge. 
+
+Step 6.3 lives in
 ``rteg_mbe_body_center_pad.py``.
 """
 from __future__ import annotations
@@ -22,6 +24,7 @@ from rteg_mbe_body_common import (
     carve_filler,
     empty_mbe_body_result,
     merge_filler_with_bridge,
+    mte_route_obstacle_polys,
     offset_polys,
 )
 from rteg_mbe_body_center_pad import (
@@ -31,7 +34,6 @@ from rteg_mbe_body_center_pad import (
 )
 from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
-from rteg_utils import assign_layer
 
 Point = tuple[float, float]
 
@@ -553,17 +555,27 @@ def build_mbe_body_keepouts(
     roles: RtegGeometryRoles,
     signal_route: gdstk.Polygon | None,
     cfg: MbeBodyConfig | None = None,
+    *,
+    mte_result: MteExtensionResult | None = None,
 ) -> list[gdstk.Polygon]:
     """Stadium, release-hole, and routed-signal clearance zones for step 6.2.
 
-    ``signal_route`` is the 6.1 MBE routed net.
+    ``signal_route`` is the 6.1 MBE routed net. MTE obstacles include resonator
+    body MTE, the 5.3 extension, and any center-pad MTE route on layer 5/0.
     """
     c = cfg or MbeBodyConfig()
     keepouts: list[gdstk.Polygon] = []
 
+    mte_extension = mte_result.extension if mte_result is not None else None
+    mte_routed_net = mte_result.routed_net if mte_result is not None else None
+    mte_obstacles = mte_route_obstacle_polys(
+        roles.resonator_body_mte,
+        mte_extension,
+        mte_routed_net,
+    )
     clearance_um = c.mbe_mte_min_spacing_um * c.stadium_clearance_factor
-    if roles.resonator_body_mte and clearance_um > 0:
-        keepouts.extend(_offset_polys(list(roles.resonator_body_mte), clearance_um))
+    if mte_obstacles and clearance_um > 0:
+        keepouts.extend(_offset_polys(mte_obstacles, clearance_um))
 
     release_polys = [tp.polygon for tp in roles.release_holes.all_items()]
     if release_polys and c.release_hole_clearance_um > 0:
@@ -645,7 +657,7 @@ def build_mbe_body_collar_extend(
     if mbe_signal is not None:
         signal_route = mbe_signal.routed_net or mbe_signal.extension
 
-    keepouts = build_mbe_body_keepouts(roles, signal_route, c)
+    keepouts = build_mbe_body_keepouts(roles, signal_route, c, mte_result=mte_result)
     carved, filler_violations = build_mbe_body_filler(base_filler, keepouts, c)
     violations.extend(filler_violations)
 
@@ -791,6 +803,22 @@ def mbe_body_overview_rows(
     return rows
 
 
+def merge_mbe_bodies(*body_maps: Mapping[int, MbeBodyResult]) -> dict[int, MbeBodyResult]:
+    """
+    Merge step 6.2 and 6.3 body dicts without empty placeholders overwriting real work.
+
+    Both builders return an entry for every index; non-applicable indices get
+    ``n_pieces == 0``. A plain ``{**collar_extend, **center_pad}`` merge would
+    replace drawn collar_extend bodies with those empty entries.
+    """
+    out: dict[int, MbeBodyResult] = {}
+    for body_map in body_maps:
+        for idx, result in body_map.items():
+            if result.n_pieces > 0:
+                out[idx] = result
+    return out
+
+
 __all__ = [
     "MbeBodyConfig",
     "MbeBodyResult",
@@ -805,4 +833,5 @@ __all__ = [
     "mbe_body_center_pad_applies",
     "mbe_body_collar_extend_applies",
     "mbe_body_overview_rows",
+    "merge_mbe_bodies",
 ]

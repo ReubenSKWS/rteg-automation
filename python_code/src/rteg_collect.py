@@ -197,8 +197,12 @@ def _resonator_shift(res: Resonator, assembly: RtegFrameAssembly) -> Point:
     """Delta from filter placement to RTEG placement for ``resonator_metal_polys``."""
     ppd = assembly.ppd_assembly
     rteg_origin = (
-        assembly.assembly_origin[0] + ppd.resonator_origin[0],
-        assembly.assembly_origin[1] + ppd.resonator_origin[1],
+        assembly.assembly_origin[0]
+        + ppd.resonator_origin[0]
+        + assembly.resonator_frame_shift[0],
+        assembly.assembly_origin[1]
+        + ppd.resonator_origin[1]
+        + assembly.resonator_frame_shift[1],
     )
     return (rteg_origin[0] - res.origin[0], rteg_origin[1] - res.origin[1])
 

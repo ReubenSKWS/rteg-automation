@@ -117,6 +117,66 @@ def _clip_polys_to_bbox(
     return clipped if clipped else list(polys)
 
 
+def mte_route_obstacle_polys(
+    resonator_body_mte: Sequence[gdstk.Polygon],
+    mte_extension: gdstk.Polygon | None = None,
+    mte_routed_net: gdstk.Polygon | None = None,
+) -> list[gdstk.Polygon]:
+    """Resonator-body MTE plus step-5.3 extension and pad route polygons."""
+    obstacles = list(resonator_body_mte)
+    if mte_extension is not None:
+        obstacles.append(mte_extension)
+    if mte_routed_net is not None:
+        obstacles.append(mte_routed_net)
+    return obstacles
+
+
+def trim_polygon_away_from_keepouts(
+    poly: gdstk.Polygon,
+    keepouts: Sequence[gdstk.Polygon],
+    *,
+    anchor: gdstk.Polygon | None = None,
+    boolean_precision: float,
+) -> gdstk.Polygon:
+    """Boolean-subtract keepouts, keeping the piece connected to ``anchor`` when split."""
+    if not keepouts:
+        return poly
+    carved = gdstk.boolean(poly, list(keepouts), "not", precision=boolean_precision)
+    if not carved:
+        return poly
+    if len(carved) == 1:
+        return carved[0]
+    if anchor is not None:
+        connected = [
+            piece
+            for piece in carved
+            if gdstk.boolean(piece, anchor, "and", precision=boolean_precision)
+        ]
+        if connected:
+            return max(connected, key=lambda p: abs(p.area()))
+    return max(carved, key=lambda p: abs(p.area()))
+
+
+def build_mte_trim_keepouts(
+    obstacles: Sequence[gdstk.Polygon],
+    clearance_um: float,
+    *,
+    extra_clearance_um: float = 0.0,
+    boolean_precision: float = 1e-3,
+) -> list[gdstk.Polygon]:
+    """Offset-clearance keepouts for final MBE filler trim near MTE routes."""
+    total = clearance_um + extra_clearance_um
+    if not obstacles or total <= 0:
+        return []
+    united = gdstk.boolean(
+        list(obstacles),
+        [],
+        "or",
+        precision=boolean_precision,
+    ) or list(obstacles)
+    return offset_polys(united, total)
+
+
 def merge_filler_with_bridge(
     carved: list[gdstk.Polygon],
     bridge: gdstk.Polygon | None,
@@ -144,8 +204,11 @@ def merge_filler_with_bridge(
 __all__ = [
     "MbeBodyResult",
     "base_filler_polygon",
+    "build_mte_trim_keepouts",
     "carve_filler",
     "empty_mbe_body_result",
     "merge_filler_with_bridge",
+    "mte_route_obstacle_polys",
     "offset_polys",
+    "trim_polygon_away_from_keepouts",
 ]

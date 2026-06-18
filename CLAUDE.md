@@ -12,6 +12,8 @@ R-tags are per-resonator test layouts used by NPI and modeling teams to characte
 
 Today, R-tag generation is a manual layout task performed in **Cadence Virtuoso** by a layout engineer. For a filter with 60–70 resonators it consumes roughly a full engineer-day. This project replaces that manual work with code that reproduces the same engineering decisions automatically.
 
+**Implementation status:** Steps 1–6 (through MBE ground filler) run on the KB331 sample in [`python_code/single_run.ipynb`](python_code/single_run.ipynb). See [`README.md`](README.md) for the current pipeline map and module list.
+
 ---
 
 ## Domain primer

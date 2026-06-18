@@ -532,6 +532,48 @@ class TestMbeBodyKB331(unittest.TestCase):
             )
             self.assertGreaterEqual(gap, min_required, msg=f"index {index} gap={gap:.2f}")
 
+    def test_center_pad_filler_clears_mte_routes(self):
+        min_required = (
+            self.center_pad_cfg.stadium_mte_clearance_um
+            + self.center_pad_cfg.mte_trim_extra_clearance_um
+            - 0.5
+        )
+        for index in CENTER_PAD_INDICES:
+            mte = self.all_mte[index]
+            obstacles = [
+                poly
+                for poly in (mte.extension, mte.routed_net)
+                if poly is not None
+            ]
+            if not obstacles:
+                continue
+            gap = _min_gap_um(self.center_pad_body[index].filler, obstacles)
+            self.assertGreaterEqual(
+                gap,
+                min_required,
+                msg=f"index {index} gap={gap:.2f}",
+            )
+
+    def test_collar_extend_filler_clears_mte_extension(self):
+        min_required = (
+            self.body_cfg.mbe_mte_min_spacing_um * self.body_cfg.stadium_clearance_factor
+            - 0.5
+        )
+        for index in COLLAR_EXTEND_INDICES:
+            mte_ext = self.all_mte[index].extension
+            if mte_ext is None:
+                continue
+            gap = _min_stadium_gap_outside_bridge(
+                self.all_body[index].filler,
+                [mte_ext],
+                self.all_body[index].bridge,
+            )
+            self.assertGreaterEqual(
+                gap,
+                min_required,
+                msg=f"index {index} gap={gap:.2f}",
+            )
+
     def test_signal_route_separation(self):
         min_required = self.body_cfg.mbe_mte_min_spacing_um - 0.5
         for index in COLLAR_EXTEND_INDICES:

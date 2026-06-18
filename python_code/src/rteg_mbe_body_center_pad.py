@@ -23,9 +23,13 @@ from rteg_collect import RtegGeometryRoles
 from rteg_mbe_body_common import (
     MbeBodyResult,
     base_filler_polygon,
+    build_mte_trim_keepouts,
     carve_filler,
     empty_mbe_body_result,
+    merge_filler_with_bridge,
+    mte_route_obstacle_polys,
     offset_polys,
+    trim_polygon_away_from_keepouts,
 )
 from rteg_mbe_extensions import (
     MbeConnectionConfig,
@@ -54,6 +58,8 @@ class MbeBodyCenterPadConfig:
     boolean_precision: float = 1e-3
     intercept_tol_um: float = 0.05
     stadium_mte_clearance_um: float = 2.0
+    # Extra margin on the final top/right/bottom trim only (avoids pinch corners).
+    mte_trim_extra_clearance_um: float = 1.0
     release_hole_clearance_um: float = 6.0
 
 
@@ -170,10 +176,13 @@ def build_center_pad_keepouts(
     clearance_um = cfg.stadium_mte_clearance_um
     keepouts: list[gdstk.Polygon] = []
 
-    stadium_mte_obstacles: list[gdstk.Polygon] = []
-    stadium_mte_obstacles.extend(roles.resonator_body_mte)
-    if mte_result is not None and mte_result.extension is not None:
-        stadium_mte_obstacles.append(mte_result.extension)
+    mte_extension = mte_result.extension if mte_result is not None else None
+    mte_routed_net = mte_result.routed_net if mte_result is not None else None
+    stadium_mte_obstacles = mte_route_obstacle_polys(
+        roles.resonator_body_mte,
+        mte_extension,
+        mte_routed_net,
+    )
 
     if clearance_um > 0 and stadium_mte_obstacles:
         stadium_mte_keepouts = offset_polys(stadium_mte_obstacles, clearance_um)
@@ -877,6 +886,7 @@ def route_filler_around_collar(
     cfg: MbeBodyCenterPadConfig,
     *,
     keepouts: Sequence[gdstk.Polygon] | None = None,
+    mte_trim_keepouts: Sequence[gdstk.Polygon] | None = None,
 ) -> list[gdstk.Polygon]:
     """
     Carve with 6.2-style keepouts, trace the left edge from a sampled clearance
@@ -980,6 +990,24 @@ def route_filler_around_collar(
             boolean_precision=cfg.boolean_precision,
         )
 
+    if mte_trim_keepouts:
+        merged = trim_polygon_away_from_keepouts(
+            merged,
+            mte_trim_keepouts,
+            anchor=collar,
+            boolean_precision=cfg.boolean_precision,
+        )
+        merged = _clean_polygon(merged, boolean_precision=cfg.boolean_precision)
+        merged = _remove_acute_vertices(merged)
+        merged = _clean_polygon(merged, boolean_precision=cfg.boolean_precision)
+        merged = trim_polygon_away_from_keepouts(
+            merged,
+            mte_trim_keepouts,
+            anchor=collar,
+            boolean_precision=cfg.boolean_precision,
+        )
+        merged = _clean_polygon(merged, boolean_precision=cfg.boolean_precision)
+
     return [tag_baw_mbe(merged, layermap)]
 
 
@@ -1020,6 +1048,19 @@ def build_mbe_body_center_pad(
             collar_tp.polygon,
             c,
         )
+        mte_extension = mte_result.extension if mte_result is not None else None
+        mte_routed_net = mte_result.routed_net if mte_result is not None else None
+        mte_obstacles = mte_route_obstacle_polys(
+            roles.resonator_body_mte,
+            mte_extension,
+            mte_routed_net,
+        )
+        mte_trim_keepouts = build_mte_trim_keepouts(
+            mte_obstacles,
+            c.stadium_mte_clearance_um,
+            extra_clearance_um=c.mte_trim_extra_clearance_um,
+            boolean_precision=c.boolean_precision,
+        )
         filler = route_filler_around_collar(
             base_filler,
             collar_tp.polygon,
@@ -1027,6 +1068,7 @@ def build_mbe_body_center_pad(
             layermap,
             c,
             keepouts=keepouts,
+            mte_trim_keepouts=mte_trim_keepouts,
         )
         absorbed_mbe = [collar_tp.polygon]
 

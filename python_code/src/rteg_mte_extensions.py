@@ -11,6 +11,7 @@ Step 5.3 — MTE collar extensions.
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1179,14 +1180,19 @@ def export_mte_extensions_gds(
     mbe_extensions: Mapping[int, object] | None = None,
     mbe_bodies: Mapping[int, object] | None = None,
     parent: str | None = None,
+    stage: str = "mte",
     flatten: bool = True,
     write_lyp: bool = True,
 ) -> list[ExportResult]:
     """
     Export one GDS per resonator: frame + MTE route/extension (+ optional MBE).
 
-    Pass ``mbe_extensions`` from step 6.1 and ``mbe_bodies`` from step 6.2 to
-    write MTE (5/0) and MBE (2/0) into the same file under ``output_dir``.
+    Pass ``mbe_extensions`` from step 6.1 and ``mbe_bodies`` from steps 6.2/6.3
+    to write MTE (5/0) and MBE (2/0) into the same file under ``output_dir``.
+
+    For the complete pipeline output (steps 4–6.3), prefer
+    :func:`export_full_rteg_gds` which validates all indices and uses the
+    ``routed`` filename suffix.
     """
     mbe_map = mbe_extensions or {}
     body_map = mbe_bodies or {}
@@ -1216,10 +1222,64 @@ def export_mte_extensions_gds(
         output_dir,
         layermap=layermap,
         parent=parent,
-        stage="mte",
+        stage=stage,
         flatten=flatten,
         write_lyp=write_lyp,
     )
+
+
+def export_full_rteg_gds(
+    frame_assemblies: Sequence[RtegFrameAssembly],
+    extensions: Mapping[int, MteExtensionResult],
+    output_dir: str | Path,
+    *,
+    layermap: LayerMap,
+    mbe_extensions: Mapping[int, object],
+    mbe_bodies: Mapping[int, object],
+    parent: str | None = None,
+    flatten: bool = True,
+    write_lyp: bool = True,
+) -> list[ExportResult]:
+    """
+    Export the complete routed RTEG (steps 4–6.3) — one GDS per resonator.
+
+    Each file includes the die frame, PPD, resonator placement (including any
+    step-4 resonator-only shift), MTE collar extension and pad routes (5.3–5.4),
+    MBE signal routes where applicable (6.1), and carved MBE ground filler
+    (6.2 for ``collar_extend``, 6.3 for ``center_pad``).
+
+    ``mbe_bodies`` must be the merged dict from steps 6.2 and 6.3, e.g.
+    ``merge_mbe_bodies(collar_extend_body, center_pad_body)``.
+    """
+    expected = {asm.index for asm in frame_assemblies}
+    missing_mte = expected - set(extensions)
+    if missing_mte:
+        raise ValueError(
+            "Full RTEG export requires MTE extensions for every framed resonator; "
+            f"missing indices: {sorted(missing_mte)}"
+        )
+
+    results = export_mte_extensions_gds(
+        frame_assemblies,
+        extensions,
+        output_dir,
+        layermap=layermap,
+        mbe_extensions=mbe_extensions,
+        mbe_bodies=mbe_bodies,
+        parent=parent,
+        stage="routed",
+        flatten=flatten,
+        write_lyp=write_lyp,
+    )
+    exported = {r.index for r in results}
+    if exported != expected:
+        missing = sorted(expected - exported)
+        warnings.warn(
+            "Full RTEG export did not write GDS for indices "
+            f"{missing}. Confirm steps 5.3–6.3 ran and routing applied.",
+            stacklevel=2,
+        )
+    return results
 
 
 __all__ = [
@@ -1231,6 +1291,7 @@ __all__ = [
     "build_mte_extensions",
     "draw_collar_extension",
     "draw_lip_extension",
+    "export_full_rteg_gds",
     "export_mte_extensions_gds",
     "extension_is_connected",
     "find_outward_lip_ab",

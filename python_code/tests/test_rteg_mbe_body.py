@@ -27,6 +27,7 @@ from rteg_mbe_body import (
     build_mbe_body_filler,
     build_mbe_body_keepouts,
     draw_mbe_cap_on_mte_extension,
+    merge_mbe_bodies,
     mbe_body_applies,
     mbe_body_center_pad_applies,
     mbe_body_collar_extend_applies,
@@ -44,7 +45,12 @@ from rteg_mbe_extensions import (
     build_mbe_extensions,
     select_extension_collar_mbe,
 )
-from rteg_mte_extensions import MteBuildConfig, build_mte_extensions, export_mte_extensions_gds
+from rteg_mte_extensions import (
+    MteBuildConfig,
+    build_mte_extensions,
+    export_full_rteg_gds,
+    export_mte_extensions_gds,
+)
 from rteg_mte_route import MteRouteConfig, build_mte_pad_routes
 
 COLLAR_EXTEND_INDICES = (0, 2, 5, 7)
@@ -383,7 +389,7 @@ class TestMbeBodyKB331(unittest.TestCase):
             )
 
     def test_center_pad_export_merges_absorbed_collar(self):
-        merged_body = {**self.all_body, **self.center_pad_body}
+        merged_body = merge_mbe_bodies(self.all_body, self.center_pad_body)
         with tempfile.TemporaryDirectory() as tmp:
             results = export_mte_extensions_gds(
                 self.ctx["frame_assemblies"],
@@ -433,7 +439,7 @@ class TestMbeBodyKB331(unittest.TestCase):
                 )
 
     def test_export_center_pad_includes_filler(self):
-        merged_body = {**self.all_body, **self.center_pad_body}
+        merged_body = merge_mbe_bodies(self.all_body, self.center_pad_body)
         with tempfile.TemporaryDirectory() as tmp:
             results = export_mte_extensions_gds(
                 self.ctx["frame_assemblies"],
@@ -454,6 +460,64 @@ class TestMbeBodyKB331(unittest.TestCase):
                     if (p.layer, p.datatype) == mbe_pair
                 ]
                 self.assertGreater(len(mbe_polys), 1, msg=f"index {index}")
+
+    def test_merge_mbe_bodies_keeps_collar_extend_when_center_pad_empty(self):
+        merged = merge_mbe_bodies(self.all_body, self.center_pad_body)
+        for index in COLLAR_EXTEND_INDICES:
+            self.assertGreater(
+                merged[index].n_pieces,
+                0,
+                msg=f"index {index}: step 6.2 body lost after merge",
+            )
+        for index in CENTER_PAD_INDICES:
+            self.assertGreater(merged[index].n_pieces, 0, msg=f"index {index}")
+
+    def test_export_full_rteg_gds_writes_all_indices_with_routed_suffix(self):
+        merged_body = merge_mbe_bodies(self.all_body, self.center_pad_body)
+        with tempfile.TemporaryDirectory() as tmp:
+            results = export_full_rteg_gds(
+                self.ctx["frame_assemblies"],
+                self.all_mte,
+                tmp,
+                layermap=self.ctx["layermap"],
+                mbe_extensions=self.all_mbe,
+                mbe_bodies=merged_body,
+                parent="KB331_N_01",
+            )
+            self.assertEqual(len(results), len(self.ctx["frame_assemblies"]))
+            mbe_pair = self.ctx["layermap"].pair("BAW_MBE")
+            mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+            by_index = {r.index: r for r in results}
+            for index in CENTER_PAD_INDICES:
+                self.assertTrue(
+                    by_index[index].path.name.endswith("_routed.gds"),
+                    msg=f"index {index}",
+                )
+                lib = gdstk.read_gds(by_index[index].path)
+                polys = [p for cell in lib.cells for p in cell.flatten().polygons]
+                layers = {(p.layer, p.datatype) for p in polys}
+                self.assertIn(mte_pair, layers, msg=f"index {index}: missing MTE")
+                self.assertIn(mbe_pair, layers, msg=f"index {index}: missing MBE")
+                self.assertTrue(
+                    self.all_mte[index].routed_net is not None,
+                    msg=f"index {index}: pad route missing from pipeline",
+                )
+            for index in COLLAR_EXTEND_INDICES:
+                lib = gdstk.read_gds(by_index[index].path)
+                polys = [p for cell in lib.cells for p in cell.flatten().polygons]
+                layers = {(p.layer, p.datatype) for p in polys}
+                self.assertIn(mte_pair, layers, msg=f"index {index}: missing MTE")
+                self.assertIn(mbe_pair, layers, msg=f"index {index}: missing MBE")
+                self.assertGreater(
+                    self.all_mbe[index].n_extensions,
+                    0,
+                    msg=f"index {index}: MBE signal missing from pipeline",
+                )
+                self.assertGreater(
+                    merged_body[index].n_pieces,
+                    0,
+                    msg=f"index {index}: step 6.2 body missing from merge",
+                )
 
     def test_cap_overlaps_mte_extension(self):
         for index in COLLAR_EXTEND_INDICES:

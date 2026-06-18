@@ -1,7 +1,9 @@
 """
 Step 6.2 — MBE ground body for ``collar_extend`` resonators.
 
-MBE cap on 5.3 MTE extension + carved filler bridge. Step 6.3 lives in
+MBE cap on 5.3 MTE extension + carved filler bridge. 
+
+Step 6.3 lives in
 ``rteg_mbe_body_center_pad.py``.
 """
 from __future__ import annotations
@@ -801,6 +803,22 @@ def mbe_body_overview_rows(
     return rows
 
 
+def merge_mbe_bodies(*body_maps: Mapping[int, MbeBodyResult]) -> dict[int, MbeBodyResult]:
+    """
+    Merge step 6.2 and 6.3 body dicts without empty placeholders overwriting real work.
+
+    Both builders return an entry for every index; non-applicable indices get
+    ``n_pieces == 0``. A plain ``{**collar_extend, **center_pad}`` merge would
+    replace drawn collar_extend bodies with those empty entries.
+    """
+    out: dict[int, MbeBodyResult] = {}
+    for body_map in body_maps:
+        for idx, result in body_map.items():
+            if result.n_pieces > 0:
+                out[idx] = result
+    return out
+
+
 __all__ = [
     "MbeBodyConfig",
     "MbeBodyResult",
@@ -815,4 +833,5 @@ __all__ = [
     "mbe_body_center_pad_applies",
     "mbe_body_collar_extend_applies",
     "mbe_body_overview_rows",
+    "merge_mbe_bodies",
 ]

@@ -1,4 +1,4 @@
-"""Step 6.2 / 6.3 — MBE ground body for collar_extend and center_pad resonators."""
+﻿"""Step 6.2 / 6.3 ΓÇö MBE ground body for collar_extend and center_pad resonators."""
 from __future__ import annotations
 
 import math
@@ -22,6 +22,7 @@ from rteg_classify import classify_nodes
 from rteg_collect import collect_geometry_roles, collect_orientation_inputs
 from rteg_mbe_body import (
     MbeBodyConfig,
+    _extension_corners,
     _extension_outer_edge,
     build_mbe_bodies,
     build_mbe_body_filler,
@@ -55,6 +56,19 @@ from rteg_mte_route import MteRouteConfig, build_mte_pad_routes
 
 COLLAR_EXTEND_INDICES = (0, 2, 5, 7)
 CENTER_PAD_INDICES = (1, 3, 4, 6)
+
+
+def _mte_cap_zone_quad(mte_result) -> gdstk.Polygon:
+    """14 µm routing cap zone from preserved-MTE metadata (not the full stub)."""
+    draw = mte_result.extension_draw
+    ext = mte_result.extension
+    assert draw is not None and ext is not None
+    inner_a, inner_b, outer_b, outer_a = _extension_corners(ext, draw)
+    return gdstk.Polygon(
+        [inner_a, inner_b, outer_b, outer_a],
+        layer=ext.layer,
+        datatype=ext.datatype,
+    )
 
 
 def _dist_point_to_segment(
@@ -121,7 +135,7 @@ def _min_stadium_gap_outside_bridge(
 
 class TestMbeBodySynthetic(unittest.TestCase):
     def test_cap_is_outer_half_shifted_outward(self):
-        # ``draw_lip_extension`` order: inner_a, inner_b, outer_b, outer_a; depth = 14 µm in +y
+        # ``draw_lip_extension`` order: inner_a, inner_b, outer_b, outer_a; depth = 14 ┬╡m in +y
         mte_ext = gdstk.Polygon([(0, 0), (8, 0), (8, 14), (0, 14)], layer=5, datatype=0)
         cfg = MbeBodyConfig(cap_shift_um=3.5)
         cap = draw_mbe_cap_on_mte_extension(
@@ -316,7 +330,7 @@ class TestMbeBodyKB331(unittest.TestCase):
             self.assertLess(
                 gap,
                 1.0,
-                msg=f"index {index}: filler should reach MBE collar (gap={gap:.3f} µm)",
+                msg=f"index {index}: filler should reach MBE collar (gap={gap:.3f} ┬╡m)",
             )
 
     def test_center_pad_filler_respects_center_pad_keepouts(self):
@@ -522,52 +536,51 @@ class TestMbeBodyKB331(unittest.TestCase):
     def test_cap_overlaps_mte_extension(self):
         for index in COLLAR_EXTEND_INDICES:
             cap = self.all_body[index].cap
-            mte_ext = self.all_mte[index].extension
+            mte = self.all_mte[index]
+            zone = _mte_cap_zone_quad(mte)
             self.assertIsNotNone(cap)
-            self.assertIsNotNone(mte_ext)
-            overlap = gdstk.boolean(cap, mte_ext, "and", precision=1e-3)
+            overlap = gdstk.boolean(cap, zone, "and", precision=1e-3)
             self.assertTrue(overlap, msg=f"index {index}")
             overlap_area = sum(abs(p.area()) for p in overlap)
-            ext_area = abs(mte_ext.area())
+            zone_area = abs(zone.area())
             self.assertGreater(overlap_area, 0.0, msg=f"index {index}")
             self.assertLess(
                 overlap_area,
-                ext_area * 0.45,
-                msg=f"index {index} overlap={overlap_area:.1f} ext={ext_area:.1f}",
+                zone_area * 0.45,
+                msg=f"index {index} overlap={overlap_area:.1f} zone={zone_area:.1f}",
             )
 
     def test_cap_is_outer_half_of_extension(self):
         for index in COLLAR_EXTEND_INDICES:
             cap = self.all_body[index].cap
-            mte_ext = self.all_mte[index].extension
+            zone = _mte_cap_zone_quad(self.all_mte[index])
             self.assertIsNotNone(cap)
-            self.assertIsNotNone(mte_ext)
-            ext_area = abs(mte_ext.area())
+            zone_area = abs(zone.area())
             cap_area = abs(cap.area())
             self.assertAlmostEqual(
                 cap_area,
-                ext_area / 2.0,
-                delta=ext_area * 0.08,
+                zone_area / 2.0,
+                delta=zone_area * 0.08,
                 msg=f"index {index}",
             )
 
     def test_cap_has_outward_lip_beyond_mte(self):
         for index in COLLAR_EXTEND_INDICES:
             cap = self.all_body[index].cap
-            mte_ext = self.all_mte[index].extension
-            draw = self.all_mte[index].extension_draw
+            mte = self.all_mte[index]
+            zone = _mte_cap_zone_quad(mte)
+            draw = mte.extension_draw
             self.assertIsNotNone(cap)
-            self.assertIsNotNone(mte_ext)
             self.assertIsNotNone(draw)
-            _, _, outward = _extension_outer_edge(mte_ext, draw)
+            _, _, outward = _extension_outer_edge(zone, draw)
             ox, oy = outward
             shift = self.body_cfg.cap_shift_um
             cap_pts = [(float(p[0]), float(p[1])) for p in cap.points]
-            mte_pts = [(float(p[0]), float(p[1])) for p in mte_ext.points]
+            zone_pts = [(float(p[0]), float(p[1])) for p in zone.points]
             cap_out = max(p[0] * ox + p[1] * oy for p in cap_pts)
-            mte_out = max(p[0] * ox + p[1] * oy for p in mte_pts)
+            zone_out = max(p[0] * ox + p[1] * oy for p in zone_pts)
             self.assertAlmostEqual(
-                cap_out - mte_out,
+                cap_out - zone_out,
                 shift,
                 delta=0.15,
                 msg=f"index {index}",

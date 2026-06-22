@@ -1,5 +1,5 @@
-"""
-Step 6.3 — MBE ground filler for ``center_pad`` resonators.
+﻿"""
+Step 6.3 ΓÇö MBE ground filler for ``center_pad`` resonators.
 
 Keepouts mirror step 6.2: stadium / MTE offset clearance plus release-hole
 zones. The filler is carved from those keepouts (same as 6.2), then the left
@@ -163,14 +163,14 @@ def build_center_pad_keepouts(
     cfg: MbeBodyCenterPadConfig,
 ) -> list[gdstk.Polygon]:
     """
-    Clearance zones for step 6.3 — same MTE sources as step 6.2 keepouts.
+    Clearance zones for step 6.3 ΓÇö same MTE sources as step 6.2 keepouts.
 
     Use resonator-body MTE and the step-5.1 extension only. Preserved filter
     connectMTE collars are not carved here: they are not written into the RTEG
     cell and must not bite the step-4 top/right/bottom bbox edges.
 
-    Stadium / extension MTE are offset by ``stadium_mte_clearance_um`` (2 µm).
-    Release holes use ``release_hole_clearance_um`` (6 µm). Stadium keepouts
+    Stadium / extension MTE are offset by ``stadium_mte_clearance_um`` (2 ┬╡m).
+    Release holes use ``release_hole_clearance_um`` (6 ┬╡m). Stadium keepouts
     are clipped at the MBE collar mouth so filler can reach the collar.
     """
     clearance_um = cfg.stadium_mte_clearance_um
@@ -324,7 +324,7 @@ def _clip_preserving_connectivity(
     Trim filler to carved+collar metal without splitting a connected ring.
 
     When carve_filler yields disjoint slabs, AND with their union would cut
-    the left-edge ring into separate upper/lower pieces — skip that clip.
+    the left-edge ring into separate upper/lower pieces ΓÇö skip that clip.
     """
     if not allowed_region:
         return merged

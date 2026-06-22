@@ -1,13 +1,13 @@
-"""
-KB331 MTE connection baseline — golden layout contract for step 5.1 + 5.3.
+﻿"""
+KB331 MTE connection baseline ΓÇö golden layout contract for step 5.1 + 5.3.
 
 Every resonator has two preserved MTE roles:
-  - **Stadium** — closed outline polygon (connectMTE stadium shell, ~5191 µm² on series parts).
-  - **Collar** — separate polygon boolean-touching the stadium (extension builds here).
+  - **Stadium** ΓÇö closed outline polygon (connectMTE stadium shell, ~5191 ┬╡m┬▓ on series parts).
+  - **Collar** ΓÇö separate polygon boolean-touching the stadium (extension builds here).
 
 Golden references (KB331):
-  - **Shunt** indices 0/1 — two small connectMTE tabs; extension on tab with body overlap.
-  - **Series** index 6 — stadium [5191] + interface collar [911]; extension on 911 only.
+  - **Shunt** indices 0/1 ΓÇö two small connectMTE tabs; extension on tab with body overlap.
+  - **Series** index 6 ΓÇö stadium [5191] + interface collar [911]; extension on 911 only.
 
 Any change to collection, collar selection, lip tracing, or ``is_connected`` must keep
 these contracts green. Visual KLayout sign-off for index 6 is the authoritative check.
@@ -36,13 +36,13 @@ from rteg_mte_extensions import (
     select_extension_collar,
 )
 
-# KB331 index 6 — approved MTE connection baseline (series / stadium + collar).
+# KB331 index 6 ΓÇö approved MTE connection baseline (series / stadium + collar).
 SERIES_GOLDEN_INDEX = 6
 SERIES_GOLDEN_PRESERVED_AREAS = [911, 5191]
 SERIES_GOLDEN_COLLAR_AREA = 911.0
 SERIES_GOLDEN_MIN_MOUTH_COVERAGE = 0.65
 
-# KB331 indices 0/1 — approved shunt-tab baseline.
+# KB331 indices 0/1 ΓÇö approved shunt-tab baseline.
 SHUNT_GOLDEN_INDICES = (0, 1)
 SHUNT_GOLDEN_MAX_COLLAR_AREA = 700.0
 SHUNT_GOLDEN_MIN_MOUTH_COVERAGE = 0.85
@@ -136,7 +136,7 @@ class TestMtePlacementKB331(unittest.TestCase):
 
     def test_index6_golden_baseline_full_contract(self):
         """
-        Primary MTE validation baseline — resonator 6 (KB331 series).
+        Primary MTE validation baseline ΓÇö resonator 6 (KB331 series).
 
         Collection: stadium [5191] + collar [911], collar touches stadium.
         Extension: on collar only, materially merged, mouth coverage >= 0.65.

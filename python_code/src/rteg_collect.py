@@ -1,13 +1,13 @@
-"""
-Step 5.1 — Collect framed-resonator geometry into typed roles.
+﻿"""
+Step 5.1 ΓÇö Collect framed-resonator geometry into typed roles.
 
 Pulls polygons from a step-4 ``RtegFrameAssembly`` by **layermap name** (no
 hardcoded layer numbers) and splits them into the sets downstream booleans need:
 
-- **ground plates** — GSG pad / arm MBE + the step-4 width filler (not resonator)
-- **preserved metal** — filter interconnect MBE/MTE from the connect cells
-- **release holes** — ``BAW_ReF`` / ``BAW_CAV`` near the resonator
-- **inner frame boundary** — inner cavity rectangle + die-frame MBE ring
+- **ground plates** ΓÇö GSG pad / arm MBE + the step-4 width filler (not resonator)
+- **preserved metal** ΓÇö filter interconnect MBE/MTE from the connect cells
+- **release holes** ΓÇö ``BAW_ReF`` / ``BAW_CAV`` near the resonator
+- **inner frame boundary** ΓÇö inner cavity rectangle + die-frame MBE ring
 
 Reference counts for KB331 resonator **index 05** (shunt):
 
@@ -21,7 +21,7 @@ Reference counts for KB331 resonator **index 05** (shunt):
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 import gdstk
@@ -43,7 +43,7 @@ Bbox = tuple[tuple[float, float], tuple[float, float]]
 
 @dataclass(frozen=True)
 class RtegCollectConfig:
-    """Layer names and margins — resolved through ``LayerMap`` at runtime."""
+    """Layer names and margins ΓÇö resolved through ``LayerMap`` at runtime."""
 
     mbe_layer: str = "BAW_MBE"
     mte_layer: str = "BAW_MTE"
@@ -408,7 +408,7 @@ def _associate_stadium_mte_collars(
     """
     When only a stadium-sized MTE piece is in ``seeds``, add nearby edge tabs.
 
-    Edge collars can sit just outside the resonator bbox window (~31 µm from the
+    Edge collars can sit just outside the resonator bbox window (~31 ┬╡m from the
     stadium in KB331) while still belonging to the same resonator interconnect.
     """
     large = [p for p in seeds if abs(p.area()) >= cfg.stadium_collar_area_um2]
@@ -515,7 +515,7 @@ def preserved_collars_at_shift(
 
     Selects ``{parent}_connectMTE`` / ``{parent}_connectMBE`` polygons that
     overlap the resonator window (in filter coordinates), then offsets them by
-    ``shift`` — the delta from filter placement to the target placement. Shared
+    ``shift`` ΓÇö the delta from filter placement to the target placement. Shared
     by step 3 (PPD-space orientation) and step 5.1 (RTEG-world collection), so
     both see the same collar geometry. Returns ``(mte_polys, mbe_polys)``.
     """
@@ -904,6 +904,72 @@ def collect_geometry_roles(
         resonator_body_mte=collect_resonator_body_mte(res, assembly, layermap, cfg),
         resonator_body_mbe=collect_resonator_body_mbe(res, assembly, layermap, cfg),
     )
+
+
+def attach_preserved_filter_interconnect(
+    assembly: RtegFrameAssembly,
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> PreservedMetal:
+    """
+    Copy filter ``connectMTE`` / ``connectMBE`` metal into the RTEG frame cell.
+
+    Uses the same overlap + collar-association rules as step 5.1
+    ``collect_preserved_metal``, but writes polygons directly onto
+    ``assembly.top_cell`` so step-4 GDS export includes the preserved interconnect.
+    """
+    preserved = collect_preserved_metal(
+        assembly, res, identification, layermap, config
+    )
+    for tp in preserved.mte:
+        assembly.top_cell.add(tp.polygon)
+    for tp in preserved.mbe:
+        assembly.top_cell.add(tp.polygon)
+    return preserved
+
+
+def attach_preserved_filter_interconnect_all(
+    assemblies: Sequence[RtegFrameAssembly],
+    resonators: Sequence[Resonator],
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> dict[int, PreservedMetal]:
+    """Attach preserved filter interconnect for every framed resonator index."""
+    res_by_index = {i: r for i, r in enumerate(resonators)}
+    out: dict[int, PreservedMetal] = {}
+    for assembly in assemblies:
+        res = res_by_index[assembly.index]
+        out[assembly.index] = attach_preserved_filter_interconnect(
+            assembly, res, identification, layermap, config
+        )
+    return out
+
+
+def preserved_interconnect_attach_rows(
+    preserved_by_index: Mapping[int, PreservedMetal],
+    *,
+    inst_names: Mapping[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Summary table for notebook display after attach step."""
+    rows: list[dict[str, object]] = []
+    for idx in sorted(preserved_by_index):
+        preserved = preserved_by_index[idx]
+        mte_areas = [round(abs(tp.polygon.area()), 1) for tp in preserved.mte]
+        mbe_areas = [round(abs(tp.polygon.area()), 1) for tp in preserved.mbe]
+        rows.append(
+            {
+                "index": idx,
+                "inst_name": inst_names.get(idx) if inst_names else None,
+                "n_preserved_mte": len(preserved.mte),
+                "n_preserved_mbe": len(preserved.mbe),
+                "mte_areas_um2": mte_areas,
+                "mbe_areas_um2": mbe_areas,
+            }
+        )
+    return rows
 
 
 def mte_extension_frame_obstacles(

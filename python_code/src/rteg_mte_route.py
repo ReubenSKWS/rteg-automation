@@ -1,10 +1,9 @@
-"""
-Step 5.4 — Stretch 5.3 MTE collar extensions to the center signal pad.
+﻿"""
+Step 5.4 — MTE pad routing for center-pad targets.
 
-When ``mte_route_target == "center_pad"``, move the pad-facing outer cap of the
-5.3 extension to the nearest signal-pad edge corners (with overlap). The collar
-mouth is taken from the 5.3 extension unless that mouth has negligible span
-along the pad edge — then the full collar edge facing the pad is used instead.
+When ``mte_route_target == "center_pad"``, build ``mteConn`` from the signal
+pad top-right / bottom-right corners to the junction where the filter MTE
+extension meets the MTE collar, then boolean-merge route + extension + collar.
 """
 from __future__ import annotations
 
@@ -16,8 +15,25 @@ import gdstk
 
 from layermap import LayerMap
 from rteg_classify import NodeClassification
-from rteg_collect import RtegGeometryRoles
-from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult, _body_centroid, _edge_length, _edge_outward_normal, _edge_points
+from rteg_collect import (
+    RtegGeometryRoles,
+    TaggedPolygon,
+    polys_touch,
+    preserved_mte_overlap_with_body,
+)
+from rteg_mte_extensions import (
+    CollarExtensionDraw,
+    MteBuildConfig,
+    MteExtensionResult,
+    _associated_edge_collars_from_pieces,
+    _body_centroid,
+    _edge_length,
+    _edge_outward_normal,
+    _edge_points,
+    _is_stadium_collar,
+    _skill_pad_vtb_corners,
+    select_extension_collar_from_pieces,
+)
 from rteg_utils import assign_layer, polys_bbox
 
 Point = tuple[float, float]
@@ -35,12 +51,14 @@ class MteRouteConfig:
     min_pad_overlap_um2: float = 0.01
     min_mouth_span_fraction: float = 0.5
     boolean_precision: float = 1e-3
+    boundary_tolerance_um: float = 0.15
     inside_probe_half_um: float = 0.25
+    skill_pad_expand_um: float = 5.0
 
 
 @dataclass(frozen=True)
 class RouteStart:
-    """Attach point on the pad-facing edge of the 5.3 extension."""
+    """Attach point on the pad-facing edge of the preserved MTE interconnect."""
 
     center: Point
     width_um: float
@@ -56,6 +74,15 @@ class PadAttachmentEdge:
     inward_normal: tuple[float, float]
     pad_entry: Point
     span_um: float
+
+
+@dataclass(frozen=True)
+class PreservedMteParts:
+    """Filter MTE collar + extension stub already on the RTEG frame."""
+
+    collar: gdstk.Polygon | None
+    extension: gdstk.Polygon
+    merge_polys: tuple[gdstk.Polygon, ...]
 
 
 @dataclass(frozen=True)
@@ -90,8 +117,8 @@ def pick_route_start(
     """
     Midpoint and width on the extension edge that faces ``toward_point``.
 
-    When the 5.3 lip extrudes away from the route target (outer cap on the far
-    side), use the collar-mouth edge as the pad-facing reference instead.
+    When the preserved interconnect extrudes away from the route target, use the
+    collar-mouth edge as the pad-facing reference instead.
     """
     p0, p1 = extension_draw.outer_edge
     outer_center = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
@@ -186,6 +213,311 @@ def pick_pad_attachment_edge(
 def _outer_vertices(draw: CollarExtensionDraw) -> tuple[Point, Point]:
     """Return ``(outer_b, outer_a)`` matching ``draw_lip_extension`` vertex order."""
     return draw.outer_edge[0], draw.outer_edge[1]
+
+
+def _collar_intercepts(draw: CollarExtensionDraw) -> tuple[Point, Point]:
+    """Legacy SKILL slope intercepts (used by keepout helpers only)."""
+    hi = draw.collar_intercept_a
+    lo = draw.collar_intercept_b
+    if hi == (0.0, 0.0) and lo == (0.0, 0.0):
+        hi, lo = draw.intercept_a, draw.intercept_b
+    if hi[1] < lo[1] or (abs(hi[1] - lo[1]) < 1e-6 and hi[0] < lo[0]):
+        hi, lo = lo, hi
+    return hi, lo
+
+
+def _order_attach_corners(p0: Point, p1: Point) -> tuple[Point, Point]:
+    """Return ``(mte_up, mte_dn)`` with higher Y first; tie-break on X."""
+    if p0[1] > p1[1] + 1e-9:
+        return p0, p1
+    if p1[1] > p0[1] + 1e-9:
+        return p1, p0
+    if p0[0] >= p1[0]:
+        return p0, p1
+    return p1, p0
+
+
+def _point_on_polygon_boundary(
+    point: Point,
+    poly: gdstk.Polygon,
+    tol_um: float,
+) -> bool:
+    pts = [(float(p[0]), float(p[1])) for p in poly.points]
+    n = len(pts)
+    px, py = point
+    for i in range(n):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
+        dx, dy = x1 - x0, y1 - y0
+        length_sq = dx * dx + dy * dy
+        if length_sq < 1e-18:
+            if math.hypot(px - x0, py - y0) <= tol_um:
+                return True
+            continue
+        t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / length_sq))
+        qx, qy = x0 + t * dx, y0 + t * dy
+        if math.hypot(px - qx, py - qy) <= tol_um:
+            return True
+    return False
+
+
+def _dedupe_points(points: Sequence[Point], tol_um: float) -> list[Point]:
+    unique: list[Point] = []
+    for pt in points:
+        if not any(math.hypot(pt[0] - q[0], pt[1] - q[1]) <= tol_um for q in unique):
+            unique.append(pt)
+    return unique
+
+
+def _farthest_pair(points: Sequence[Point]) -> tuple[Point, Point]:
+    if len(points) < 2:
+        raise ValueError("need at least two points for junction corners")
+    best_a, best_b = points[0], points[1]
+    best_len = _dist(best_a, best_b)
+    for i, a in enumerate(points):
+        for b in points[i + 1 :]:
+            length = _dist(a, b)
+            if length > best_len:
+                best_len = length
+                best_a, best_b = a, b
+    return best_a, best_b
+
+
+def identify_preserved_mte_parts(
+    preserved_mte_polys: Sequence[gdstk.Polygon],
+    body_mte_polys: Sequence[gdstk.Polygon],
+    *,
+    mte_build_cfg: MteBuildConfig | None = None,
+    boolean_precision: float = 1e-3,
+) -> PreservedMteParts:
+    """
+    Split frame MTE into the resonator-mouth collar and the interconnect extension.
+
+    The extension is the stub selected by step 5.3. The collar is the stadium
+    shell it touches when present, otherwise ``None`` (junction falls back to
+    resonator-body overlap on the extension).
+    """
+    cfg = mte_build_cfg or MteBuildConfig()
+    if not preserved_mte_polys:
+        raise ValueError("no preserved MTE polygons on frame")
+
+    tagged = [
+        TaggedPolygon(f"preserved_mte[{i}]", cfg.mte_layer, poly)
+        for i, poly in enumerate(preserved_mte_polys)
+    ]
+    ext_tp = select_extension_collar_from_pieces(
+        tagged,
+        body_mte_polys,
+        preserved_mte_overlap_with_body,
+        cfg,
+    )
+    if ext_tp is None:
+        raise ValueError("no preserved MTE extension on frame")
+    extension = ext_tp.polygon
+
+    stadiums = [tp for tp in tagged if _is_stadium_collar(tp.polygon, cfg)]
+    associated = _associated_edge_collars_from_pieces(tagged, cfg)
+    collar_poly: gdstk.Polygon | None = None
+
+    if associated:
+        extension = associated[0].polygon
+        for stadium in stadiums:
+            if polys_touch(
+                stadium.polygon,
+                extension,
+                precision=boolean_precision,
+                min_overlap_um2=0.01,
+            ):
+                collar_poly = stadium.polygon
+                break
+
+    if collar_poly is None and stadiums:
+        for stadium in stadiums:
+            for tp in tagged:
+                if _polygon_key(tp.polygon) == _polygon_key(stadium.polygon):
+                    continue
+                if polys_touch(
+                    tp.polygon,
+                    stadium.polygon,
+                    precision=boolean_precision,
+                    min_overlap_um2=0.01,
+                ):
+                    collar_poly = stadium.polygon
+                    extension = tp.polygon
+                    break
+            if collar_poly is not None:
+                break
+
+    if collar_poly is None and stadiums:
+        collar_poly = min(stadiums, key=lambda tp: abs(tp.polygon.area())).polygon
+
+    return PreservedMteParts(
+        collar=collar_poly,
+        extension=extension,
+        merge_polys=tuple(preserved_mte_polys),
+    )
+
+
+def _polygon_key(poly: gdstk.Polygon) -> tuple[float, float, float, float, float]:
+    bb = poly.bounding_box()
+    if bb is None:
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+    (x0, y0), (x1, y1) = bb
+    return (round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3), round(abs(poly.area()), 3))
+
+
+def _junction_on_shared_boundary(
+    extension: gdstk.Polygon,
+    collar: gdstk.Polygon,
+    *,
+    tol_um: float,
+    boolean_precision: float,
+) -> tuple[Point, Point] | None:
+    """Corners where the extension polygon meets the MTE collar polygon."""
+    ext_pts = [(float(p[0]), float(p[1])) for p in extension.points]
+    candidates: list[Point] = []
+    for vertex in ext_pts:
+        if _point_on_polygon_boundary(vertex, collar, tol_um):
+            candidates.append(vertex)
+
+    n = len(ext_pts)
+    for i in range(n):
+        p0, p1 = ext_pts[i], ext_pts[(i + 1) % n]
+        if _point_on_polygon_boundary(p0, collar, tol_um) and _point_on_polygon_boundary(
+            p1, collar, tol_um
+        ):
+            candidates.extend([p0, p1])
+
+    unique = _dedupe_points(candidates, tol_um)
+    if len(unique) >= 2:
+        return _farthest_pair(unique)
+
+    inter = gdstk.boolean(extension, collar, "and", precision=boolean_precision)
+    if inter:
+        overlap = max(inter, key=lambda p: abs(p.area()))
+        on_overlap = [
+            v for v in ext_pts if _point_on_polygon_boundary(v, overlap, tol_um)
+        ]
+        unique = _dedupe_points(on_overlap, tol_um)
+        if len(unique) >= 2:
+            return _farthest_pair(unique)
+    return None
+
+
+def _junction_on_body_overlap(
+    extension: gdstk.Polygon,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    *,
+    tol_um: float,
+    boolean_precision: float,
+) -> tuple[Point, Point] | None:
+    """Fallback junction: extension vertices on the resonator-body MTE overlap."""
+    inter_pieces: list[gdstk.Polygon] = []
+    for body in body_mte_polys:
+        inter = gdstk.boolean(extension, body, "and", precision=boolean_precision)
+        if inter:
+            inter_pieces.extend(inter)
+    if not inter_pieces:
+        return None
+
+    overlap = max(inter_pieces, key=lambda p: abs(p.area()))
+    ext_pts = [(float(p[0]), float(p[1])) for p in extension.points]
+    on_overlap = [
+        v for v in ext_pts if _point_on_polygon_boundary(v, overlap, tol_um)
+    ]
+    unique = _dedupe_points(on_overlap, tol_um)
+    if len(unique) >= 2:
+        return _farthest_pair(unique)
+    return None
+
+
+def collar_extension_junction_corners(
+    parts: PreservedMteParts,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: MteRouteConfig | None = None,
+) -> tuple[Point, Point]:
+    """Two corners where the filter MTE extension meets the MTE collar."""
+    c = cfg or MteRouteConfig()
+    if parts.collar is not None:
+        shared = _junction_on_shared_boundary(
+            parts.extension,
+            parts.collar,
+            tol_um=c.boundary_tolerance_um,
+            boolean_precision=c.boolean_precision,
+        )
+        if shared is not None:
+            return _order_attach_corners(*shared)
+
+    body = _junction_on_body_overlap(
+        parts.extension,
+        body_mte_polys,
+        tol_um=c.boundary_tolerance_um,
+        boolean_precision=c.boolean_precision,
+    )
+    if body is not None:
+        return _order_attach_corners(*body)
+
+    raise ValueError("could not find MTE collar-extension junction corners")
+
+
+def preserved_extension_attach_corners(
+    parts: PreservedMteParts,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    cfg: MteRouteConfig | None = None,
+) -> tuple[Point, Point]:
+    """Junction corners between preserved filter MTE extension and collar."""
+    return collar_extension_junction_corners(parts, body_mte_polys, cfg)
+
+
+def merge_mte_route_with_extensions(
+    route: gdstk.Polygon,
+    extension_polys: Sequence[gdstk.Polygon],
+    *,
+    boolean_precision: float,
+) -> gdstk.Polygon:
+    """Boolean-OR the pad-route quad with all preserved filter MTE pieces."""
+    if not extension_polys:
+        return route
+    pieces = [route, *extension_polys]
+    merged = gdstk.boolean(pieces, [], "or", precision=boolean_precision)
+    if not merged:
+        return route
+    if len(merged) == 1:
+        return merged[0]
+    return max(merged, key=lambda p: abs(p.area()))
+
+
+def _skill_mte_conn_vertices(
+    signal_polys: Sequence[gdstk.Polygon],
+    cfg: MteRouteConfig,
+    parts: PreservedMteParts,
+    body_mte_polys: Sequence[gdstk.Polygon],
+) -> tuple[list[Point], PadAttachmentEdge]:
+    """
+    ``mteConn`` quad: ``[vtbdn, vtbup, mteupFinal, mtednFinal]``.
+
+    Pad corners are the signal-pad bbox top-right / bottom-right. Collar-side
+    corners are the junction where the filter MTE extension meets the collar.
+    """
+    vtb_up, vtb_dn = _skill_pad_vtb_corners(signal_polys, expand_um=0.0)
+    overlap = cfg.pad_touch_overlap_um
+    vtb_up = (vtb_up[0] - overlap, vtb_up[1])
+    vtb_dn = (vtb_dn[0] - overlap, vtb_dn[1])
+
+    mte_up, mte_dn = preserved_extension_attach_corners(parts, body_mte_polys, cfg)
+
+    pad_entry = (
+        (vtb_dn[0] + vtb_up[0]) / 2.0,
+        (vtb_dn[1] + vtb_up[1]) / 2.0,
+    )
+    attachment = PadAttachmentEdge(
+        corner_low=vtb_dn,
+        corner_high=vtb_up,
+        inward_normal=(-1.0, 0.0),
+        pad_entry=pad_entry,
+        span_um=_dist(vtb_dn, vtb_up),
+    )
+    return [vtb_dn, vtb_up, mte_up, mte_dn], attachment
 
 
 def _mouth_span_along_pad_edge(
@@ -301,47 +633,23 @@ def stretch_extension_to_pad(
     from_point: Point | None = None,
     collar: gdstk.Polygon | None = None,
     body_mte_polys: Sequence[gdstk.Polygon] | None = None,
+    preserved: gdstk.Polygon | None = None,
+    parts: PreservedMteParts | None = None,
 ) -> tuple[gdstk.Polygon, PadAttachmentEdge]:
     """
-    Morph the 5.3 extension: collar mouth on the pad-facing side, outer cap on pad.
+    Build ``mteConn`` quad from pad corners to the collar-extension junction.
 
-    Returns the stretched polygon and pad attachment metadata.
+    Returns the route trapezoid and pad attachment metadata.
     """
-    outer_b, outer_a = _outer_vertices(draw)
-
-    ref = from_point
-    if ref is None:
-        ref = (
-            (outer_a[0] + outer_b[0]) / 2.0,
-            (outer_a[1] + outer_b[1]) / 2.0,
-        )
-
-    inner_a, inner_b = _resolve_stretch_inner_mouth(
-        draw,
-        signal_polys,
-        cfg,
-        collar=collar,
-        body_mte_polys=body_mte_polys,
-        from_point=ref,
+    _ = draw, from_point, collar
+    if parts is None:
+        raise ValueError("preserved MTE parts are required for pad routing")
+    if body_mte_polys is None:
+        raise ValueError("body_mte_polys required for collar-extension junction")
+    vertices, attachment = _skill_mte_conn_vertices(
+        signal_polys, cfg, parts, body_mte_polys
     )
-
-    attachment = pick_pad_attachment_edge(
-        signal_polys, ref, touch_overlap_um=cfg.pad_touch_overlap_um
-    )
-
-    pad_low = attachment.corner_low
-    pad_high = attachment.corner_high
-
-    if outer_b[1] <= outer_a[1]:
-        outer_b_new, outer_a_new = pad_low, pad_high
-    else:
-        outer_b_new, outer_a_new = pad_high, pad_low
-
-    stretched = gdstk.Polygon(
-        [inner_a, inner_b, outer_b_new, outer_a_new],
-        layer=layer,
-        datatype=datatype,
-    )
+    stretched = gdstk.Polygon(vertices, layer=layer, datatype=datatype)
     return stretched, attachment
 
 
@@ -368,7 +676,7 @@ def validate_pad_attachment(
     if overlap < cfg.min_pad_overlap_um2:
         raise ValueError(
             f"{prefix}MTE routed net not attached to signal pad "
-            f"(overlap {overlap:.4f} um² < {cfg.min_pad_overlap_um2:.4f} um²)"
+            f"(overlap {overlap:.4f} um┬▓ < {cfg.min_pad_overlap_um2:.4f} um┬▓)"
         )
     return overlap
 
@@ -387,7 +695,7 @@ def build_mte_pad_route(
     c = cfg or MteRouteConfig()
     if classification.mte_route_target != "center_pad":
         return None
-    if mte_result.extension is None or mte_result.extension_draw is None:
+    if mte_result.extension_draw is None:
         return None
 
     signal_tps = classification.signal_polygons()
@@ -403,7 +711,14 @@ def build_mte_pad_route(
     start_info = pick_route_start(draw, toward_point=pad_ref)
 
     collar_poly = mte_result.collar.polygon if mte_result.collar is not None else None
-    stretched, attachment = stretch_extension_to_pad(
+    parts = identify_preserved_mte_parts(
+        mte_result.preserved_collar_polygons,
+        roles.resonator_body_mte,
+        boolean_precision=c.boolean_precision,
+    )
+    merge_polys = list(parts.merge_polys)
+
+    route_quad, attachment = stretch_extension_to_pad(
         draw,
         signal_polys,
         c,
@@ -412,16 +727,24 @@ def build_mte_pad_route(
         from_point=start_info.center,
         collar=collar_poly,
         body_mte_polys=roles.resonator_body_mte,
+        preserved=parts.extension,
+        parts=parts,
     )
-    stretched = assign_layer(stretched, layermap, c.mte_layer)
+    route_quad = assign_layer(route_quad, layermap, c.mte_layer)
+    merged = merge_mte_route_with_extensions(
+        route_quad,
+        merge_polys,
+        boolean_precision=c.boolean_precision,
+    )
+    stretched = assign_layer(merged, layermap, c.mte_layer)
     overlap = validate_pad_attachment(
-        stretched,
+        route_quad,
         signal_polys,
         c,
         resonator_index=resonator_index,
     )
     return MteRouteDraw(
-        route_polygon=stretched,
+        route_polygon=route_quad,
         routed_net_polygon=stretched,
         waypoints=[attachment.corner_low, attachment.corner_high],
         pad_entry=attachment.pad_entry,
@@ -441,6 +764,7 @@ def apply_mte_pad_route(
         mte_result,
         route_draw=route_draw,
         routed_net=route_draw.routed_net_polygon,
+        n_extensions=1,
     )
 
 
@@ -499,14 +823,19 @@ __all__ = [
     "MteRouteConfig",
     "MteRouteDraw",
     "PadAttachmentEdge",
+    "PreservedMteParts",
     "RouteStart",
     "apply_mte_pad_route",
     "build_mte_pad_route",
     "build_mte_pad_routes",
+    "collar_extension_junction_corners",
     "collar_mouth_facing_pad",
+    "identify_preserved_mte_parts",
+    "merge_mte_route_with_extensions",
     "mte_route_overview_rows",
     "pick_pad_attachment_edge",
     "pick_route_start",
+    "preserved_extension_attach_corners",
     "stretch_extension_to_pad",
     "validate_pad_attachment",
 ]

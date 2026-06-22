@@ -1,5 +1,5 @@
-"""
-Step 6.1 — MBE pad-to-collar connection for ``collar_extend`` resonators.
+﻿"""
+Step 6.1 ΓÇö MBE pad-to-collar connection for ``collar_extend`` resonators.
 
 Four-sided connector: pad right edge on the left, straight lines from the top
 and bottom pad corners to collar bends on the pad-facing side, and a straight

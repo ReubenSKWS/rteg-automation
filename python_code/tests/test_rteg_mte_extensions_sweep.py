@@ -1,4 +1,4 @@
-"""KB331 sweep — MTE extensions attach to edge collars without interior fill."""
+﻿"""KB331 sweep ΓÇö MTE extensions attach to edge collars without interior fill."""
 from __future__ import annotations
 
 import sys
@@ -123,7 +123,10 @@ class TestMteExtensionsSweep(unittest.TestCase):
                         ),
                         msg=f"index {index}: merge inset {corner} not inside collar",
                     )
-            lip = find_outward_lip_ab(collar.polygon, roles.resonator_body_mte, self.cfg)
+            signal = [tp.polygon for tp in roles.ground_plates.center]
+            lip = find_outward_lip_ab(
+                collar.polygon, roles.resonator_body_mte, self.cfg, signal_polys=signal
+            )
             body_centroid = _body_centroid(roles.resonator_body_mte)
             mouth_mid = (
                 (lip.point_a[0] + lip.point_b[0]) / 2.0,

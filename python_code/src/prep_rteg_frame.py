@@ -1,9 +1,9 @@
-"""
-Step 4 — Setting up: place each PPD+resonator assembly in the die frame.
+﻿"""
+Step 4 ΓÇö Setting up: place each PPD+resonator assembly in the die frame.
 
 Accepts in-memory ``ResonatorPpdAssembly`` objects from step 3
 (``prep_resonator_ppd``). Margins are measured from the inner die frame (MBE
-ring cavity), not the outer 460×580 bbox. An MBE filler rectangle on the right
+ring cavity), not the outer 460├ù580 bbox. An MBE filler rectangle on the right
 normalizes RTEG width.
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ def inner_die_frame_bbox(
     """
     Inner cavity of the die frame MBE ring (inside the inner blue border).
 
-    Parsed from the largest MBE polygon in the frame cell — a rectangular ring
+    Parsed from the largest MBE polygon in the frame cell ΓÇö a rectangular ring
     with outer/inner x and y coordinates.
     """
     ring_candidates = [

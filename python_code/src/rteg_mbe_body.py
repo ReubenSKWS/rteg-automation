@@ -1,5 +1,5 @@
-"""
-Step 6.2 — MBE ground body for ``collar_extend`` resonators.
+﻿"""
+Step 6.2 ΓÇö MBE ground body for ``collar_extend`` resonators.
 
 MBE cap on 5.3 MTE extension + carved filler bridge. 
 
@@ -112,10 +112,7 @@ def _extension_corners(
     mte_ext: gdstk.Polygon,
     extension_draw: CollarExtensionDraw | None,
 ) -> tuple[Point, Point, Point, Point]:
-    """Return ``(inner_a, inner_b, outer_b, outer_a)`` from the MTE extension polygon."""
-    pts = [(float(p[0]), float(p[1])) for p in mte_ext.points]
-    if len(pts) >= 4:
-        return pts[0], pts[1], pts[2], pts[3]
+    """Return ``(inner_a, inner_b, outer_b, outer_a)`` for MTE routing metadata."""
     if extension_draw is not None:
         return (
             extension_draw.intercept_a,
@@ -123,6 +120,9 @@ def _extension_corners(
             extension_draw.outer_edge[0],
             extension_draw.outer_edge[1],
         )
+    pts = [(float(p[0]), float(p[1])) for p in mte_ext.points]
+    if len(pts) >= 4:
+        return pts[0], pts[1], pts[2], pts[3]
     raise ValueError("MTE extension polygon has fewer than 4 vertices")
 
 
@@ -639,8 +639,8 @@ def build_mbe_body_collar_extend(
         return _empty_mbe_body_result(violations=["missing step-4 MBE width filler"])
 
     mte_ext = mte_result.extension
-    if mte_ext is None:
-        return _empty_mbe_body_result(violations=["missing 5.3 MTE collar extension"])
+    if mte_ext is None or mte_result.extension_draw is None:
+        return _empty_mbe_body_result(violations=["missing preserved MTE interconnect"])
 
     violations: list[str] = []
     cap = draw_mbe_cap_on_mte_extension(

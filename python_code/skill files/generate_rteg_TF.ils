@@ -1,0 +1,249 @@
+/*
+	Generate RTEG from a template
+
+	Taylor Fernald
+	taylor.fernald@skyworksinc.com
+	
+	Generates an RTEG frame from a single template. The idea is to get it ready for resonator fitting.
+	/home/fernaldt/skill_code/generate_rteg.ils
+
+    RUN FROM FTEG_Frame
+	
+    Eventually this needs to connect up to the script at:
+    /rds/devel/R/AMS/amslibs/oa614/cdslibs/baw26/PDK/v0.29/src/skill/cds/rdsBawTEGAutoFromTemp.il
+    Vim setup: put cursor on above line and then type :vs<enter><ctrl-w>w
+
+    To do this, it could create a form and send it to the rdsBawTEGAutoFromTempCB fx.
+    As far as I can tell, it directly uses the following:
+    
+    * cells = form->runList->choices 
+    * lN = form->lName->value
+
+    runList->choices: cells of the library from the open cell. 
+    lName->calue: chosen library name 
+*/
+
+/* 	
+	SECTIONS (Highlight the name to find the section)
+	PARAMETERS				
+	DIRTY					
+	GET FRAME READY			
+	FRAME CALCULATIONS		
+	COPY TEMPLATE			
+	MBE RECTANGLE			
+	DELETE OTHER SHAPES		
+	CLOSE FILES				
+*/																													; <- 30 Tab line
+
+( defun generate_rteg_TF ( @aux wcv current_lib lib_names isTrue lName templateLibrary cName fields shownGUIform rl lN form )
+	GUIform = nil ; The form
+	; Create the fields, then create the app form at the end.
+	wcv = geGetWindowCellView(  )
+	( unless wcv ( error "Please open a FTEG template cell view." ) )
+	current_lib = wcv~>libName
+	current_cell = parseString( current_lib "_" )
+	current_cell = buildString( list(( nth 0 current_cell ) ( nth 1 current_cell ) "RTEG1_template") "_" )
+	libNames = ( sort ddGetLibList()~>name nil ) ; get def here too.
+	verbosep = hiCreateBooleanButton( ?name  'verbosep
+                               	?buttonText "Verbose (Debug Mode)"
+                               	?value  nil
+                               )	
+	
+	
+    is_vertical = hiCreateBooleanButton(
+                                    ?name       'is_vertical
+                                    ?buttonText "Vertical Template"
+                                    ?value      t
+    )
+	 lName = hiCreateCyclicField(  		
+	 								?name           'lName
+		             			    ?prompt    	"Library:"
+		             			    ?choices   	libNames
+		             			   	?value     	current_lib                
+				                   	?callback	()      
+                               ) 
+   	cName = hiCreateStringField(
+   									?name	'cName
+   									?prompt	"New Cell Name:"
+   									?value current_cell	; Should be KBXXX_X
+   									?defValue "NEWCELL" ; if value is invalid
+   									?editable t
+   								)           
+	fields = list(
+                      				list(verbosep  	20:10 	600:30 	200 )   
+                                    list(is_vertical    20:40   600:30 200)
+                      				list(lName  		20:70 	700:30 	80 )
+                      				list(cName		20:100	600:30	200)
+                     		)
+
+	GUIform = hiCreateAppForm( 
+									?name 'GUIform
+                               		?formTitle "GenerateRTEGFrame"
+                               		?fields fields 
+                               		?initialSize t
+                               		?callback "bawCreateRtegFn(hiGetCurrentForm())"
+                               		?buttonLayout 'OKCancelApply
+                            )        
+    shownGUIform = hiDisplayForm('GUIform)
+)
+
+( defun bawCreateRtegFn ( GUIform @aux 
+		verbosep t_libName t_cellName t_frameName libNames template_library get_instances_by_name width_matrix is_vertical get_setting mbe_margin_x 
+		mbe_margin_y mbe_top_shift port_offset mbe_offset frame_cellView t_cellName new_cellView tech split_tech 
+		die_mode wb_minus_two frame_width frontside_pads frame_connectors frame frame_bBox frame_top frame_bottom 
+		frame_left frame_right frame_delta_x frame_delta_y frame_vertical_center frame_horizontal_center 
+		port_vertical_position port_horizontal_position rteg_template_cellView orientation position 
+		rteg_instance mbe_list mbe mbe_top mbe_dimensions createRect lT lF h y
+	)
+    is_vertical = GUIform->is_vertical->value
+	verbosep = GUIform->verbosep->value
+    ; look for baw_dev library
+	t_libName = GUIform->lName->value
+	t_cellName = GUIform->cName->value
+	t_frameName = parseString( t_cellName "_" )
+	t_frameName = buildString( list(( nth 0 t_frameName ) ( nth 1 t_frameName ) "FTEG_Frame") "_" )
+	libNames = ( sort ddGetLibList()~>name nil ) ; get def here too.
+    template_library = ( if ( lindex libNames "bawpdk4_dev" ) "bawpdk4_dev" "baw26_dev" )
+	get_instances_by_name = ( lambda ( key_name ) 
+		( setof instance new_cellView~>instances instance~>cellName==key_name ) 
+	)
+	; take it apart and build a frame name a la "KB281_N_Frame"
+	; PARAMETERS
+	width_matrix = ( list 48.5:60.5 48.5:53.5 48.5:48.5 )
+	mbe_top_shift = 2.7
+	port_offset = 47.5 	    ; Distance from the arrow to the upper bounding box on the port.
+	mbe_offset = 726.3	    ; Distance from the upper port to the mbe rectangle.
+		
+	; DIRTY
+	; This cell name needs to change based on the cell prefix
+	frame_cellView = ( dbOpenCellViewByType t_libName t_frameName "layout" "" "r" )								; Grabs the Frame template
+	( unless frame_cellView ( error "frame cellView is null." ) )
+	new_cellView = ( dbCopyCellView frame_cellView t_libName t_cellName "layout" nil nil t )						; Makes a new cellview that has the frame in it.
+	( unless new_cellView ( error "new_cellView is null. Does it the path already exist?" ) )
+
+	tech = ( getShellEnvVar "RDS_CDS_VERIFY_TECH" ) 																; The frame width depends on the technology.
+	split_tech = ( parseString tech "_" )																			; It can be either 48.5, 60.5 or 53.5 microns.
+	die_mode = ( if ( nth 1 split_tech ) == "DSSD" 0 1 )
+	wb_minus_two = ( atoi ( car ( parseString ( nth 0 split_tech ) "WB" ) ) ) - 2
+	frame_width = ( nth die_mode ( nth wb_minus_two width_matrix ) )
+				
+	; GET FRAME READY	
+	frontside_pads = get_instances_by_name( "pad3" )																; Delete frontside_pads.
+	( printf "Found %d frontside pads to delete\n" ( length frontside_pads ) )
+	( foreach pad frontside_pads ( dbDeleteObject pad ) )
+	; 9/24/2025 Delete all pzlb3 instances
+	; Candidate for a helper function \/
+	frame_connectors = ( get_instances_by_name "pzlb3" )
+	( printf "Found %d pzlb3 to delete\n" ( length frame_connectors ) )
+	( foreach inst frame_connectors ( dbDeleteObject inst ) )
+		
+	frame = ( car ( get_instances_by_name "frame3" ) )																; Set frame.TEG
+	( dbReplaceProp frame "TEG" "boolean" t )
+	
+	; FRAME CALCULATIONS
+	frame_bBox = frame~>bBox																						; Using the frame width, get some helpful information.
+	frame_top = ( yCoord ( yCoord frame_bBox ) ) 
+	frame_bottom = ( yCoord ( xCoord frame_bBox ) ) 
+	frame_left = ( xCoord ( xCoord frame_bBox ) ) 
+	frame_right = ( xCoord ( yCoord frame_bBox ) )	
+	frame_vertical_center = ( frame_right - frame_left ) / 2.0
+	frame_horizontal_center = ( frame_top - frame_bottom ) / 2.0
+    get_setting = ( lambda ( i @aux settings )   ; Gets the setting depending on verticalness.
+        settings = ( list
+                  ; Rot MBERect Port MBEbB MTEbB
+            ( list "R0" ( list 0 -272.8 381 250 ) ( list frame_vertical_center frame_top-frame_width-port_offset-1 ) 
+            		( list 0 -52.75 81 24.5) ( list 0 -59 81 12 ) ) ; Vertical
+            ( list "R90" ( list 225.3 0 155 381 ) ( list frame_left+frame_width+port_offset+1 frame_horizontal_center ) 
+            		( list 52.75 0 24.5 81 ) ( list 59 0 12 81 ) ) ; Horizontal
+        )
+       ( nth i ( if is_vertical ( nth 0 settings ) ( nth 1 settings ) ) )
+    )
+    createRect = ( lambda ( layer_name x y w h @aux half_width half_height )
+       ; create a rect from a center coordinate and a width & height.
+       ( print ( list x y w h ) )
+       half_width = w/2.0 
+       half_height = h/2.0
+       ( dbCreateRect new_cellView layer_name ( list ( x-half_width ):( y-half_height ) ( x+half_width ):( y+half_height ) ) )
+    )
+
+	; COPY TEMPLATE																									; Prefer vertical orientation
+	rteg_template_cellView = ( dbOpenCellViewByType template_library "RTEG_template" "layout" "" "r" )					; Copy over the RTEG template
+	orientation = ( get_setting 0 )
+	position = ( get_setting 2 )
+	rteg_instance = ( dbCreateInst new_cellView rteg_template_cellView "_RTEG1_template" position orientation )
+	; Flatten the RTEG and the KBXXX_N_01_Frame cell
+	; 9/25/2025 There is a rect that is not surviving being flattened. (Solution found)
+	leFlattenInst( rteg_instance 1 t )
+	
+	; Stretch the mbe/mte rectangle so it lines up.
+	
+	; MBE RECTANGLE
+    ; Delete the MTE Rect
+	( foreach rect ( setof shape new_cellView~>shapes shape~>layerName=="BAW_MTE" ) 
+		( dbDeleteObject rect ) 
+	)
+    ; Delete the MBE Rects (I'll recreate one of them correctly later)
+	( foreach shape ( setof shape new_cellView~>shapes shape~>layerName=="BAW_MBE" ) ( dbDeleteObject shape ) )	
+
+    mbe_dimensions = ( get_setting 1 )
+    ; TODO: Find out how to snap to position. Probably change the mbe_dimentions to account for bottom / right of the frame.
+    ; Here change to account for stretching.
+    ; Do this for vertical first, then add a conditional for horizontal.
+    ( if is_vertical
+        {
+        lT = ( nth 1 ( get_setting 1 ) ) + ( ( nth 3 ( get_setting 1 ) ) / 2.0 )
+        lF = frame_bottom + frame_width + 8
+        h = ( yCoord position ) + lT - lF
+        y = lT - ( h/2.0 )
+        mbe_dimensions = ( list ( nth 0 mbe_dimensions ) y ( nth 2 mbe_dimensions ) h )
+        }
+        {
+        lT = ( nth 0 ( get_setting 1 ) ) - ( ( nth 2 ( get_setting 1 ) ) / 2.0 )
+        lF = frame_right - frame_width - 8
+        h = lF - lT - ( xCoord position )
+        y = lT + ( h/2.0 )
+        mbe_dimensions = ( list y ( nth 1 mbe_dimensions ) h ( nth 3 mbe_dimensions ) )
+        }
+    )
+    mbe = ( createRect "BAW_MBE" ( xCoord position )+( nth 0 mbe_dimensions ) ( yCoord position )+( nth 1 mbe_dimensions ) ( nth 2 mbe_dimensions ) ( nth 3 mbe_dimensions ) )
+	; DELETE OTHER SHAPES
+    ; Delete the text on the bottom left.
+
+    ( foreach instance new_cellView~>instances
+        (when instance~>cellName == "swks_logo" ( dbDeleteObject instance ) )
+        (when instance~>cellName == "ppd_1port" 
+            instance~>probeDir = nil
+            (when techGetTechLibName(new_cellView)=="bawpdk4"
+                ( dbReplaceProp instance "noM2" "boolean" t )
+            )
+        ) 
+         
+    )
+    
+    ; Get rid of all labels, specifically on TXTMB2.
+    ; They are not instances, but stored in ~>lpps.
+    (foreach shape new_cellView~>shapes
+        if( (shape~>objType=="label" && shape~>layerName == "BAW_TXTMB2")
+            (dbDeleteObject shape)
+        ) 
+    )
+
+
+    ( foreach shape new_cellView~>shapes
+        ( if ( lindex ( list "BAW_SV" "BAW_H2" "BAW_H3" ) shape~>layerName ) ( dbDeleteObject shape ) )
+    )
+	
+	; There are some shapes that aren't surviving the flattening step. Create them here.
+    ; Relative to the port position.
+	( createRect "BAW_MBE" xCoord(position)+( nth 0 ( get_setting 3 ) ) yCoord(position)+( nth 1 ( get_setting 3 ) ) ( nth 2 ( get_setting 3 ) ) ( nth 3 ( get_setting 3 ) ) )
+	( createRect "BAW_MTE" xCoord(position)+( nth 0 ( get_setting 4 ) ) yCoord(position)+( nth 1 ( get_setting 4 ) ) ( nth 2 ( get_setting 4 ) ) ( nth 3 ( get_setting 4 ) ) )
+    ; Save the new cellView so it can be opened.
+    ( dbSave new_cellView )
+	
+	; CLOSE FILES
+	; Close all cellViews used.
+	( dbClose frame_cellView )
+	( dbClose rteg_template_cellView )
+    ( dbClose new_cellView )
+	( printf "Generated an RTEG template.\n" )
+)

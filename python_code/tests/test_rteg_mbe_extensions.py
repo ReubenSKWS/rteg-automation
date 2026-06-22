@@ -1,4 +1,4 @@
-"""Step 6.1 — MBE pad-to-collar connection."""
+﻿"""Step 6.1 ΓÇö MBE pad-to-collar connection."""
 from __future__ import annotations
 
 import math
@@ -113,7 +113,7 @@ class TestMbeConnectionSynthetic(unittest.TestCase):
         )
 
     def test_rectangle_collar_fallback_hits(self):
-        """No fillet clusters — fallback ray picks pad-facing rectangle corners."""
+        """No fillet clusters ΓÇö fallback ray picks pad-facing rectangle corners."""
         collar = gdstk.rectangle(
             (40.0, 45.0), (55.0, 55.0), layer=self.layer, datatype=self.datatype
         )
@@ -132,7 +132,7 @@ class TestMbeConnectionSynthetic(unittest.TestCase):
         _assert_connection_draw(self, draw)
 
     def test_filleted_collar_cluster_stretch_hits(self):
-        """Fillet vertex cluster — Y-sweep stretch reaches the inner mouth corner."""
+        """Fillet vertex cluster ΓÇö Y-sweep stretch reaches the inner mouth corner."""
         collar_pts = [
             (90.0, 320.0),
             (90.0, 255.0),

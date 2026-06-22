@@ -1,4 +1,4 @@
-"""Geometry checks for preserved-collar MTE extension drawing."""
+﻿"""Geometry checks for preserved-collar MTE extension drawing."""
 from __future__ import annotations
 
 import math
@@ -22,6 +22,25 @@ from rteg_mte_extensions import (
     draw_collar_extension,
     find_outward_lip_ab,
 )
+
+
+def _signal_pad_west_of_collar(collar: gdstk.Polygon) -> list[gdstk.Polygon]:
+    """Synthetic center signal pad left of the collar (for unit tests)."""
+    bb = collar.bounding_box()
+    if bb is None:
+        raise ValueError("collar has no bbox")
+    (xmin, ymin), (xmax, ymax) = bb
+    _ = xmax
+    pad_right = xmin - 5.0
+    pad_left = pad_right - 40.0
+    return [
+        gdstk.rectangle(
+            (pad_left, ymin),
+            (pad_right, ymax),
+            layer=collar.layer,
+            datatype=collar.datatype,
+        )
+    ]
 
 
 def _body_below_collar(collar: gdstk.Polygon) -> list[gdstk.Polygon]:
@@ -66,12 +85,10 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             datatype=0,
         )
         body = _body_below_collar(collar)
-        lip = find_outward_lip_ab(collar, body)
-        self.assertAlmostEqual(lip.point_a[0], 20.0)
-        self.assertAlmostEqual(lip.point_a[1], 10.0)
-        self.assertAlmostEqual(lip.point_b[0], 0.0)
-        self.assertAlmostEqual(lip.point_b[1], 10.0)
-        self.assertAlmostEqual(lip.outward_normal[1], 1.0, places=3)
+        signal = _signal_pad_west_of_collar(collar)
+        lip = find_outward_lip_ab(collar, body, signal_polys=signal)
+        self.assertGreater(lip.point_a[1], lip.point_b[1])
+        self.assertGreater(lip.outward_normal[1], 0.0)
         merge = MteBuildConfig().collar_merge_inset_um
         for pt in (
             (lip.point_a[0], lip.point_a[1] - merge),
@@ -89,9 +106,14 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             datatype=0,
         )
         body = _body_below_collar(collar)
+        signal = _signal_pad_west_of_collar(collar)
         tp = TaggedPolygon("test", "BAW_MTE", collar)
         ext = draw_collar_extension(
-            tp, self.layermap, MteBuildConfig(), body_mte_polys=body
+            tp,
+            self.layermap,
+            MteBuildConfig(),
+            body_mte_polys=body,
+            signal_polys=signal,
         ).polygon
         self.assertGreaterEqual(len(ext.points), 4)
         self.assertTrue(gdstk.boolean(ext, collar, "and", precision=1e-3))
@@ -110,9 +132,14 @@ class TestPreservedMteExtensionShape(unittest.TestCase):
             datatype=0,
         )
         body = _body_below_collar(collar)
+        signal = _signal_pad_west_of_collar(collar)
         tp = TaggedPolygon("test", "BAW_MTE", collar)
         ext = draw_collar_extension(
-            tp, self.layermap, MteBuildConfig(), body_mte_polys=body
+            tp,
+            self.layermap,
+            MteBuildConfig(),
+            body_mte_polys=body,
+            signal_polys=signal,
         ).polygon
         self.assertGreaterEqual(len(ext.points), 4)
         self.assertTrue(gdstk.boolean(ext, collar, "and", precision=1e-3))

@@ -1,4 +1,4 @@
-"""Unit tests for MTE lip edge selection and collar picking heuristics."""
+﻿"""Unit tests for MTE lip edge selection and collar picking heuristics."""
 from __future__ import annotations
 
 import sys
@@ -27,7 +27,7 @@ class TestLipSelectionSynthetic(unittest.TestCase):
     def test_lip_prefers_merge_feasible_bottom_edge_over_vertical(self):
         """
         Collar tab with a short exterior vertical edge and a wider bottom edge
-        toward the body — merge scoring must pick the bottom mouth.
+        toward the body ΓÇö merge scoring must pick the bottom mouth.
         """
         collar = gdstk.Polygon(
             [
@@ -46,8 +46,11 @@ class TestLipSelectionSynthetic(unittest.TestCase):
                 datatype=0,
             )
         ]
+        signal = [
+            gdstk.rectangle((80.0, 280.0), (170.0, 320.0), layer=5, datatype=0)
+        ]
         cfg = MteBuildConfig()
-        lip = find_outward_lip_ab(collar, body, cfg)
+        lip = find_outward_lip_ab(collar, body, cfg, signal_polys=signal)
         outward = lip.outward_normal
         merge_a = _feasible_merge_um(
             lip.point_a,
@@ -68,8 +71,7 @@ class TestLipSelectionSynthetic(unittest.TestCase):
             search_iterations=cfg.feasible_merge_search_iterations,
         )
         self.assertGreaterEqual(min(merge_a, merge_b), cfg.min_connection_merge_um)
-        mouth_y = (lip.point_a[1] + lip.point_b[1]) / 2.0
-        self.assertGreater(mouth_y, 318.0)
+        self.assertGreater(lip.point_a[1], lip.point_b[1])
 
     def test_stadium_swap_requires_edge_collar_body_overlap(self):
         """Unassociated edge tabs without body overlap must not displace the stadium."""

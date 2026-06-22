@@ -1,8 +1,8 @@
-"""
+﻿"""
 Export in-memory assemblies to standalone GDS files (after step 4, or any stage).
 
 Accepts objects with ``index``, ``inst_name``, ``top_cell``, ``library``, and
-``flatten()`` — e.g. ``ResonatorPpdAssembly`` (step 3) or ``RtegFrameAssembly``
+``flatten()`` ΓÇö e.g. ``ResonatorPpdAssembly`` (step 3) or ``RtegFrameAssembly``
 (step 4). Future routed assemblies can use the same API.
 
 When ``layermap`` is supplied, export keeps only mapped GDS pairs and writes a

@@ -1,4 +1,4 @@
-"""Shared result types and filler-carve helpers for steps 6.2 and 6.3."""
+﻿"""Shared result types and filler-carve helpers for steps 6.2 and 6.3."""
 from __future__ import annotations
 
 from collections.abc import Sequence

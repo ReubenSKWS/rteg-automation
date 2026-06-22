@@ -572,6 +572,183 @@ def preserved_collars_at_shift(
     return out[cfg.mte_layer], out[cfg.mbe_layer]
 
 
+def _resonator_body_layer_at_shift(
+    res: Resonator,
+    layermap: LayerMap,
+    layer_name: str,
+    dx: float,
+    dy: float,
+) -> list[gdstk.Polygon]:
+    pair = layermap.pair(layer_name)
+    return [
+        poly
+        for poly in resonator_metal_polys(res, dx, dy)
+        if (poly.layer, poly.datatype) == pair
+    ]
+
+
+def _resonator_body_mte_at_filter(
+    res: Resonator,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> list[gdstk.Polygon]:
+    cfg = config or RtegCollectConfig()
+    return _resonator_body_layer_at_shift(res, layermap, cfg.mte_layer, 0.0, 0.0)
+
+
+def _resonator_body_mbe_at_filter(
+    res: Resonator,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> list[gdstk.Polygon]:
+    cfg = config or RtegCollectConfig()
+    return _resonator_body_layer_at_shift(res, layermap, cfg.mbe_layer, 0.0, 0.0)
+
+
+def _tag_preserved_metal(
+    mbe_polys: Sequence[gdstk.Polygon],
+    mte_polys: Sequence[gdstk.Polygon],
+    n_connect_mte: int,
+    cfg: RtegCollectConfig,
+) -> PreservedMetal:
+    return PreservedMetal(
+        mbe=[
+            TaggedPolygon(f"preserved_{cfg.mbe_layer}[{i}]", cfg.mbe_layer, p)
+            for i, p in enumerate(mbe_polys)
+        ],
+        mte=[
+            TaggedPolygon(
+                (
+                    f"preserved_{cfg.mte_layer}[{i}]"
+                    if i < n_connect_mte
+                    else f"preserved_{cfg.mte_layer}_interface[{i - n_connect_mte}]"
+                ),
+                cfg.mte_layer,
+                p,
+            )
+            for i, p in enumerate(mte_polys)
+        ],
+    )
+
+
+def collect_filter_preserved_metal(
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> PreservedMetal:
+    """
+    Preserved filter interconnect at the resonator's filter-die placement.
+
+    Same connect-cell selection and MTE stadium/tab association as step 5.1,
+    but with ``shift=(0, 0)`` so coordinates stay in filter-die world space.
+    Used by step 2.4 die-intercept capture.
+    """
+    cfg = config or RtegCollectConfig()
+    mte_polys, mbe_polys = preserved_collars_at_shift(
+        res,
+        identification,
+        layermap,
+        shift=(0.0, 0.0),
+        config=cfg,
+    )
+    n_connect = len(mte_polys)
+    body_mte = _resonator_body_mte_at_filter(res, layermap, cfg)
+    mte_polys = _augment_preserved_mte_interface_collars(mte_polys, body_mte, cfg)
+    return _tag_preserved_metal(mbe_polys, mte_polys, n_connect, cfg)
+
+
+def _expand_filter_die_collar_layer(
+    polys: list[gdstk.Polygon],
+    *,
+    layer_name: str,
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    body_polys: Sequence[gdstk.Polygon],
+    overlap_with_body,
+    cfg: RtegCollectConfig,
+) -> list[gdstk.Polygon]:
+    """
+    Add top-level filter-die MTE/MBE that touch the connect-cell cluster.
+
+    Connect cells omit large filter bus polygons that still carry the collar
+    mouth (e.g. KB331 resonator 6 MTE at ~9497 µm²). Step 2.4 needs those
+    pieces; step 5.1 keeps the narrower connect-cell set.
+    """
+    pair = layermap.pair(layer_name)
+    filter_bb = _expand_bbox(
+        resonator_world_bbox(res), cfg.preserved_overlap_margin_um
+    )
+    candidates = [
+        poly
+        for poly in identification.filter_cell.flatten().polygons
+        if (poly.layer, poly.datatype) == pair
+        and abs(poly.area()) >= cfg.min_polygon_area_um2
+    ]
+    cluster = list(polys)
+    seen = {_polygon_key(p) for p in cluster}
+    changed = True
+    while changed:
+        changed = False
+        for poly in candidates:
+            key = _polygon_key(poly)
+            if key in seen:
+                continue
+            bb = poly.bounding_box()
+            if bb is None or not _bbox_overlap(bb, filter_bb):
+                continue
+            if any(polys_touch(poly, member) for member in cluster):
+                cluster.append(poly)
+                seen.add(key)
+                changed = True
+            elif overlap_with_body(poly, body_polys) >= 0.01:
+                cluster.append(poly)
+                seen.add(key)
+                changed = True
+    return cluster
+
+
+def collect_filter_die_collar_metal(
+    res: Resonator,
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> PreservedMetal:
+    """
+    Filter-die collar metal for step 2.4 intercept capture.
+
+    Starts from ``collect_filter_preserved_metal`` then grows each layer with
+    top-level filter polygons that touch that cluster or overlap resonator body.
+    """
+    cfg = config or RtegCollectConfig()
+    preserved = collect_filter_preserved_metal(res, identification, layermap, cfg)
+    n_connect = len(preserved.mte)
+    body_mte = _resonator_body_mte_at_filter(res, layermap, cfg)
+    body_mbe = _resonator_body_mbe_at_filter(res, layermap, cfg)
+    mte_polys = _expand_filter_die_collar_layer(
+        [tp.polygon for tp in preserved.mte],
+        layer_name=cfg.mte_layer,
+        res=res,
+        identification=identification,
+        layermap=layermap,
+        body_polys=body_mte,
+        overlap_with_body=preserved_mte_overlap_with_body,
+        cfg=cfg,
+    )
+    mbe_polys = _expand_filter_die_collar_layer(
+        [tp.polygon for tp in preserved.mbe],
+        layer_name=cfg.mbe_layer,
+        res=res,
+        identification=identification,
+        layermap=layermap,
+        body_polys=body_mbe,
+        overlap_with_body=preserved_mbe_overlap_with_body,
+        cfg=cfg,
+    )
+    return _tag_preserved_metal(mbe_polys, mte_polys, n_connect, cfg)
+
+
 def collect_preserved_metal(
     assembly: RtegFrameAssembly,
     res: Resonator,
@@ -598,24 +775,7 @@ def collect_preserved_metal(
     n_connect = len(mte_polys)
     body_mte = collect_resonator_body_mte(res, assembly, layermap, cfg)
     mte_polys = _augment_preserved_mte_interface_collars(mte_polys, body_mte, cfg)
-    return PreservedMetal(
-        mbe=[
-            TaggedPolygon(f"preserved_{cfg.mbe_layer}[{i}]", cfg.mbe_layer, p)
-            for i, p in enumerate(mbe_polys)
-        ],
-        mte=[
-            TaggedPolygon(
-                (
-                    f"preserved_{cfg.mte_layer}[{i}]"
-                    if i < n_connect
-                    else f"preserved_{cfg.mte_layer}_interface[{i - n_connect}]"
-                ),
-                cfg.mte_layer,
-                p,
-            )
-            for i, p in enumerate(mte_polys)
-        ],
-    )
+    return _tag_preserved_metal(mbe_polys, mte_polys, n_connect, cfg)
 
 
 def preserved_mte_overlap_with_body(

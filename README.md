@@ -11,7 +11,7 @@ Domain rules and constraints: [`CLAUDE.md`](CLAUDE.md).
 | Step | What | Status |
 |------|------|--------|
 | 1 | Inputs + layermap | Done |
-| 2 | Identify resonators / vias | Done |
+| 2 | Identify resonators / vias / die intercepts | Done |
 | 3 | Center resonator in GSG PPD | Done |
 | 4 | Die frame placement + framed GDS export | Done |
 | 5 | MTE signal (collect → classify → extend → pad route) | Done |
@@ -39,7 +39,7 @@ Needs `python_code/input_files/` (filter, frame, PPD, layermap) and writes to `p
 ## Pipeline (one line per step)
 
 1. **Inputs** — validate GDS files and load layermap.
-2. **Selection** — find resonators (`series`/`shunt`/…) and vias in the filter hierarchy.
+2. **Selection** — find resonators (`series`/`shunt`/…) and vias; capture original-die MBE/MTE collar intercepts.
 3. **Separation** — place each resonator in the GSG probe template with pad/release clearance.
 4. **Setting up** — place assembly in die frame; add right-side MBE filler; export framed GDS.
 5. **MTE routing** — classify signal path; draw 14 µm collar extensions; stretch to center pad when needed.
@@ -71,7 +71,8 @@ flowchart LR
 | File | Role |
 |------|------|
 | `layermap.py` / `inspect_refs.py` | Step 1 — layer names, hierarchy |
-| `separate.py` | Step 2 — `identify()` |
+| `separate.py` | Step 2.3 — `identify()` |
+| `rteg_die_intercepts.py` | Step 2.4 — original-die collar intercepts |
 | `prep_resonator_ppd.py` | Step 3 — PPD + resonator assembly |
 | `prep_rteg_frame.py` | Step 4 — die frame + filler placement |
 | `export_gds.py` | GDS + `.lyp` export |

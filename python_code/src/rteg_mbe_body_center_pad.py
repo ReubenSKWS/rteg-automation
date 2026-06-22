@@ -26,7 +26,6 @@ from rteg_mbe_body_common import (
     build_mte_trim_keepouts,
     carve_filler,
     empty_mbe_body_result,
-    merge_filler_with_bridge,
     mte_route_obstacle_polys,
     offset_polys,
     trim_polygon_away_from_keepouts,
@@ -36,7 +35,9 @@ from rteg_mbe_extensions import (
     _collar_mouth_edge_path,
     _collar_vertices,
     _locate_on_collar_boundary,
+    _snap_point_to_collar,
     _walk_collar_boundary,
+    select_collar_for_die_mouth,
     select_extension_collar_mbe,
     tag_baw_mbe,
 )
@@ -887,6 +888,7 @@ def route_filler_around_collar(
     *,
     keepouts: Sequence[gdstk.Polygon] | None = None,
     mte_trim_keepouts: Sequence[gdstk.Polygon] | None = None,
+    collar_hits: tuple[Point, Point] | None = None,
 ) -> list[gdstk.Polygon]:
     """
     Carve with 6.2-style keepouts, trace the left edge from a sampled clearance
@@ -906,9 +908,17 @@ def route_filler_around_collar(
     bl, br, tr, tl = _rectangle_corners_ccw(base_filler)
     edge_x = bl[0]
     filler_bb = base_filler.bounding_box()
-    hits = _left_edge_collar_hits(
-        edge_x, bl[1], tl[1], collar, tol=cfg.intercept_tol_um
-    )
+    if collar_hits is not None:
+        from rteg_die_intercepts import mouth_hits_for_left_edge
+
+        hit_bot, hit_top = mouth_hits_for_left_edge(collar_hits[0], collar_hits[1])
+        hit_bot = _snap_point_to_collar(collar, hit_bot)
+        hit_top = _snap_point_to_collar(collar, hit_top)
+        hits = [hit_bot, hit_top]
+    else:
+        hits = _left_edge_collar_hits(
+            edge_x, bl[1], tl[1], collar, tol=cfg.intercept_tol_um
+        )
     if len(hits) >= 2:
         hit_bot, hit_top = _arc_hit_endpoints(hits)
         layer, datatype = template.layer, template.datatype
@@ -1018,6 +1028,9 @@ def build_mbe_body_center_pad(
     layermap: LayerMap,
     cfg: MbeBodyCenterPadConfig | None = None,
     conn_cfg: MbeConnectionConfig | None = None,
+    *,
+    die_routing: object | None = None,
+    resonator_index: int | None = None,
 ) -> MbeBodyResult:
     """Run step 6.3 for a single ``center_pad`` resonator."""
     c = cfg or MbeBodyCenterPadConfig()
@@ -1037,6 +1050,20 @@ def build_mbe_body_center_pad(
         connection_cfg,
         signal_polys=signal_polys or None,
     )
+    collar_hits = None
+    if die_routing is not None and resonator_index is not None:
+        collar_hits = die_routing.collar_mouth(resonator_index, "mbe")
+    if collar_hits is not None:
+        mbe_pieces = list(roles.preserved.mbe)
+        if die_routing is not None and resonator_index is not None:
+            mbe_pieces.extend(die_routing.extra_collars(resonator_index, "mbe"))
+        picked = select_collar_for_die_mouth(
+            mbe_pieces,
+            collar_hits[0],
+            collar_hits[1],
+        )
+        if picked is not None:
+            collar_tp = picked
     if collar_tp is None:
         violations.append("missing preserved MBE collar for filler routing")
         filler: list[gdstk.Polygon] = [base_filler]
@@ -1069,6 +1096,11 @@ def build_mbe_body_center_pad(
             c,
             keepouts=keepouts,
             mte_trim_keepouts=mte_trim_keepouts,
+            collar_hits=(
+                die_routing.collar_mouth(resonator_index, "mbe")
+                if die_routing is not None and resonator_index is not None
+                else None
+            ),
         )
         absorbed_mbe = [collar_tp.polygon]
 
@@ -1090,15 +1122,16 @@ def build_mbe_body_center_pads(
     layermap: LayerMap,
     config: MbeBodyCenterPadConfig | None = None,
     conn_config: MbeConnectionConfig | None = None,
+    *,
+    die_routing: object | None = None,
 ) -> dict[int, MbeBodyResult]:
-    """Run step 6.3 for every resonator index in ``roles_by_index``."""
+    """Run step 6.3 for every ``center_pad`` index in ``roles_by_index``."""
     cfg = config or MbeBodyCenterPadConfig()
     conn_cfg = conn_config or MbeConnectionConfig()
     out: dict[int, MbeBodyResult] = {}
     for idx, roles in roles_by_index.items():
         classification = classifications[idx]
         if not mbe_body_center_pad_applies(classification):
-            out[idx] = empty_mbe_body_result()
             continue
         out[idx] = build_mbe_body_center_pad(
             roles,
@@ -1107,6 +1140,8 @@ def build_mbe_body_center_pads(
             layermap,
             cfg,
             conn_cfg,
+            die_routing=die_routing,
+            resonator_index=idx,
         )
     return out
 

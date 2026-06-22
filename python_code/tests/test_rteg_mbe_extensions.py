@@ -32,7 +32,7 @@ SKIP_INDICES = (1, 3, 4, 6)
 
 # Golden collar hits after fillet-cluster detection + Y-sweep stretch (KB331).
 KB331_EXPECTED_HITS: dict[int, tuple[tuple[float, float], tuple[float, float]]] = {
-    0: ((180.192, 314.858), (159.256, 262.000)),
+    0: ((172.422, 314.858), (151.486, 262.000)),
     2: ((186.731, 318.124), (148.844, 304.932)),
     5: ((193.239, 337.052), (159.797, 293.302)),
     7: ((157.084, 267.576), (176.857, 236.142)),

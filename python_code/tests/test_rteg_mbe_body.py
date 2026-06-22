@@ -23,13 +23,11 @@ from rteg_collect import collect_geometry_roles, collect_orientation_inputs
 from rteg_mbe_body import (
     MbeBodyConfig,
     _extension_outer_edge,
-    build_mbe_bodies,
-    build_mbe_body_filler,
+    build_mbe_body_collar_extends,
     build_mbe_body_keepouts,
     draw_mbe_cap_on_mte_extension,
     merge_mbe_bodies,
     mbe_body_applies,
-    mbe_body_center_pad_applies,
     mbe_body_collar_extend_applies,
     mbe_body_overview_rows,
 )
@@ -37,6 +35,7 @@ from rteg_mbe_body_center_pad import (
     MbeBodyCenterPadConfig,
     build_center_pad_keepouts,
     build_mbe_body_center_pads,
+    mbe_body_center_pad_applies,
     _gds_polygon_count,
 )
 from rteg_mbe_body_common import base_filler_polygon
@@ -217,7 +216,7 @@ class TestMbeBodyKB331(unittest.TestCase):
             cls.ctx["layermap"],
             cls.mbe_cfg,
         )
-        cls.all_body = build_mbe_bodies(
+        cls.all_body = build_mbe_body_collar_extends(
             cls.all_roles,
             cls.all_classify,
             cls.all_mte,
@@ -461,14 +460,11 @@ class TestMbeBodyKB331(unittest.TestCase):
                 ]
                 self.assertGreater(len(mbe_polys), 1, msg=f"index {index}")
 
-    def test_merge_mbe_bodies_keeps_collar_extend_when_center_pad_empty(self):
+    def test_merge_mbe_bodies_combines_routing_styles(self):
         merged = merge_mbe_bodies(self.all_body, self.center_pad_body)
+        self.assertEqual(set(merged), set(COLLAR_EXTEND_INDICES) | set(CENTER_PAD_INDICES))
         for index in COLLAR_EXTEND_INDICES:
-            self.assertGreater(
-                merged[index].n_pieces,
-                0,
-                msg=f"index {index}: step 6.2 body lost after merge",
-            )
+            self.assertGreater(merged[index].n_pieces, 0, msg=f"index {index}")
         for index in CENTER_PAD_INDICES:
             self.assertGreater(merged[index].n_pieces, 0, msg=f"index {index}")
 
@@ -694,9 +690,9 @@ class TestMbeBodyKB331(unittest.TestCase):
     def test_overview_rows(self):
         inst_names = {i: r.inst_name for i, r in enumerate(self.ctx["res_list"])}
         rows = mbe_body_overview_rows(self.all_body, inst_names=inst_names)
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), len(COLLAR_EXTEND_INDICES))
         drawn = [r for r in rows if r["n_pieces"] > 0]
-        self.assertEqual(len(drawn), 8)
+        self.assertEqual(len(drawn), len(COLLAR_EXTEND_INDICES))
 
 
 if __name__ == "__main__":

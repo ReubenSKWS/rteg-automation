@@ -61,6 +61,9 @@ class MteBuildConfig:
     boolean_precision: float = 1e-3
     inside_probe_half_um: float = 0.25
     feasible_merge_search_iterations: int = 24
+    pad_facing_min_edge_um: float = 5.0
+    pad_facing_prefer_vertical_bonus: float = 0.05
+    die_intercept_min_mouth_um: float = 50.0
 
 
 @dataclass(frozen=True)
@@ -516,6 +519,133 @@ def find_outward_lip_ab(
     )
 
 
+def infer_probe_reference(body_polys: Sequence[gdstk.Polygon]) -> Point:
+    """
+    Filter-die probe direction for left-side (center-pad) probing.
+
+    Without RTEG pad geometry, assume the signal pad lies far to the left (-x)
+    of the resonator body centroid — consistent with KB331 center-pad series.
+    """
+    cx, cy = _body_centroid(body_polys)
+    return (cx - 500.0, cy)
+
+
+def find_pad_facing_mouth_lip(
+    collar: gdstk.Polygon,
+    body_polys: Sequence[gdstk.Polygon],
+    cfg: MteBuildConfig | None = None,
+    *,
+    probe_ref: Point | None = None,
+) -> LipIntercept:
+    """
+    Pad-facing collar mouth for die intercept capture.
+
+    Picks the longest edge whose outward normal best aligns with the probe pad,
+    preferring vertical mouths (reference layouts use ~81 µm vertical strips).
+    """
+    c = cfg or MteBuildConfig()
+    pad_ref = probe_ref if probe_ref is not None else infer_probe_reference(body_polys)
+    pts = [(float(p[0]), float(p[1])) for p in collar.points]
+    if len(pts) < 4:
+        raise ValueError("collar must have at least 4 vertices")
+
+    body_centroid = _body_centroid(body_polys)
+    n = len(pts)
+    best: tuple[tuple[float, float, float], int, Edge, tuple[float, float]] | None = None
+    for edge_idx in range(n):
+        p0, p1 = _edge_points(pts, edge_idx)
+        edge_len = _edge_length(p0, p1)
+        if edge_len < c.pad_facing_min_edge_um:
+            continue
+        outward = _edge_outward_normal((p0, p1), body_centroid)
+        mid = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
+        to_pad = (pad_ref[0] - mid[0], pad_ref[1] - mid[1])
+        to_pad_len = math.hypot(to_pad[0], to_pad[1])
+        if to_pad_len < 1e-9:
+            continue
+        alignment = (
+            outward[0] * to_pad[0] / to_pad_len + outward[1] * to_pad[1] / to_pad_len
+        )
+        vertical_bonus = (
+            c.pad_facing_prefer_vertical_bonus
+            if abs(p0[0] - p1[0]) <= 0.5
+            else 0.0
+        )
+        score = (alignment + vertical_bonus, edge_len, -abs(edge_len - 81.0))
+        if best is None or score > best[0]:
+            best = (score, edge_idx, (p0, p1), outward)
+
+    if best is None:
+        raise ValueError("collar has no edge facing the probe pad")
+
+    edge_idx, (p0, p1), outward = best[1], best[2], best[3]
+    return LipIntercept(
+        point_a=(p0[0], p0[1]),
+        point_b=(p1[0], p1[1]),
+        lip_vertex_indices=[edge_idx, (edge_idx + 1) % n],
+        outward_normal=outward,
+        lip_edges=[edge_idx],
+    )
+
+
+def select_die_intercept_collar_from_pieces(
+    pieces: Sequence[TaggedPolygon],
+    body_polys: Sequence[gdstk.Polygon],
+    overlap_with_body,
+    cfg: MteBuildConfig | None = None,
+    *,
+    layer: str = "mte",
+) -> TaggedPolygon | None:
+    """
+    Pick the connect collar whose pad-facing mouth best matches reference layouts.
+
+    For MTE, prefer the stadium shell over the augmented edge tab when both are
+    present — reference RTEG mouths sit on the stadium vertical edge. For MBE,
+    score all candidates by pad-facing vertical mouth quality, not only body
+    overlap (ground collars may not overlap resonator body MBE).
+    """
+    c = cfg or MteBuildConfig()
+    if not pieces:
+        return None
+
+    probe_ref = infer_probe_reference(body_polys)
+    candidates = list(pieces)
+    if layer == "mte":
+        stadiums = [tp for tp in pieces if _is_stadium_collar(tp.polygon, c)]
+        if stadiums:
+            candidates = stadiums
+
+    scored: list[tuple[tuple[float, float, float], TaggedPolygon]] = []
+    for tp in candidates:
+        try:
+            lip = find_pad_facing_mouth_lip(
+                tp.polygon, body_polys, c, probe_ref=probe_ref
+            )
+        except ValueError:
+            continue
+        span = _dist(lip.point_a, lip.point_b)
+        if span < c.die_intercept_min_mouth_um:
+            continue
+        overlap = overlap_with_body(
+            tp.polygon, body_polys, precision=c.boolean_precision
+        )
+        vertical = abs(lip.point_a[0] - lip.point_b[0]) <= 0.5
+        score = (
+            1.0 if vertical else 0.0,
+            span,
+            overlap,
+            -abs(tp.polygon.area()),
+        )
+        scored.append((score, tp))
+
+    if scored:
+        return max(scored, key=lambda item: item[0])[1]
+
+    return select_extension_collar_from_pieces(
+        pieces, body_polys, overlap_with_body, c
+    )
+
+
 def _point_inside_polygon(
     point: Point,
     polygon: gdstk.Polygon,
@@ -670,8 +800,16 @@ def draw_lip_extension(
     )
     span = _dist(lip.point_a, lip.point_b)
     pts = [(float(p[0]), float(p[1])) for p in collar.points]
-    edge_a = _edge_points(pts, lip.lip_edges[0])
-    edge_b = _edge_points(pts, lip.lip_edges[-1])
+    if lip.lip_edges:
+        edge_a = _edge_points(pts, lip.lip_edges[0])
+        edge_b = _edge_points(pts, lip.lip_edges[-1])
+        endcap_index_a = lip.lip_edges[0]
+        endcap_index_b = lip.lip_edges[-1]
+    else:
+        edge_a = (lip.point_a, lip.point_b)
+        edge_b = edge_a
+        endcap_index_a = -1
+        endcap_index_b = -1
 
     return CollarExtensionDraw(
         polygon=polygon,
@@ -682,8 +820,8 @@ def draw_lip_extension(
         target_extension_um=extension_um,
         endcap_edge_a=edge_a,
         endcap_edge_b=edge_b,
-        endcap_index_a=lip.lip_edges[0],
-        endcap_index_b=lip.lip_edges[-1],
+        endcap_index_a=endcap_index_a,
+        endcap_index_b=endcap_index_b,
         mouth_span_um=span,
         mouth_vertices=2,
         collar_intercept_a=lip.point_a,
@@ -788,6 +926,128 @@ def _validate_extension(
         )
 
 
+def _nearest_boundary_point_on_collar(
+    collar: gdstk.Polygon,
+    target: Point,
+) -> Point:
+    """Closest point on the collar ring to ``target``."""
+    tx, ty = target
+    best_d = float("inf")
+    best_pt: Point = target
+    pts = [(float(x), float(y)) for x, y in collar.points]
+    for i in range(len(pts)):
+        p0, p1 = pts[i], pts[(i + 1) % len(pts)]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        el2 = dx * dx + dy * dy
+        if el2 < 1e-9:
+            continue
+        t = max(0.0, min(1.0, ((tx - p0[0]) * dx + (ty - p0[1]) * dy) / el2))
+        pt = (p0[0] + t * dx, p0[1] + t * dy)
+        d = math.hypot(pt[0] - tx, pt[1] - ty)
+        if d < best_d:
+            best_d = d
+            best_pt = pt
+    return best_pt
+
+
+def _outward_normal_from_mouth(
+    point_a: Point,
+    point_b: Point,
+    body_polys: Sequence[gdstk.Polygon],
+) -> tuple[float, float]:
+    """Unit normal perpendicular to the mouth, pointing away from body metal."""
+    body_c = _body_centroid(body_polys)
+    ax, ay = point_a
+    bx, by = point_b
+    tx, ty = bx - ax, by - ay
+    tlen = math.hypot(tx, ty)
+    if tlen < 1e-9:
+        return (0.0, 1.0)
+    tx, ty = tx / tlen, ty / tlen
+    nx, ny = -ty, tx
+    mid = ((ax + bx) / 2.0, (ay + by) / 2.0)
+    vx, vy = mid[0] - body_c[0], mid[1] - body_c[1]
+    if nx * vx + ny * vy < 0.0:
+        return (-nx, -ny)
+    return (nx, ny)
+
+
+def _die_lip_collar_score(
+    collar: gdstk.Polygon,
+    die_lip: LipIntercept,
+) -> tuple[float, float, float]:
+    """Return (snap score, mouth span on collar, span delta from die mouth)."""
+    sa = _nearest_boundary_point_on_collar(collar, die_lip.point_a)
+    sb = _nearest_boundary_point_on_collar(collar, die_lip.point_b)
+    span = _dist(sa, sb)
+    die_span = _dist(die_lip.point_a, die_lip.point_b)
+    score = _dist(sa, die_lip.point_a) + _dist(sb, die_lip.point_b)
+    return score, span, abs(span - die_span)
+
+
+def select_collar_for_die_lip(
+    pieces: Sequence[TaggedPolygon],
+    die_lip: LipIntercept,
+    *,
+    min_mouth_um: float = 5.0,
+) -> TaggedPolygon | None:
+    """Pick preserved MTE collar whose boundary best matches die mouth targets."""
+    best: TaggedPolygon | None = None
+    best_key: tuple[float, bool, float] | None = None
+    for tp in pieces:
+        score, span, span_delta = _die_lip_collar_score(tp.polygon, die_lip)
+        key = (score, span >= min_mouth_um, -span_delta)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = tp
+    return best
+
+
+def _rank_collars_for_die_lip(
+    pieces: Sequence[TaggedPolygon],
+    die_lip: LipIntercept,
+) -> list[TaggedPolygon]:
+    """Order preserved MTE collars from best to worst die-mouth snap fit."""
+    return sorted(
+        pieces,
+        key=lambda tp: _die_lip_collar_score(tp.polygon, die_lip),
+    )
+
+
+def _snap_lip_to_collar(collar: gdstk.Polygon, lip: LipIntercept) -> LipIntercept:
+    """Snap die mouth targets onto the preserved RTEG collar boundary."""
+    point_a = _nearest_boundary_point_on_collar(collar, lip.point_a)
+    point_b = _nearest_boundary_point_on_collar(collar, lip.point_b)
+    return LipIntercept(
+        point_a=point_a,
+        point_b=point_b,
+        lip_vertex_indices=[],
+        outward_normal=lip.outward_normal,
+        lip_edges=[],
+    )
+
+
+def _lip_for_collar(
+    collar: gdstk.Polygon,
+    die_lip: LipIntercept,
+    body_polys: Sequence[gdstk.Polygon],
+    *,
+    max_snap_um: float = 15.0,
+) -> LipIntercept:
+    """Snap routing mouth targets onto the selected collar boundary."""
+    point_a = _nearest_boundary_point_on_collar(collar, die_lip.point_a)
+    point_b = _nearest_boundary_point_on_collar(collar, die_lip.point_b)
+    return LipIntercept(
+        point_a=point_a,
+        point_b=point_b,
+        lip_vertex_indices=[],
+        outward_normal=_outward_normal_from_mouth(
+            point_a, point_b, body_polys
+        ),
+        lip_edges=[],
+    )
+
+
 def draw_collar_extension(
     collar_tp: TaggedPolygon,
     layermap: LayerMap,
@@ -795,9 +1055,13 @@ def draw_collar_extension(
     *,
     body_mte_polys: Sequence[gdstk.Polygon],
     resonator_index: int | None = None,
+    lip: LipIntercept | None = None,
 ) -> CollarExtensionDraw:
     layer, datatype = layermap.pair(cfg.mte_layer)
-    lip = find_outward_lip_ab(collar_tp.polygon, body_mte_polys, cfg)
+    if lip is not None:
+        lip = _lip_for_collar(collar_tp.polygon, lip, body_mte_polys)
+    if lip is None:
+        lip = find_outward_lip_ab(collar_tp.polygon, body_mte_polys, cfg)
     draw = draw_lip_extension(
         collar_tp.polygon,
         lip,
@@ -842,24 +1106,65 @@ def _extension_for_roles(
     cfg: MteBuildConfig,
     *,
     resonator_index: int,
+    die_lip: LipIntercept | None = None,
+    die_routing: object | None = None,
 ) -> MteExtensionResult:
     preserved_polys = [tp.polygon for tp in roles.preserved.mte]
-    collar_tp = select_extension_collar(
-        roles.preserved,
-        roles.resonator_body_mte,
-        cfg,
-    )
-    if collar_tp is None:
-        raise ValueError(
-            f"resonator {resonator_index}: no preserved MTE collar to extend"
+    lip: LipIntercept | None = die_lip
+    mte_pieces = list(roles.preserved.mte)
+    if die_routing is not None and die_lip is not None:
+        mte_pieces.extend(die_routing.extra_collars(resonator_index, "mte"))
+    if die_lip is not None:
+        collar_candidates = _rank_collars_for_die_lip(
+            mte_pieces,
+            die_lip,
         )
-    draw = draw_collar_extension(
-        collar_tp,
-        layermap,
-        cfg,
-        body_mte_polys=roles.resonator_body_mte,
-        resonator_index=resonator_index,
-    )
+    else:
+        collar_candidates = []
+        collar_tp = select_extension_collar(
+            roles.preserved,
+            roles.resonator_body_mte,
+            cfg,
+        )
+        if collar_tp is not None:
+            collar_candidates = [collar_tp]
+
+    draw: CollarExtensionDraw | None = None
+    collar_tp: TaggedPolygon | None = None
+    for candidate in collar_candidates:
+        try:
+            draw = draw_collar_extension(
+                candidate,
+                layermap,
+                cfg,
+                body_mte_polys=roles.resonator_body_mte,
+                resonator_index=resonator_index,
+                lip=lip,
+            )
+            collar_tp = candidate
+            break
+        except ValueError:
+            continue
+
+    if draw is None or collar_tp is None:
+        collar_tp = select_extension_collar(
+            roles.preserved,
+            roles.resonator_body_mte,
+            cfg,
+        )
+        if collar_tp is None:
+            raise ValueError(
+                f"resonator {resonator_index}: no preserved MTE collar to extend"
+            )
+        lip = None
+        draw = draw_collar_extension(
+            collar_tp,
+            layermap,
+            cfg,
+            body_mte_polys=roles.resonator_body_mte,
+            resonator_index=resonator_index,
+            lip=None,
+        )
     overlap = _collar_overlap_area(
         draw.polygon, collar_tp.polygon, cfg.boolean_precision
     )
@@ -881,10 +1186,23 @@ def build_mte_extensions(
     roles_by_index: Mapping[int, _HasPreserved],
     layermap: LayerMap,
     config: MteBuildConfig | None = None,
+    *,
+    die_routing: object | None = None,
 ) -> dict[int, MteExtensionResult]:
     cfg = config or MteBuildConfig()
     return {
-        idx: _extension_for_roles(roles, layermap, cfg, resonator_index=idx)
+        idx: _extension_for_roles(
+            roles,
+            layermap,
+            cfg,
+            resonator_index=idx,
+            die_lip=(
+                die_routing.lip(idx, "mte")
+                if die_routing is not None
+                else None
+            ),
+            die_routing=die_routing,
+        )
         for idx, roles in roles_by_index.items()
     }
 
@@ -1249,7 +1567,8 @@ def export_full_rteg_gds(
     (6.2 for ``collar_extend``, 6.3 for ``center_pad``).
 
     ``mbe_bodies`` must be the merged dict from steps 6.2 and 6.3, e.g.
-    ``merge_mbe_bodies(collar_extend_body, center_pad_body)``.
+    ``merge_mbe_bodies(collar_extend_body, center_pad_body)`` — each builder
+    returns only the indices it applies to.
     """
     expected = {asm.index for asm in frame_assemblies}
     missing_mte = expected - set(extensions)

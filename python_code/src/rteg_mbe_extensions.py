@@ -222,6 +222,60 @@ def _locate_on_collar_boundary(point: Point, verts: Sequence[Point]) -> tuple[in
     return best_edge, best_t
 
 
+def _snap_point_to_collar(
+    collar: gdstk.Polygon,
+    point: Point,
+    *,
+    max_snap_um: float = 15.0,
+) -> Point:
+    """Project onto the collar boundary when the target is already nearby."""
+    verts = _collar_vertices(collar)
+    edge, t = _locate_on_collar_boundary(point, verts)
+    snapped = _interp_collar_edge(verts, edge, t)
+    if math.hypot(snapped[0] - point[0], snapped[1] - point[1]) <= max_snap_um:
+        return snapped
+    return point
+
+
+def _die_mouth_collar_score(
+    collar: gdstk.Polygon,
+    mouth_a: Point,
+    mouth_b: Point,
+) -> tuple[float, float, float]:
+    """Return (snap score, mouth span on collar, span delta from die mouth)."""
+    sa = _snap_point_to_collar(collar, mouth_a, max_snap_um=1e9)
+    sb = _snap_point_to_collar(collar, mouth_b, max_snap_um=1e9)
+    span = math.hypot(sb[0] - sa[0], sb[1] - sa[1])
+    die_span = math.hypot(mouth_b[0] - mouth_a[0], mouth_b[1] - mouth_a[1])
+    score = math.hypot(sa[0] - mouth_a[0], sa[1] - mouth_a[1]) + math.hypot(
+        sb[0] - mouth_b[0], sb[1] - mouth_b[1]
+    )
+    return score, span, abs(span - die_span)
+
+
+def select_collar_for_die_mouth(
+    pieces: Sequence[TaggedPolygon],
+    mouth_a: Point,
+    mouth_b: Point,
+    *,
+    min_mouth_um: float = 5.0,
+) -> TaggedPolygon | None:
+    """Pick preserved MBE collar that best matches die mouth targets."""
+    best: TaggedPolygon | None = None
+    best_key: tuple[float, bool, float] | None = None
+    for tp in pieces:
+        score, span, span_delta = _die_mouth_collar_score(
+            tp.polygon,
+            mouth_a,
+            mouth_b,
+        )
+        key = (score, span >= min_mouth_um, -span_delta)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = tp
+    return best
+
+
 def _interp_collar_edge(verts: Sequence[Point], edge: int, t: float) -> Point:
     a = verts[edge]
     b = verts[(edge + 1) % len(verts)]
@@ -700,6 +754,8 @@ def draw_mbe_pad_connection(
     signal_polys: Sequence[gdstk.Polygon],
     layermap: LayerMap,
     cfg: MbeConnectionConfig | None = None,
+    *,
+    collar_hits: tuple[Point, Point] | None = None,
 ) -> tuple[gdstk.Polygon, MbeConnectionDraw]:
     """Build a pad-to-collar connector tracing the collar mouth edge."""
     c = cfg or MbeConnectionConfig()
@@ -708,9 +764,16 @@ def draw_mbe_pad_connection(
 
     point_a, point_b = _pad_corners_tr_br(signal_polys)
     pad_ref = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
-    bend_top, bend_bottom = _collar_mouth_bends(collar, pad_ref, point_a, point_b, c)
-    hit_a = bend_top or _fallback_collar_hit(collar, point_a, pad_ref)
-    hit_b = bend_bottom or _fallback_collar_hit(collar, point_b, pad_ref)
+    if collar_hits is not None:
+        from rteg_die_intercepts import mouth_hits_for_pad
+
+        hit_a, hit_b = mouth_hits_for_pad(collar_hits[0], collar_hits[1])
+        hit_a = _snap_point_to_collar(collar, hit_a)
+        hit_b = _snap_point_to_collar(collar, hit_b)
+    else:
+        bend_top, bend_bottom = _collar_mouth_bends(collar, pad_ref, point_a, point_b, c)
+        hit_a = bend_top or _fallback_collar_hit(collar, point_a, pad_ref)
+        hit_b = bend_bottom or _fallback_collar_hit(collar, point_b, pad_ref)
 
     connection = gdstk.Polygon(
         _connection_points(point_a, point_b, hit_a, hit_b, collar),
@@ -731,6 +794,10 @@ def _extension_for_roles(
     classification: NodeClassification,
     layermap: LayerMap,
     cfg: MbeConnectionConfig,
+    *,
+    collar_hits: tuple[Point, Point] | None = None,
+    die_routing: object | None = None,
+    resonator_index: int | None = None,
 ) -> MbeExtensionResult:
     preserved = roles.preserved
     signal_polys = [tp.polygon for tp in classification.center_pad_polygons()]
@@ -740,6 +807,17 @@ def _extension_for_roles(
         cfg,
         signal_polys=signal_polys or None,
     )
+    if collar_hits is not None:
+        mbe_pieces = list(preserved.mbe)
+        if die_routing is not None and resonator_index is not None:
+            mbe_pieces.extend(die_routing.extra_collars(resonator_index, "mbe"))
+        picked = select_collar_for_die_mouth(
+            mbe_pieces,
+            collar_hits[0],
+            collar_hits[1],
+        )
+        if picked is not None:
+            collar_tp = picked
     if collar_tp is None:
         return _empty_mbe_result(preserved)
     if not signal_polys:
@@ -753,7 +831,13 @@ def _extension_for_roles(
             drc_violations=["no center signal pad geometry"],
         )
 
-    connection, draw = draw_mbe_pad_connection(collar_tp, signal_polys, layermap, cfg)
+    connection, draw = draw_mbe_pad_connection(
+        collar_tp,
+        signal_polys,
+        layermap,
+        cfg,
+        collar_hits=collar_hits,
+    )
 
     return MbeExtensionResult(
         collar=collar_tp,
@@ -770,6 +854,9 @@ def build_mbe_extension(
     classification: NodeClassification,
     layermap: LayerMap,
     config: MbeConnectionConfig | None = None,
+    *,
+    die_routing: object | None = None,
+    resonator_index: int | None = None,
 ) -> MbeExtensionResult:
     """Run step 6.1 for a single resonator."""
     cfg = config or MbeConnectionConfig()
@@ -777,7 +864,18 @@ def build_mbe_extension(
         return _empty_mbe_result(roles.preserved)
     if not roles.preserved.mbe:
         return _empty_mbe_result(roles.preserved)
-    return _extension_for_roles(roles, classification, layermap, cfg)
+    collar_hits = None
+    if die_routing is not None and resonator_index is not None:
+        collar_hits = die_routing.collar_mouth(resonator_index, "mbe")
+    return _extension_for_roles(
+        roles,
+        classification,
+        layermap,
+        cfg,
+        collar_hits=collar_hits,
+        die_routing=die_routing,
+        resonator_index=resonator_index,
+    )
 
 
 def build_mbe_extensions(
@@ -785,20 +883,22 @@ def build_mbe_extensions(
     classifications: Mapping[int, NodeClassification],
     layermap: LayerMap,
     config: MbeConnectionConfig | None = None,
+    *,
+    die_routing: object | None = None,
 ) -> dict[int, MbeExtensionResult]:
     """Run step 6.1 for every resonator index in ``roles_by_index``."""
     cfg = config or MbeConnectionConfig()
-    out: dict[int, MbeExtensionResult] = {}
-    for idx, roles in roles_by_index.items():
-        classification = classifications[idx]
-        if not mbe_extension_applies(classification):
-            out[idx] = _empty_mbe_result(roles.preserved)
-            continue
-        if not roles.preserved.mbe:
-            out[idx] = _empty_mbe_result(roles.preserved)
-            continue
-        out[idx] = _extension_for_roles(roles, classification, layermap, cfg)
-    return out
+    return {
+        idx: build_mbe_extension(
+            roles,
+            classifications[idx],
+            layermap,
+            cfg,
+            die_routing=die_routing,
+            resonator_index=idx,
+        )
+        for idx, roles in roles_by_index.items()
+    }
 
 
 def mbe_extensions_overview_rows(
@@ -834,7 +934,6 @@ __all__ = [
     "MbeConnectionDraw",
     "MbeExtensionResult",
     "PDK6_MBE_GDS_PAIR",
-    "build_mbe_extension",
     "build_mbe_extensions",
     "draw_mbe_pad_connection",
     "mbe_extension_applies",

@@ -1,4 +1,4 @@
-﻿"""Step 6.2 — preserved MTE extension simplification."""
+﻿"""Step 6.2 export contracts and optional MTE extension reshape helpers."""
 from __future__ import annotations
 
 import sys
@@ -14,7 +14,12 @@ for p in (str(SRC), str(TESTS)):
 
 from kb331_pipeline import load_kb331_pipeline
 from rteg_classify import classify_nodes
-from rteg_collect import collect_geometry_roles, collect_orientation_inputs
+from rteg_collect import (
+    _polygon_key,
+    attach_preserved_filter_interconnect,
+    collect_geometry_roles,
+    collect_orientation_inputs,
+)
 from rteg_mbe_body import MbeBodyConfig, build_mbe_body_collar_extends
 from rteg_mbe_extensions import MbeConnectionConfig, build_mbe_extensions
 from rteg_mte_route import identify_preserved_mte_parts
@@ -68,7 +73,8 @@ class TestMteExtensionSimplify(unittest.TestCase):
             MbeBodyConfig(),
         )
 
-    def test_index7_is_five_point_right_angle(self):
+    def test_index7_simplify_mte_extension_unit(self):
+        """``simplify_mte_extension`` remains available but is not used in 6.2 export."""
         index = 7
         roles = self.all_roles[index]
         mte = self.all_mte[index]
@@ -97,32 +103,81 @@ class TestMteExtensionSimplify(unittest.TestCase):
         self.assertGreater(leg_far[0], 300.0)
         self.assertGreater(leg_mouth[1], 315.0)
 
+    def test_collar_extend_export_leaves_mte_unchanged(self):
         mte_pair = self.ctx["layermap"].pair("BAW_MTE")
-        cell = MteRtegAssembly(
-            self.ctx["frame_assemblies"][index],
-            mte,
-            layermap=self.ctx["layermap"],
-            mbe_extension=self.all_mbe[index],
-            mbe_body=self.all_body[index],
-        ).flatten()
-        ext_polys = [
-            p
-            for p in cell.polygons
-            if (p.layer, p.datatype) == mte_pair and len(p.points) <= 8
-        ]
-        compact = [p for p in ext_polys if len(p.points) == 5]
-        self.assertTrue(compact, msg="expected 5-vertex reshaped extension in export")
-        wild = [p for p in cell.polygons if (p.layer, p.datatype) == mte_pair and len(p.points) > 20 and abs(p.area()) < 2000]
-        self.assertFalse(wild, msg="wild extension stub should be stripped from export")
+        for index in COLLAR_EXTEND_INDICES:
+            frame_asm = self.ctx["frame_assemblies"][index]
+            res = self.ctx["res_list"][index]
+            attach_preserved_filter_interconnect(
+                frame_asm,
+                res,
+                self.ctx["identification"],
+                self.ctx["layermap"],
+            )
+            mte_only = MteRtegAssembly(
+                frame_asm,
+                self.all_mte[index],
+                layermap=self.ctx["layermap"],
+                mbe_extension=self.all_mbe[index],
+                mbe_body=None,
+            ).flatten()
+            full = MteRtegAssembly(
+                frame_asm,
+                self.all_mte[index],
+                layermap=self.ctx["layermap"],
+                mbe_extension=self.all_mbe[index],
+                mbe_body=self.all_body[index],
+            ).flatten()
 
-    def test_collar_extend_produces_reshaped_extension(self):
+            def mte_keys(cell: object) -> set[tuple[float, ...]]:
+                return {
+                    _polygon_key(p)
+                    for p in cell.polygons
+                    if (p.layer, p.datatype) == mte_pair
+                }
+
+            self.assertEqual(
+                mte_keys(mte_only),
+                mte_keys(full),
+                msg=f"index {index}: step 6.2 must not add or remove MTE polygons",
+            )
+
+    def test_collar_extend_export_preserves_mte_collar(self):
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        for index in COLLAR_EXTEND_INDICES:
+            frame_asm = self.ctx["frame_assemblies"][index]
+            res = self.ctx["res_list"][index]
+            attach_preserved_filter_interconnect(
+                frame_asm,
+                res,
+                self.ctx["identification"],
+                self.ctx["layermap"],
+            )
+            asm = MteRtegAssembly(
+                frame_asm,
+                self.all_mte[index],
+                layermap=self.ctx["layermap"],
+                mbe_extension=self.all_mbe[index],
+                mbe_body=self.all_body[index],
+            )
+            keepers = asm._preserved_mte_collar_keepers()
+            if not keepers:
+                continue
+            cell = asm.flatten()
+            mte_polys = [
+                p for p in cell.polygons if (p.layer, p.datatype) == mte_pair
+            ]
+            self.assertTrue(
+                any(asm._polygon_matches_any(p, keepers) for p in mte_polys),
+                msg=f"index {index}: preserved MTE collar missing from export",
+            )
+
+    def test_collar_extend_does_not_store_fabricated_mte(self):
         for index in COLLAR_EXTEND_INDICES:
             body = self.all_body[index]
-            self.assertIsNotNone(body.mte_extension, msg=f"index {index}")
-            self.assertLessEqual(
-                len(body.mte_extension.points),
-                8,
-                msg=f"index {index}: expected compact polygon",
+            self.assertIsNone(
+                body.mte_extension,
+                msg=f"index {index}: step 6.2 must not replace filter MTE",
             )
 
 

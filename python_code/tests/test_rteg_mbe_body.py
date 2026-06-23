@@ -486,7 +486,7 @@ class TestMbeBodyKB331(unittest.TestCase):
         for index in CENTER_PAD_INDICES:
             self.assertGreater(merged[index].n_pieces, 0, msg=f"index {index}")
 
-    def test_export_full_rteg_gds_writes_all_indices_with_routed_suffix(self):
+    def test_export_full_rteg_gds_writes_one_gds_per_resonator(self):
         merged_body = merge_mbe_bodies(self.all_body, self.center_pad_body)
         with tempfile.TemporaryDirectory() as tmp:
             results = export_full_rteg_gds(
@@ -504,9 +504,11 @@ class TestMbeBodyKB331(unittest.TestCase):
             by_index = {r.index: r for r in results}
             for index in CENTER_PAD_INDICES:
                 self.assertTrue(
-                    by_index[index].path.name.endswith("_routed.gds"),
+                    by_index[index].path.name.endswith(".gds"),
                     msg=f"index {index}",
                 )
+                self.assertNotIn("_mte_routed", by_index[index].path.name)
+                self.assertNotIn("_mbe_body", by_index[index].path.name)
                 lib = gdstk.read_gds(by_index[index].path)
                 polys = [p for cell in lib.cells for p in cell.flatten().polygons]
                 layers = {(p.layer, p.datatype) for p in polys}

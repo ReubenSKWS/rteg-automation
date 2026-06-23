@@ -93,10 +93,9 @@ Tests: `python_code/tests/` (KB331 fixtures in `kb331_pipeline.py`).
 
 **Outputs** (`python_code/draft_output/`):
 
-- `original_rteg/` ΓÇö step-4 framed layouts (no routing).
-- `MTE_generated_deterministic/` (notebook path) ΓÇö incremental exports with MTE/MBE routing.
+- `route_outputs/` — one complete GDS per resonator after the full pipeline (steps 4–6.3).
 
-Filenames: `{parent}_RTEG1_{index:02d}_{inst_name}_*.gds` + matching `.lyp`.
+Filenames: `{parent}_RTEG1_{index:02d}_{inst_name}.gds` (+ `.lyp` for KLayout layer names).
 
 ---
 

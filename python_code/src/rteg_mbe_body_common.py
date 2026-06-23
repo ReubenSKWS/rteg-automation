@@ -18,6 +18,8 @@ class MbeBodyResult:
     n_pieces: int
     drc_violations: list[str] = field(default_factory=list)
     absorbed_mbe: list[gdstk.Polygon] = field(default_factory=list)
+    mte_extension: gdstk.Polygon | None = None
+    replaced_mte_extension: gdstk.Polygon | None = None
 
 
 def empty_mbe_body_result(*, violations: list[str] | None = None) -> MbeBodyResult:

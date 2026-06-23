@@ -37,6 +37,22 @@ Point = tuple[float, float]
 Edge = tuple[Point, Point]
 
 
+def _bbox_intersects(
+    a: tuple[tuple[float, float], tuple[float, float]],
+    b: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    margin_um: float = 0.0,
+) -> bool:
+    (ax0, ay0), (ax1, ay1) = a
+    (bx0, by0), (bx1, by1) = b
+    return not (
+        ax1 + margin_um < bx0 - margin_um
+        or bx1 + margin_um < ax0 - margin_um
+        or ay1 + margin_um < by0 - margin_um
+        or by1 + margin_um < ay0 - margin_um
+    )
+
+
 @dataclass(frozen=True)
 class MteBuildConfig:
     """Tunable parameters for step 5.3 MTE collar extensions."""
@@ -1575,6 +1591,38 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
+    def _strip_mbe_merged_into_route(
+        self,
+        cell: gdstk.Cell,
+        routed_net: gdstk.Polygon,
+        *,
+        overlap_fraction: float = 0.85,
+        boolean_precision: float = 1e-3,
+    ) -> None:
+        """Drop preserved MBE polygons already merged into the routed net."""
+        if self.layermap is None:
+            return
+        mbe_pair = self.layermap.pair("BAW_MBE")
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mbe_pair:
+                keep.append(poly)
+                continue
+            overlap = gdstk.boolean(
+                poly, routed_net, "and", precision=boolean_precision
+            )
+            poly_area = abs(poly.area())
+            if (
+                overlap
+                and poly_area > 1e-6
+                and sum(abs(p.area()) for p in overlap) / poly_area
+                >= overlap_fraction
+            ):
+                continue
+            keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
     def _strip_mte_merged_into_route(
         self,
         cell: gdstk.Cell,
@@ -1607,6 +1655,60 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
+    def _strip_mte_extension_stub(
+        self,
+        cell: gdstk.Cell,
+        replaced: gdstk.Polygon,
+        *,
+        reshaped: gdstk.Polygon | None = None,
+        overlap_fraction: float = 0.15,
+        max_extension_area_um2: float = 6000.0,
+        boolean_precision: float = 1e-3,
+    ) -> None:
+        """Drop preserved MTE extension stubs replaced by step 6.2 reshape."""
+        if self.layermap is None:
+            return
+        mte_pair = self.layermap.pair("BAW_MTE")
+        targets = [replaced]
+        if reshaped is not None:
+            targets.append(reshaped)
+        reshaped_bbox = reshaped.bounding_box() if reshaped is not None else None
+        keep: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mte_pair:
+                keep.append(poly)
+                continue
+            poly_area = abs(poly.area())
+            drop = False
+            for target in targets:
+                overlap = gdstk.boolean(
+                    poly, target, "and", precision=boolean_precision
+                )
+                if (
+                    overlap
+                    and poly_area > 1e-6
+                    and sum(abs(p.area()) for p in overlap) / poly_area
+                    >= overlap_fraction
+                ):
+                    drop = True
+                    break
+            if (
+                not drop
+                and reshaped_bbox is not None
+                and len(poly.points) > 20
+                and poly_area <= max_extension_area_um2
+            ):
+                poly_bbox = poly.bounding_box()
+                if poly_bbox is not None and _bbox_intersects(
+                    poly_bbox, reshaped_bbox, margin_um=2.0
+                ):
+                    drop = True
+            if drop:
+                continue
+            keep.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*keep)
+
     def flatten(self) -> gdstk.Cell:
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
         if self.mbe_body is not None and getattr(self.mbe_body, "n_pieces", 0) > 0:
@@ -1623,10 +1725,24 @@ class MteRtegAssembly:
         if self.layermap is not None and self.mbe_extension is not None:
             mbe_net = self.mbe_extension.routed_net or self.mbe_extension.extension
             if mbe_net is not None and self.mbe_extension.n_extensions > 0:
+                self._strip_mbe_merged_into_route(cell, mbe_net)
                 tagged = assign_layer(mbe_net, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
         if self.layermap is not None and self.mbe_body is not None:
             body = self.mbe_body
+            reshaped_mte = getattr(body, "mte_extension", None)
+            if reshaped_mte is not None:
+                replaced = getattr(body, "replaced_mte_extension", None) or reshaped_mte
+                self._strip_mte_extension_stub(
+                    cell,
+                    replaced,
+                    reshaped=reshaped_mte,
+                    overlap_fraction=0.15,
+                )
+                tagged = assign_layer(reshaped_mte, self.layermap, "BAW_MTE")
+                cell.add(
+                    gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype)
+                )
             if getattr(body, "cap", None) is not None:
                 tagged = assign_layer(body.cap, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))

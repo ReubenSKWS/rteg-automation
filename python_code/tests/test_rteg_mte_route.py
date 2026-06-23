@@ -66,7 +66,7 @@ class TestMteRouteSynthetic(unittest.TestCase):
         parts = PreservedMteParts(
             collar=collar,
             extension=extension,
-            merge_polys=(collar, extension),
+            merge_polys=(extension,),
         )
         draw = CollarExtensionDraw(
             polygon=extension,
@@ -98,6 +98,49 @@ class TestMteRouteSynthetic(unittest.TestCase):
         inter = gdstk.boolean(stretched, pad, "and", precision=cfg.boolean_precision)
         self.assertTrue(inter)
         self.assertGreater(sum(abs(p.area()) for p in inter), 0.01)
+
+    def test_merge_uses_extension_stub_not_collar(self):
+        cfg = MteRouteConfig()
+        pad = gdstk.rectangle((0.0, 40.0), (12.0, 60.0), layer=2, datatype=0)
+        collar = gdstk.rectangle((54.0, 35.0), (80.0, 65.0), layer=5, datatype=0)
+        extension = gdstk.Polygon(
+            [(50.0, 40.0), (50.0, 60.0), (54.0, 60.0), (54.0, 40.0)],
+            layer=5,
+            datatype=0,
+        )
+        route = gdstk.Polygon(
+            [(12.0, 40.0), (12.0, 60.0), (54.0, 60.0), (54.0, 40.0)],
+            layer=5,
+            datatype=0,
+        )
+        merged_ext = merge_mte_route_with_extensions(
+            route, [extension], boolean_precision=cfg.boolean_precision
+        )
+        merged_both = merge_mte_route_with_extensions(
+            route,
+            [collar, extension],
+            boolean_precision=cfg.boolean_precision,
+        )
+        collar_area = abs(collar.area())
+        ext_only_overlap = gdstk.boolean(
+            merged_ext, collar, "and", precision=cfg.boolean_precision
+        )
+        both_overlap = gdstk.boolean(
+            merged_both, collar, "and", precision=cfg.boolean_precision
+        )
+        ext_frac = (
+            sum(abs(p.area()) for p in ext_only_overlap) / collar_area
+            if ext_only_overlap
+            else 0.0
+        )
+        both_frac = (
+            sum(abs(p.area()) for p in both_overlap) / collar_area
+            if both_overlap
+            else 0.0
+        )
+        self.assertLess(ext_frac, 0.1)
+        self.assertGreater(both_frac, 0.9)
+        self.assertGreater(abs(merged_both.area()), abs(merged_ext.area()))
 
 
 class TestMteRouteKB331(unittest.TestCase):
@@ -209,6 +252,7 @@ class TestMteRouteKB331(unittest.TestCase):
             self.assertIsNotNone(result.routed_net)
             self.assertEqual(result.n_extensions, 1)
             assert result.route_draw is not None
+            assert result.routed_net is not None
             self.assertGreaterEqual(
                 result.route_draw.pad_overlap_um2,
                 self.route_cfg.min_pad_overlap_um2,
@@ -219,6 +263,16 @@ class TestMteRouteKB331(unittest.TestCase):
                 gdstk.boolean(
                     quad, pads, "and", precision=self.route_cfg.boolean_precision
                 )
+            )
+            parts = identify_preserved_mte_parts(
+                self.extensions[index].preserved_collar_polygons,
+                self.all_roles[index].resonator_body_mte,
+                boolean_precision=self.route_cfg.boolean_precision,
+            )
+            self.assertEqual(
+                parts.merge_polys,
+                (parts.extension,),
+                msg=f"index {index}: only extension stub may boolean-merge",
             )
 
     def test_index1_extension_corner_attach(self):
@@ -237,7 +291,7 @@ class TestMteRouteKB331(unittest.TestCase):
             )
         merged = merge_mte_route_with_extensions(
             result.route_draw.route_polygon,
-            base.preserved_collar_polygons,
+            [base.extension],
             boolean_precision=self.route_cfg.boolean_precision,
         )
         inter = gdstk.boolean(

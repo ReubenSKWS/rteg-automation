@@ -637,7 +637,7 @@ class TestMbeBodyKB331(unittest.TestCase):
             - 0.5
         )
         for index in COLLAR_EXTEND_INDICES:
-            mte_ext = self.all_mte[index].extension
+            mte_ext = self.all_body[index].mte_extension or self.all_mte[index].extension
             if mte_ext is None:
                 continue
             gap = _min_stadium_gap_outside_bridge(

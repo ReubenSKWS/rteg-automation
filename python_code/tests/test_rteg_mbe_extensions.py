@@ -28,11 +28,11 @@ from rteg_mbe_extensions import (
 from rteg_mte_extensions import MteBuildConfig, build_mte_extensions, export_mte_extensions_gds
 
 COLLAR_EXTEND_INDICES = (0, 2, 5, 7)
-SKIP_INDICES = (1, 3, 4, 6)
+CENTER_PAD_INDICES = (1, 3, 4, 6)
 
 # Golden collar hits after fillet-cluster detection + Y-sweep stretch (KB331).
 KB331_EXPECTED_HITS: dict[int, tuple[tuple[float, float], tuple[float, float]]] = {
-    0: ((180.192, 314.858), (159.256, 262.000)),
+    0: ((172.422, 314.858), (151.486, 262.000)),
     2: ((186.731, 318.124), (148.844, 304.932)),
     5: ((193.239, 337.052), (159.797, 293.302)),
     7: ((157.084, 267.576), (176.857, 236.142)),
@@ -235,8 +235,15 @@ class TestMbeExtensionsKB331(unittest.TestCase):
             )
             _assert_connection_draw(self, result.connection_draw, index=index)
 
-        for index in SKIP_INDICES:
-            self.assertEqual(self.extensions[index].n_extensions, 0)
+    def test_center_pad_indices_not_routed(self):
+        for index in CENTER_PAD_INDICES:
+            result = self.extensions[index]
+            classification = self.all_classify[index]
+            self.assertTrue(classification.collar_orientation.mte_faces_center)
+            self.assertEqual(classification.mte_route_target, "center_pad")
+            self.assertEqual(result.n_extensions, 0, f"index {index}")
+            self.assertIsNone(result.extension)
+            self.assertIsNone(result.connection_draw)
 
     def test_kb331_collar_extend_hits(self):
         for index, (expected_a, expected_b) in KB331_EXPECTED_HITS.items():
@@ -277,7 +284,7 @@ class TestMbeExtensionsKB331(unittest.TestCase):
     def test_overview_rows_have_connection_fields(self):
         rows = mbe_extensions_overview_rows(self.extensions)
         active = [r for r in rows if r["n_extensions"] == 1]
-        self.assertGreaterEqual(len(active), 4)
+        self.assertEqual(len(active), len(COLLAR_EXTEND_INDICES))
         for row in active:
             self.assertIsNotNone(row["point_a"])
             self.assertIsNotNone(row["point_b"])

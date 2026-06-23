@@ -33,7 +33,9 @@ from rteg_mbe_body_center_pad import (
     mbe_body_center_pad_applies,
 )
 from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
+from rteg_mte_extension_shape import retrace_mte_extension_along_collar
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
+from rteg_mte_route import MteRouteConfig, identify_preserved_mte_parts
 
 Point = tuple[float, float]
 
@@ -557,6 +559,7 @@ def build_mbe_body_keepouts(
     cfg: MbeBodyConfig | None = None,
     *,
     mte_result: MteExtensionResult | None = None,
+    mte_extension: gdstk.Polygon | None = None,
 ) -> list[gdstk.Polygon]:
     """Stadium, release-hole, and routed-signal clearance zones for step 6.2.
 
@@ -566,7 +569,8 @@ def build_mbe_body_keepouts(
     c = cfg or MbeBodyConfig()
     keepouts: list[gdstk.Polygon] = []
 
-    mte_extension = mte_result.extension if mte_result is not None else None
+    if mte_extension is None and mte_result is not None:
+        mte_extension = mte_result.extension
     mte_routed_net = mte_result.routed_net if mte_result is not None else None
     mte_obstacles = mte_route_obstacle_polys(
         roles.resonator_body_mte,
@@ -638,11 +642,28 @@ def build_mbe_body_collar_extend(
     if base_filler is None:
         return _empty_mbe_body_result(violations=["missing step-4 MBE width filler"])
 
-    mte_ext = mte_result.extension
-    if mte_ext is None or mte_result.extension_draw is None:
+    wild_mte_ext = mte_result.extension
+    if wild_mte_ext is None or mte_result.extension_draw is None:
         return _empty_mbe_body_result(violations=["missing preserved MTE interconnect"])
 
     violations: list[str] = []
+    preserved_polys = [tp.polygon for tp in roles.preserved.mte]
+    parts = identify_preserved_mte_parts(
+        preserved_polys,
+        roles.resonator_body_mte,
+        boolean_precision=c.boolean_precision,
+    )
+    reshaped_mte, reshape_violations = retrace_mte_extension_along_collar(
+        parts,
+        mte_result.extension_draw,
+        roles.resonator_body_mte,
+        wild_mte_ext,
+        layermap,
+        route_cfg=MteRouteConfig(boolean_precision=c.boolean_precision),
+    )
+    violations.extend(reshape_violations)
+    mte_ext = reshaped_mte or wild_mte_ext
+
     cap = draw_mbe_cap_on_mte_extension(
         mte_ext,
         mte_result.extension_draw,
@@ -657,7 +678,13 @@ def build_mbe_body_collar_extend(
     if mbe_signal is not None:
         signal_route = mbe_signal.routed_net or mbe_signal.extension
 
-    keepouts = build_mbe_body_keepouts(roles, signal_route, c, mte_result=mte_result)
+    keepouts = build_mbe_body_keepouts(
+        roles,
+        signal_route,
+        c,
+        mte_result=mte_result,
+        mte_extension=mte_ext,
+    )
     carved, filler_violations = build_mbe_body_filler(base_filler, keepouts, c)
     violations.extend(filler_violations)
 
@@ -686,6 +713,8 @@ def build_mbe_body_collar_extend(
         routed_net=export_polys,
         n_pieces=len(export_polys),
         drc_violations=violations,
+        mte_extension=reshaped_mte,
+        replaced_mte_extension=wild_mte_ext if reshaped_mte is not None else None,
     )
 
 

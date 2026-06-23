@@ -1,9 +1,12 @@
 ﻿"""
-Step 6.1 ΓÇö MBE pad-to-collar connection for ``collar_extend`` resonators.
+Step 6.1 — MBE pad-to-collar connection.
 
-Four-sided connector: pad right edge on the left, straight lines from the top
-and bottom pad corners to collar bends on the pad-facing side, and a straight
-line between those two collar points on the right.
+Applies only when MTE does **not** face the center pad (``collar_extend`` /
+``mte_faces_center == false``). Resonators routed by step 5.4 (``center_pad``)
+are skipped — MTE already carries signal to the pad.
+
+Draws a four-sided connector tracing the preserved MBE collar mouth edge from
+the center signal pad TR/BR corners.
 """
 from __future__ import annotations
 
@@ -19,10 +22,25 @@ from rteg_collect import (
     PreservedMetal,
     RtegGeometryRoles,
     TaggedPolygon,
+    polys_touch,
     preserved_mbe_overlap_with_body,
 )
+from rteg_mte_extensions import (
+    _associated_edge_collars_from_pieces,
+    _is_stadium_collar,
+    select_extension_collar_from_pieces,
+)
+from rteg_mte_route import (
+    MteRouteConfig,
+    PreservedMteParts,
+    _polygon_key,
+    collar_extension_junction_corners,
+    junction_route_corners_for_merge,
+    merge_pad_route_with_preserved,
+    merge_mte_route_with_extensions,
+    _union_pad_bbox,
+)
 from rteg_mte_extensions import select_extension_collar_from_pieces
-from rteg_mte_route import _union_pad_bbox
 from rteg_utils import assign_layer
 
 Point = tuple[float, float]
@@ -51,6 +69,9 @@ class MbeConnectionConfig:
 
     mbe_layer: str = "BAW_MBE"
     boolean_precision: float = 1e-3
+    boundary_tolerance_um: float = 0.15
+    pad_touch_overlap_um: float = 0.5
+    junction_merge_inset_um: float = 0.5
     min_collar_overlap_um2: float = 1.0
     stadium_collar_area_um2: float = 2500.0
     max_edge_collar_area_um2: float = 800.0
@@ -85,8 +106,8 @@ class MbeExtensionResult:
 
 
 def mbe_extension_applies(classification: NodeClassification) -> bool:
-    """Step 6.1 applies when preserved MTE does not face center."""
-    return not classification.collar_orientation.mte_faces_center
+    """Step 6.1 applies only when step 5.4 does not route MTE to the pad."""
+    return classification.mte_route_target == "collar_extend"
 
 
 def _fmt_point(p: Point | None) -> str | None:
@@ -684,6 +705,139 @@ def select_extension_collar_mbe(
     )
 
 
+def identify_preserved_mbe_parts(
+    preserved_mbe_polys: Sequence[gdstk.Polygon],
+    body_mbe_polys: Sequence[gdstk.Polygon],
+    *,
+    signal_polys: Sequence[gdstk.Polygon] | None = None,
+    cfg: MbeConnectionConfig | None = None,
+) -> PreservedMteParts:
+    """
+    Split frame MBE into resonator-mouth collar and interconnect extension stub.
+
+    Same rules as step 5.4 MTE part identification, on preserved ``BAW_MBE``.
+    """
+    c = cfg or MbeConnectionConfig()
+    if not preserved_mbe_polys:
+        raise ValueError("no preserved MBE polygons on frame")
+
+    tagged = [
+        TaggedPolygon(f"preserved_mbe[{i}]", c.mbe_layer, poly)
+        for i, poly in enumerate(preserved_mbe_polys)
+    ]
+    if signal_polys:
+        ext_tp = select_extension_collar_mbe(
+            PreservedMetal(mte=[], mbe=tagged),
+            body_mbe_polys,
+            c,
+            signal_polys=signal_polys,
+        )
+    else:
+        ext_tp = select_extension_collar_from_pieces(
+            tagged,
+            body_mbe_polys,
+            preserved_mbe_overlap_with_body,
+            c,
+        )
+    if ext_tp is None:
+        raise ValueError("no preserved MBE extension on frame")
+    extension = ext_tp.polygon
+
+    stadiums = [tp for tp in tagged if _is_stadium_collar(tp.polygon, c)]
+    associated = _associated_edge_collars_from_pieces(tagged, c)
+    collar_poly: gdstk.Polygon | None = None
+
+    if associated:
+        extension = associated[0].polygon
+        for stadium in stadiums:
+            if polys_touch(
+                stadium.polygon,
+                extension,
+                precision=c.boolean_precision,
+                min_overlap_um2=0.01,
+            ):
+                collar_poly = stadium.polygon
+                break
+
+    if collar_poly is None and stadiums:
+        for stadium in stadiums:
+            for tp in tagged:
+                if _polygon_key(tp.polygon) == _polygon_key(stadium.polygon):
+                    continue
+                if polys_touch(
+                    tp.polygon,
+                    stadium.polygon,
+                    precision=c.boolean_precision,
+                    min_overlap_um2=0.01,
+                ):
+                    collar_poly = stadium.polygon
+                    extension = tp.polygon
+                    break
+            if collar_poly is not None:
+                break
+
+    if collar_poly is None and stadiums:
+        collar_poly = min(stadiums, key=lambda tp: abs(tp.polygon.area())).polygon
+
+    return PreservedMteParts(
+        collar=collar_poly,
+        extension=extension,
+        merge_polys=(extension,),
+    )
+
+
+def draw_mbe_center_pad_connection(
+    parts: PreservedMteParts,
+    signal_polys: Sequence[gdstk.Polygon],
+    body_mbe_polys: Sequence[gdstk.Polygon],
+    layermap: LayerMap,
+    cfg: MbeConnectionConfig | None = None,
+) -> tuple[gdstk.Polygon, gdstk.Polygon, MbeConnectionDraw]:
+    """
+    ``mbeConn`` quad from pad TR/BR to the extension–collar junction, then merge
+    the route with the preserved extension stub only (collar stays separate).
+
+    Returns ``(route_quad, merged_net, draw)``.
+    """
+    c = cfg or MbeConnectionConfig()
+    route_cfg = MteRouteConfig(
+        boolean_precision=c.boolean_precision,
+        boundary_tolerance_um=c.boundary_tolerance_um,
+        pad_touch_overlap_um=c.pad_touch_overlap_um,
+        junction_merge_inset_um=c.junction_merge_inset_um,
+    )
+    vtb_up, vtb_dn = _pad_corners_tr_br(signal_polys)
+    overlap = c.pad_touch_overlap_um
+    vtb_up = (vtb_up[0] - overlap, vtb_up[1])
+    vtb_dn = (vtb_dn[0] - overlap, vtb_dn[1])
+    hit_up, hit_dn = collar_extension_junction_corners(
+        parts, body_mbe_polys, route_cfg
+    )
+
+    layer, datatype = layermap.pair(c.mbe_layer)
+    route_quad = tag_baw_mbe(
+        gdstk.Polygon(
+            [vtb_dn, vtb_up, hit_up, hit_dn], layer=layer, datatype=datatype
+        ),
+        layermap,
+    )
+    merged = merge_pad_route_with_preserved(
+        route_quad,
+        parts,
+        hit_up,
+        hit_dn,
+        route_cfg,
+    )
+    merged = tag_baw_mbe(merged, layermap)
+    draw = MbeConnectionDraw(
+        point_a=vtb_up,
+        point_b=vtb_dn,
+        hit_a=hit_up,
+        hit_b=hit_dn,
+    )
+    return route_quad, merged, draw
+
+
 def _empty_mbe_result(preserved: PreservedMetal) -> MbeExtensionResult:
     return MbeExtensionResult(
         collar=None,
@@ -734,17 +888,9 @@ def _extension_for_roles(
 ) -> MbeExtensionResult:
     preserved = roles.preserved
     signal_polys = [tp.polygon for tp in classification.center_pad_polygons()]
-    collar_tp = select_extension_collar_mbe(
-        preserved,
-        roles.resonator_body_mbe,
-        cfg,
-        signal_polys=signal_polys or None,
-    )
-    if collar_tp is None:
-        return _empty_mbe_result(preserved)
     if not signal_polys:
         return MbeExtensionResult(
-            collar=collar_tp,
+            collar=None,
             extension=None,
             routed_net=None,
             preserved_collar_polygons=[tp.polygon for tp in preserved.mbe],
@@ -752,6 +898,15 @@ def _extension_for_roles(
             connection_draw=None,
             drc_violations=["no center signal pad geometry"],
         )
+
+    collar_tp = select_extension_collar_mbe(
+        preserved,
+        roles.resonator_body_mbe,
+        cfg,
+        signal_polys=signal_polys,
+    )
+    if collar_tp is None:
+        return _empty_mbe_result(preserved)
 
     connection, draw = draw_mbe_pad_connection(collar_tp, signal_polys, layermap, cfg)
 
@@ -836,7 +991,9 @@ __all__ = [
     "PDK6_MBE_GDS_PAIR",
     "build_mbe_extension",
     "build_mbe_extensions",
+    "draw_mbe_center_pad_connection",
     "draw_mbe_pad_connection",
+    "identify_preserved_mbe_parts",
     "mbe_extension_applies",
     "mbe_extensions_overview_rows",
     "select_extension_collar_mbe",

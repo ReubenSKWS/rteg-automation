@@ -3,7 +3,8 @@ Step 5.4 — MTE pad routing for center-pad targets.
 
 When ``mte_route_target == "center_pad"``, build ``mteConn`` from the signal
 pad top-right / bottom-right corners to the junction where the filter MTE
-extension meets the MTE collar, then boolean-merge route + extension + collar.
+extension meets the MTE collar, then boolean-merge route + extension stub
+(never the collar — collar stays a separate polygon).
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from rteg_classify import NodeClassification
 from rteg_collect import (
     RtegGeometryRoles,
     TaggedPolygon,
+    polys_associated,
     polys_touch,
     preserved_mte_overlap_with_body,
 )
@@ -47,6 +49,7 @@ class MteRouteConfig:
 
     mte_layer: str = "BAW_MTE"
     pad_touch_overlap_um: float = 0.5
+    junction_merge_inset_um: float = 0.5
     collar_merge_inset_um: float = 4.0
     min_pad_overlap_um2: float = 0.01
     min_mouth_span_fraction: float = 0.5
@@ -83,6 +86,7 @@ class PreservedMteParts:
     collar: gdstk.Polygon | None
     extension: gdstk.Polygon
     merge_polys: tuple[gdstk.Polygon, ...]
+    """Extension stub(s) only — pad routes boolean-merge with these, never the collar."""
 
 
 @dataclass(frozen=True)
@@ -354,7 +358,7 @@ def identify_preserved_mte_parts(
     return PreservedMteParts(
         collar=collar_poly,
         extension=extension,
-        merge_polys=tuple(preserved_mte_polys),
+        merge_polys=(extension,),
     )
 
 
@@ -469,13 +473,151 @@ def preserved_extension_attach_corners(
     return collar_extension_junction_corners(parts, body_mte_polys, cfg)
 
 
+def _probe_overlaps_polygon(
+    point: Point,
+    polygon: gdstk.Polygon,
+    *,
+    boolean_precision: float,
+    probe_half_um: float,
+) -> bool:
+    probe = gdstk.rectangle(
+        (point[0] - probe_half_um, point[1] - probe_half_um),
+        (point[0] + probe_half_um, point[1] + probe_half_um),
+    )
+    return bool(gdstk.boolean(probe, polygon, "and", precision=boolean_precision))
+
+
+def _inset_junction_corner_for_merge(
+    corner: Point,
+    extension: gdstk.Polygon,
+    *,
+    cfg: MteRouteConfig,
+    junction_peer: Point | None = None,
+) -> Point:
+    """
+    Nudge a junction corner slightly into ``extension`` so the route quad shares
+    area with preserved metal (edge-only contact does not boolean-merge).
+    """
+    inset_um = cfg.junction_merge_inset_um
+    if inset_um <= 0.0:
+        return corner
+
+    bb = extension.bounding_box()
+    tol = cfg.boundary_tolerance_um
+    if bb is not None:
+        (x0, y0), (x1, y1) = bb
+        axis_trials: list[Point] = []
+        if abs(corner[0] - x0) <= tol:
+            axis_trials.append((corner[0] + inset_um, corner[1]))
+        if abs(corner[0] - x1) <= tol:
+            axis_trials.append((corner[0] - inset_um, corner[1]))
+        if abs(corner[1] - y0) <= tol:
+            axis_trials.append((corner[0], corner[1] + inset_um))
+        if abs(corner[1] - y1) <= tol:
+            axis_trials.append((corner[0], corner[1] - inset_um))
+        for dx, dy in (
+            (inset_um, 0.0),
+            (-inset_um, 0.0),
+            (0.0, inset_um),
+            (0.0, -inset_um),
+        ):
+            axis_trials.append((corner[0] + dx, corner[1] + dy))
+        for trial in axis_trials:
+            if _probe_overlaps_polygon(
+                trial,
+                extension,
+                boolean_precision=cfg.boolean_precision,
+                probe_half_um=cfg.inside_probe_half_um,
+            ):
+                return trial
+
+    directions: list[tuple[float, float]] = []
+    bb = extension.bounding_box()
+    if bb is not None:
+        cx = (bb[0][0] + bb[1][0]) / 2.0
+        cy = (bb[0][1] + bb[1][1]) / 2.0
+        dx, dy = cx - corner[0], cy - corner[1]
+        length = math.hypot(dx, dy)
+        if length > 1e-9:
+            directions.append((dx / length, dy / length))
+
+    if junction_peer is not None:
+        jx = junction_peer[0] - corner[0]
+        jy = junction_peer[1] - corner[1]
+        length = math.hypot(jx, jy)
+        if length > 1e-9:
+            px, py = -jy / length, jx / length
+            directions.extend([(px, py), (-px, -py)])
+
+    for ux, uy in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
+        directions.append((ux, uy))
+
+    seen: set[tuple[float, float]] = set()
+    unique_dirs: list[tuple[float, float]] = []
+    for ux, uy in directions:
+        key = (round(ux, 6), round(uy, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_dirs.append((ux, uy))
+
+    max_step = inset_um * 8.0
+    for ux, uy in unique_dirs:
+        lo, hi = 0.0, max_step
+        best = corner
+        for _ in range(12):
+            mid = (lo + hi) / 2.0
+            trial = (corner[0] + ux * mid, corner[1] + uy * mid)
+            if _probe_overlaps_polygon(
+                trial,
+                extension,
+                boolean_precision=cfg.boolean_precision,
+                probe_half_um=cfg.inside_probe_half_um,
+            ):
+                best = trial
+                lo = mid
+            else:
+                hi = mid
+        if best != corner:
+            return best
+    return corner
+
+
+def junction_route_corners_for_merge(
+    junction_up: Point,
+    junction_dn: Point,
+    extension: gdstk.Polygon,
+    cfg: MteRouteConfig,
+) -> tuple[Point, Point]:
+    """Route-quad collar-side corners, inset into ``extension`` when needed."""
+    route_up = _inset_junction_corner_for_merge(
+        junction_up,
+        extension,
+        cfg=cfg,
+        junction_peer=junction_dn,
+    )
+    route_dn = _inset_junction_corner_for_merge(
+        junction_dn,
+        extension,
+        cfg=cfg,
+        junction_peer=junction_up,
+    )
+    return _order_attach_corners(route_up, route_dn)
+
+
+def _route_fragment_overlap(frag: gdstk.Polygon, route: gdstk.Polygon, *, precision: float) -> float:
+    inter = gdstk.boolean(frag, route, "and", precision=precision)
+    return sum(abs(p.area()) for p in inter) if inter else 0.0
+
+
 def merge_mte_route_with_extensions(
     route: gdstk.Polygon,
     extension_polys: Sequence[gdstk.Polygon],
     *,
     boolean_precision: float,
+    association_gap_um: float = 0.01,
 ) -> gdstk.Polygon:
-    """Boolean-OR the pad-route quad with all preserved filter MTE pieces."""
+    """Boolean-OR the pad-route quad with preserved extension stub(s) only."""
     if not extension_polys:
         return route
     pieces = [route, *extension_polys]
@@ -484,7 +626,91 @@ def merge_mte_route_with_extensions(
         return route
     if len(merged) == 1:
         return merged[0]
-    return max(merged, key=lambda p: abs(p.area()))
+
+    route_frag = max(
+        merged,
+        key=lambda frag: _route_fragment_overlap(frag, route, precision=boolean_precision),
+    )
+    kept = [route_frag]
+    changed = True
+    while changed:
+        changed = False
+        for frag in merged:
+            if frag in kept:
+                continue
+            if any(
+                polys_associated(
+                    frag,
+                    member,
+                    gap_um=association_gap_um,
+                    precision=boolean_precision,
+                )
+                for member in kept
+            ):
+                kept.append(frag)
+                changed = True
+
+    if len(kept) == 1:
+        return kept[0]
+    remerged = gdstk.boolean(kept, [], "or", precision=boolean_precision)
+    if not remerged:
+        return kept[0]
+    if len(remerged) == 1:
+        return remerged[0]
+    return max(remerged, key=lambda p: abs(p.area()))
+
+
+def _merged_overlap_area(
+    merged: gdstk.Polygon,
+    extension: gdstk.Polygon,
+    *,
+    boolean_precision: float,
+) -> float:
+    inter = gdstk.boolean(merged, extension, "and", precision=boolean_precision)
+    return sum(abs(p.area()) for p in inter) if inter else 0.0
+
+
+def merge_pad_route_with_preserved(
+    route: gdstk.Polygon,
+    parts: PreservedMteParts,
+    junction_up: Point,
+    junction_dn: Point,
+    cfg: MteRouteConfig,
+) -> gdstk.Polygon:
+    """
+    Boolean-merge the pad route with the preserved extension stub.
+
+    The collar polygon is never merged here — it remains a separate piece on the
+    frame. When the route quad only edge-touches the extension (no shared area),
+    rebuild the collar-side corners with a small inset so gdstk can form one net.
+    """
+    merged = merge_mte_route_with_extensions(
+        route,
+        parts.merge_polys,
+        boolean_precision=cfg.boolean_precision,
+    )
+    if _merged_overlap_area(merged, parts.extension, boolean_precision=cfg.boolean_precision) > 0.1:
+        return merged
+
+    route_up, route_dn = junction_route_corners_for_merge(
+        junction_up, junction_dn, parts.extension, cfg
+    )
+    pts = route.points
+    merge_route = gdstk.Polygon(
+        [
+            (float(pts[0][0]), float(pts[0][1])),
+            (float(pts[1][0]), float(pts[1][1])),
+            route_up,
+            route_dn,
+        ],
+        layer=route.layer,
+        datatype=route.datatype,
+    )
+    return merge_mte_route_with_extensions(
+        merge_route,
+        parts.merge_polys,
+        boolean_precision=cfg.boolean_precision,
+    )
 
 
 def _skill_mte_conn_vertices(
@@ -504,7 +730,10 @@ def _skill_mte_conn_vertices(
     vtb_up = (vtb_up[0] - overlap, vtb_up[1])
     vtb_dn = (vtb_dn[0] - overlap, vtb_dn[1])
 
-    mte_up, mte_dn = preserved_extension_attach_corners(parts, body_mte_polys, cfg)
+    junction_up, junction_dn = preserved_extension_attach_corners(
+        parts, body_mte_polys, cfg
+    )
+    mte_up, mte_dn = junction_up, junction_dn
 
     pad_entry = (
         (vtb_dn[0] + vtb_up[0]) / 2.0,
@@ -716,7 +945,6 @@ def build_mte_pad_route(
         roles.resonator_body_mte,
         boolean_precision=c.boolean_precision,
     )
-    merge_polys = list(parts.merge_polys)
 
     route_quad, attachment = stretch_extension_to_pad(
         draw,
@@ -731,10 +959,15 @@ def build_mte_pad_route(
         parts=parts,
     )
     route_quad = assign_layer(route_quad, layermap, c.mte_layer)
-    merged = merge_mte_route_with_extensions(
+    junction_up, junction_dn = preserved_extension_attach_corners(
+        parts, roles.resonator_body_mte, c
+    )
+    merged = merge_pad_route_with_preserved(
         route_quad,
-        merge_polys,
-        boolean_precision=c.boolean_precision,
+        parts,
+        junction_up,
+        junction_dn,
+        c,
     )
     stretched = assign_layer(merged, layermap, c.mte_layer)
     overlap = validate_pad_attachment(
@@ -831,11 +1064,14 @@ __all__ = [
     "collar_extension_junction_corners",
     "collar_mouth_facing_pad",
     "identify_preserved_mte_parts",
+    "junction_route_corners_for_merge",
     "merge_mte_route_with_extensions",
+    "merge_pad_route_with_preserved",
     "mte_route_overview_rows",
     "pick_pad_attachment_edge",
     "pick_route_start",
     "preserved_extension_attach_corners",
     "stretch_extension_to_pad",
     "validate_pad_attachment",
+    "_polygon_key",
 ]

@@ -142,29 +142,6 @@ def find_vias(cell: gdstk.Cell) -> list[gdstk.Reference]:
     ]
 
 
-def group_splits(resonators: list[Resonator]) -> dict[str, list[Resonator]]:
-    """Group split/cascade resonators by base instance name (reserved for step 5)."""
-    groups: dict[str, list[Resonator]] = {}
-    for r in resonators:
-        key = r.split_base or r.inst_name
-        groups.setdefault(key, []).append(r)
-    return groups
-
-
-def vias_near(
-    res: Resonator, vias: list[gdstk.Reference], margin: float = 10.0
-) -> list[gdstk.Reference]:
-    """Vias whose origin falls inside the resonator bbox + margin (reserved for step 5)."""
-    rb = res.reference.cell.bounding_box()
-    if rb is None:
-        return []
-    (rx0, ry0), (rx1, ry1) = rb
-    ox, oy = res.origin
-    x0, y0 = rx0 + ox - margin, ry0 + oy - margin
-    x1, y1 = rx1 + ox + margin, ry1 + oy + margin
-    return [v for v in vias if x0 <= v.origin[0] <= x1 and y0 <= v.origin[1] <= y1]
-
-
 def separate(
     lib: gdstk.Library, variant_only: bool = True
 ) -> dict[str, list[Resonator]]:

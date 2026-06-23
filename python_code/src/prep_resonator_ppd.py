@@ -7,7 +7,6 @@ Returns in-memory ``ResonatorPpdAssembly`` objects for step 4 and export.
 from __future__ import annotations
 
 import math
-import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -208,16 +207,6 @@ def polys_satisfy_clearance(
             if gdstk.boolean(poly, zone, "and"):
                 return False
     return True
-
-
-def metal_satisfies_frame_clearance(
-    metal_polys: Sequence[gdstk.Polygon],
-    keepout_polys: Sequence[gdstk.Polygon],
-    *,
-    min_gap: float = MIN_FRAME_CLEARANCE_UM,
-) -> bool:
-    """True when resonator metal is at least ``min_gap`` from every pad polygon."""
-    return polys_satisfy_clearance(metal_polys, keepout_polys, min_gap=min_gap)
 
 
 def ppd_clearance_satisfied(
@@ -624,12 +613,3 @@ def assemblies_summary_df(
     assemblies: Sequence[ResonatorPpdAssembly],
 ) -> pd.DataFrame:
     return pd.DataFrame([a.summary_row() for a in assemblies])
-
-
-def preview_assembly_svg(assembly: ResonatorPpdAssembly) -> str:
-    """Render one assembly to SVG text for notebook display."""
-    flat = assembly.flatten()
-    with tempfile.TemporaryDirectory() as tmp:
-        svg_path = Path(tmp) / f"{assembly.top_cell.name}.svg"
-        flat.write_svg(str(svg_path))
-        return svg_path.read_text(encoding="utf-8")

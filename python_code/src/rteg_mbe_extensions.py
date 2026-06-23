@@ -22,25 +22,12 @@ from rteg_collect import (
     PreservedMetal,
     RtegGeometryRoles,
     TaggedPolygon,
-    polys_touch,
     preserved_mbe_overlap_with_body,
 )
 from rteg_mte_extensions import (
-    _associated_edge_collars_from_pieces,
-    _is_stadium_collar,
     select_extension_collar_from_pieces,
 )
-from rteg_mte_route import (
-    MteRouteConfig,
-    PreservedMteParts,
-    _polygon_key,
-    collar_extension_junction_corners,
-    junction_route_corners_for_merge,
-    merge_pad_route_with_preserved,
-    merge_mte_route_with_extensions,
-    _union_pad_bbox,
-)
-from rteg_mte_extensions import select_extension_collar_from_pieces
+from rteg_mte_route import _union_pad_bbox
 from rteg_utils import assign_layer
 
 Point = tuple[float, float]
@@ -705,139 +692,6 @@ def select_extension_collar_mbe(
     )
 
 
-def identify_preserved_mbe_parts(
-    preserved_mbe_polys: Sequence[gdstk.Polygon],
-    body_mbe_polys: Sequence[gdstk.Polygon],
-    *,
-    signal_polys: Sequence[gdstk.Polygon] | None = None,
-    cfg: MbeConnectionConfig | None = None,
-) -> PreservedMteParts:
-    """
-    Split frame MBE into resonator-mouth collar and interconnect extension stub.
-
-    Same rules as step 5.4 MTE part identification, on preserved ``BAW_MBE``.
-    """
-    c = cfg or MbeConnectionConfig()
-    if not preserved_mbe_polys:
-        raise ValueError("no preserved MBE polygons on frame")
-
-    tagged = [
-        TaggedPolygon(f"preserved_mbe[{i}]", c.mbe_layer, poly)
-        for i, poly in enumerate(preserved_mbe_polys)
-    ]
-    if signal_polys:
-        ext_tp = select_extension_collar_mbe(
-            PreservedMetal(mte=[], mbe=tagged),
-            body_mbe_polys,
-            c,
-            signal_polys=signal_polys,
-        )
-    else:
-        ext_tp = select_extension_collar_from_pieces(
-            tagged,
-            body_mbe_polys,
-            preserved_mbe_overlap_with_body,
-            c,
-        )
-    if ext_tp is None:
-        raise ValueError("no preserved MBE extension on frame")
-    extension = ext_tp.polygon
-
-    stadiums = [tp for tp in tagged if _is_stadium_collar(tp.polygon, c)]
-    associated = _associated_edge_collars_from_pieces(tagged, c)
-    collar_poly: gdstk.Polygon | None = None
-
-    if associated:
-        extension = associated[0].polygon
-        for stadium in stadiums:
-            if polys_touch(
-                stadium.polygon,
-                extension,
-                precision=c.boolean_precision,
-                min_overlap_um2=0.01,
-            ):
-                collar_poly = stadium.polygon
-                break
-
-    if collar_poly is None and stadiums:
-        for stadium in stadiums:
-            for tp in tagged:
-                if _polygon_key(tp.polygon) == _polygon_key(stadium.polygon):
-                    continue
-                if polys_touch(
-                    tp.polygon,
-                    stadium.polygon,
-                    precision=c.boolean_precision,
-                    min_overlap_um2=0.01,
-                ):
-                    collar_poly = stadium.polygon
-                    extension = tp.polygon
-                    break
-            if collar_poly is not None:
-                break
-
-    if collar_poly is None and stadiums:
-        collar_poly = min(stadiums, key=lambda tp: abs(tp.polygon.area())).polygon
-
-    return PreservedMteParts(
-        collar=collar_poly,
-        extension=extension,
-        merge_polys=(extension,),
-    )
-
-
-def draw_mbe_center_pad_connection(
-    parts: PreservedMteParts,
-    signal_polys: Sequence[gdstk.Polygon],
-    body_mbe_polys: Sequence[gdstk.Polygon],
-    layermap: LayerMap,
-    cfg: MbeConnectionConfig | None = None,
-) -> tuple[gdstk.Polygon, gdstk.Polygon, MbeConnectionDraw]:
-    """
-    ``mbeConn`` quad from pad TR/BR to the extension–collar junction, then merge
-    the route with the preserved extension stub only (collar stays separate).
-
-    Returns ``(route_quad, merged_net, draw)``.
-    """
-    c = cfg or MbeConnectionConfig()
-    route_cfg = MteRouteConfig(
-        boolean_precision=c.boolean_precision,
-        boundary_tolerance_um=c.boundary_tolerance_um,
-        pad_touch_overlap_um=c.pad_touch_overlap_um,
-        junction_merge_inset_um=c.junction_merge_inset_um,
-    )
-    vtb_up, vtb_dn = _pad_corners_tr_br(signal_polys)
-    overlap = c.pad_touch_overlap_um
-    vtb_up = (vtb_up[0] - overlap, vtb_up[1])
-    vtb_dn = (vtb_dn[0] - overlap, vtb_dn[1])
-    hit_up, hit_dn = collar_extension_junction_corners(
-        parts, body_mbe_polys, route_cfg
-    )
-
-    layer, datatype = layermap.pair(c.mbe_layer)
-    route_quad = tag_baw_mbe(
-        gdstk.Polygon(
-            [vtb_dn, vtb_up, hit_up, hit_dn], layer=layer, datatype=datatype
-        ),
-        layermap,
-    )
-    merged = merge_pad_route_with_preserved(
-        route_quad,
-        parts,
-        hit_up,
-        hit_dn,
-        route_cfg,
-    )
-    merged = tag_baw_mbe(merged, layermap)
-    draw = MbeConnectionDraw(
-        point_a=vtb_up,
-        point_b=vtb_dn,
-        hit_a=hit_up,
-        hit_b=hit_dn,
-    )
-    return route_quad, merged, draw
-
-
 def _empty_mbe_result(preserved: PreservedMetal) -> MbeExtensionResult:
     return MbeExtensionResult(
         collar=None,
@@ -920,21 +774,6 @@ def _extension_for_roles(
     )
 
 
-def build_mbe_extension(
-    roles: RtegGeometryRoles,
-    classification: NodeClassification,
-    layermap: LayerMap,
-    config: MbeConnectionConfig | None = None,
-) -> MbeExtensionResult:
-    """Run step 6.1 for a single resonator."""
-    cfg = config or MbeConnectionConfig()
-    if not mbe_extension_applies(classification):
-        return _empty_mbe_result(roles.preserved)
-    if not roles.preserved.mbe:
-        return _empty_mbe_result(roles.preserved)
-    return _extension_for_roles(roles, classification, layermap, cfg)
-
-
 def build_mbe_extensions(
     roles_by_index: Mapping[int, RtegGeometryRoles],
     classifications: Mapping[int, NodeClassification],
@@ -989,11 +828,8 @@ __all__ = [
     "MbeConnectionDraw",
     "MbeExtensionResult",
     "PDK6_MBE_GDS_PAIR",
-    "build_mbe_extension",
     "build_mbe_extensions",
-    "draw_mbe_center_pad_connection",
     "draw_mbe_pad_connection",
-    "identify_preserved_mbe_parts",
     "mbe_extension_applies",
     "mbe_extensions_overview_rows",
     "select_extension_collar_mbe",

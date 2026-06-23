@@ -207,14 +207,6 @@ def _resonator_shift(res: Resonator, assembly: RtegFrameAssembly) -> Point:
     return (rteg_origin[0] - res.origin[0], rteg_origin[1] - res.origin[1])
 
 
-def resonator_body_polys(
-    res: Resonator, assembly: RtegFrameAssembly
-) -> list[gdstk.Polygon]:
-    """Resonator MBE+MTE body polygons in RTEG world space."""
-    dx, dy = _resonator_shift(res, assembly)
-    return resonator_metal_polys(res, dx, dy)
-
-
 def _resonator_rteg_bbox(
     res: Resonator, assembly: RtegFrameAssembly
 ) -> Bbox:
@@ -633,31 +625,6 @@ def preserved_mte_overlap_with_body(
     return overlap
 
 
-def select_preserved_collar_mte(
-    preserved: PreservedMetal,
-    body_mte_polys: Sequence[gdstk.Polygon],
-    *,
-    min_overlap_um2: float = 0.01,
-    precision: float = 1e-3,
-) -> TaggedPolygon | None:
-    """
-    Pick the one preserved MTE collar that overlaps resonator-body MTE.
-
-    Filter connectMTE often yields two pieces (resonator outline + edge collar);
-    only the collar touching the resonator body should receive an extension.
-    """
-    best: TaggedPolygon | None = None
-    best_overlap = 0.0
-    for collar_tp in preserved.mte:
-        overlap = preserved_mte_overlap_with_body(
-            collar_tp.polygon, body_mte_polys, precision=precision
-        )
-        if overlap >= min_overlap_um2 and overlap > best_overlap:
-            best = collar_tp
-            best_overlap = overlap
-    return best
-
-
 def preserved_mbe_overlap_with_body(
     preserved_mbe: gdstk.Polygon,
     body_mbe_polys: Sequence[gdstk.Polygon],
@@ -671,32 +638,6 @@ def preserved_mbe_overlap_with_body(
         if inter:
             overlap = max(overlap, sum(abs(p.area()) for p in inter))
     return overlap
-
-
-def select_preserved_collar_mbe(
-    preserved: PreservedMetal,
-    body_mbe_polys: Sequence[gdstk.Polygon],
-    *,
-    min_overlap_um2: float = 0.01,
-    precision: float = 1e-3,
-) -> TaggedPolygon | None:
-    """
-    Pick the preserved MBE collar for step 6.1 extension.
-
-    Uses the same edge-tab-over-stadium rules as MTE ``select_extension_collar``.
-    """
-    from rteg_mte_extensions import MteBuildConfig, select_extension_collar_from_pieces
-
-    cfg = MteBuildConfig(
-        min_collar_overlap_um2=min_overlap_um2,
-        boolean_precision=precision,
-    )
-    return select_extension_collar_from_pieces(
-        preserved.mbe,
-        body_mbe_polys,
-        preserved_mbe_overlap_with_body,
-        cfg,
-    )
 
 
 def collect_resonator_body_mte(
@@ -970,23 +911,6 @@ def preserved_interconnect_attach_rows(
             }
         )
     return rows
-
-
-def mte_extension_frame_obstacles(
-    roles: RtegGeometryRoles,
-    layermap: LayerMap,
-    config: RtegCollectConfig | None = None,
-) -> list[gdstk.Polygon]:
-    """Die-frame MBE geometry the horizontal MTE cap must not intersect."""
-    cfg = config or RtegCollectConfig()
-    obstacles: list[gdstk.Polygon] = []
-    if roles.frame_boundary.ring is not None:
-        obstacles.append(roles.frame_boundary.ring.polygon)
-    mbe_pair = layermap.pair(cfg.mbe_layer)
-    for tp in roles.ground_plates.all_items():
-        if (tp.polygon.layer, tp.polygon.datatype) == mbe_pair:
-            obstacles.append(tp.polygon)
-    return obstacles
 
 
 def geometry_roles_summary_table(roles: RtegGeometryRoles) -> list[dict[str, object]]:

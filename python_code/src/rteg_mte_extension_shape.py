@@ -1,13 +1,11 @@
 """
-Step 6.2 — simplify preserved filter MTE extension stubs.
+Optional MTE extension simplification helpers (not used in the current pipeline).
 
-Only the extension polygon is modified. Collar and resonator body MTE are never
-touched — the collar polygon is used only to find attachment vertices.
-
-From each collar-intercept corner on the extension, trace one step outward along
-the extension boundary; those two outer vertices are connected with an
-axis-aligned right-angle (horizontal + vertical). The inner mouth stays a
-straight edge between the two collar attachment points.
+``simplify_mte_extension`` and ``retrace_mte_extension_along_collar`` reshape the
+preserved filter MTE extension stub only — collar and resonator body MTE are
+never modified. Intended for future step 6.2 export work; today
+``build_mbe_body_collar_extend`` reads filter MTE as-is and export leaves it
+untouched.
 """
 from __future__ import annotations
 

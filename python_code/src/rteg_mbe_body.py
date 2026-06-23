@@ -1,10 +1,11 @@
 ﻿"""
-Step 6.2 ΓÇö MBE ground body for ``collar_extend`` resonators.
+Step 6.2 — MBE ground body for ``collar_extend`` resonators.
 
-MBE cap on 5.3 MTE extension + carved filler bridge. 
+Draws an MBE cap on the preserved filter MTE extension stub and a carved filler
+bridge. Filter MTE metal is read for geometry only; export leaves it untouched
+(see ``MteRtegAssembly._is_collar_extend_export``).
 
-Step 6.3 lives in
-``rteg_mbe_body_center_pad.py``.
+Step 6.3 (``center_pad``) lives in ``rteg_mbe_body_center_pad.py``.
 """
 from __future__ import annotations
 
@@ -33,9 +34,8 @@ from rteg_mbe_body_center_pad import (
     mbe_body_center_pad_applies,
 )
 from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
-from rteg_mte_extension_shape import retrace_mte_extension_along_collar
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
-from rteg_mte_route import MteRouteConfig, identify_preserved_mte_parts
+from rteg_mte_route import identify_preserved_mte_parts
 
 Point = tuple[float, float]
 
@@ -642,8 +642,7 @@ def build_mbe_body_collar_extend(
     if base_filler is None:
         return _empty_mbe_body_result(violations=["missing step-4 MBE width filler"])
 
-    wild_mte_ext = mte_result.extension
-    if wild_mte_ext is None or mte_result.extension_draw is None:
+    if mte_result.extension_draw is None:
         return _empty_mbe_body_result(violations=["missing preserved MTE interconnect"])
 
     violations: list[str] = []
@@ -653,16 +652,10 @@ def build_mbe_body_collar_extend(
         roles.resonator_body_mte,
         boolean_precision=c.boolean_precision,
     )
-    reshaped_mte, reshape_violations = retrace_mte_extension_along_collar(
-        parts,
-        mte_result.extension_draw,
-        roles.resonator_body_mte,
-        wild_mte_ext,
-        layermap,
-        route_cfg=MteRouteConfig(boolean_precision=c.boolean_precision),
-    )
-    violations.extend(reshape_violations)
-    mte_ext = reshaped_mte or wild_mte_ext
+    # Geometry input only — export does not add or replace MTE (see flatten).
+    mte_ext = parts.extension
+    if mte_ext is None:
+        return _empty_mbe_body_result(violations=["missing preserved MTE interconnect"])
 
     cap = draw_mbe_cap_on_mte_extension(
         mte_ext,
@@ -713,8 +706,8 @@ def build_mbe_body_collar_extend(
         routed_net=export_polys,
         n_pieces=len(export_polys),
         drc_violations=violations,
-        mte_extension=reshaped_mte,
-        replaced_mte_extension=wild_mte_ext if reshaped_mte is not None else None,
+        mte_extension=None,
+        replaced_mte_extension=None,
     )
 
 

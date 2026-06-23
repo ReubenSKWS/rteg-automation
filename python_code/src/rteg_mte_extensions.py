@@ -1462,6 +1462,24 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
+    def _preserved_mte_collar_keepers(self) -> list[gdstk.Polygon]:
+        """Preserved filter MTE collar shells that must survive export unchanged."""
+        from rteg_mte_route import identify_preserved_mte_parts
+
+        try:
+            parts = identify_preserved_mte_parts(
+                self.extension.preserved_collar_polygons,
+                self.extension.resonator_body_mte_polys,
+            )
+        except ValueError:
+            return []
+        if parts.collar is None:
+            return []
+        return [parts.collar]
+
+    def _is_preserved_mte_collar(self, poly: gdstk.Polygon) -> bool:
+        return self._polygon_matches_any(poly, self._preserved_mte_collar_keepers())
+
     def _strip_mte_merged_into_route(
         self,
         cell: gdstk.Cell,
@@ -1474,9 +1492,13 @@ class MteRtegAssembly:
         if self.layermap is None:
             return
         mte_pair = self.layermap.pair("BAW_MTE")
+        collar_keep = self._preserved_mte_collar_keepers()
         keep: list[gdstk.Polygon] = []
         for poly in cell.polygons:
             if (poly.layer, poly.datatype) != mte_pair:
+                keep.append(poly)
+                continue
+            if collar_keep and self._is_preserved_mte_collar(poly):
                 keep.append(poly)
                 continue
             overlap = gdstk.boolean(
@@ -1501,7 +1523,6 @@ class MteRtegAssembly:
         *,
         reshaped: gdstk.Polygon | None = None,
         overlap_fraction: float = 0.15,
-        max_extension_area_um2: float = 6000.0,
         boolean_precision: float = 1e-3,
     ) -> None:
         """Drop preserved MTE extension stubs replaced by step 6.2 reshape."""
@@ -1511,10 +1532,13 @@ class MteRtegAssembly:
         targets = [replaced]
         if reshaped is not None:
             targets.append(reshaped)
-        reshaped_bbox = reshaped.bounding_box() if reshaped is not None else None
+        collar_keep = self._preserved_mte_collar_keepers()
         keep: list[gdstk.Polygon] = []
         for poly in cell.polygons:
             if (poly.layer, poly.datatype) != mte_pair:
+                keep.append(poly)
+                continue
+            if collar_keep and self._is_preserved_mte_collar(poly):
                 keep.append(poly)
                 continue
             poly_area = abs(poly.area())
@@ -1531,17 +1555,6 @@ class MteRtegAssembly:
                 ):
                     drop = True
                     break
-            if (
-                not drop
-                and reshaped_bbox is not None
-                and len(poly.points) > 20
-                and poly_area <= max_extension_area_um2
-            ):
-                poly_bbox = poly.bounding_box()
-                if poly_bbox is not None and _bbox_intersects(
-                    poly_bbox, reshaped_bbox, margin_um=2.0
-                ):
-                    drop = True
             if drop:
                 continue
             keep.append(poly)
@@ -1755,22 +1768,42 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*kept)
 
+    def _is_collar_extend_export(self) -> bool:
+        """Step 6.2: MTE not routed to center pad — leave filter MTE untouched."""
+        return self.extension.routed_net is None and (
+            self.mbe_body is not None
+            and getattr(self.mbe_body, "cap", None) is not None
+        )
+
     def flatten(self) -> gdstk.Cell:
+        # --- center_pad (5.4): strip extra preserved MTE on frame before flatten ---
         if self.extension.routed_net is not None:
             self._strip_preserved_mte_for_pad_route_on_frame()
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
-        if self.mbe_body is not None and getattr(self.mbe_body, "n_pieces", 0) > 0:
+        body = self.mbe_body
+        reshaped_mte = (
+            getattr(body, "mte_extension", None)
+            if body is not None and getattr(body, "n_pieces", 0) > 0
+            else None
+        )
+        if body is not None and getattr(body, "n_pieces", 0) > 0:
             self._strip_raw_filler(cell)
-            absorbed = getattr(self.mbe_body, "absorbed_mbe", None) or []
+            absorbed = getattr(body, "absorbed_mbe", None) or []
             if absorbed:
                 self._strip_absorbed_mbe(cell, absorbed)
+        # --- MTE export: routed net (center_pad) or 5.3 stub (legacy); collar_extend skips ---
         if self.extension.routed_net is not None:
             net = self.extension.routed_net
             self._strip_mte_merged_into_route(cell, net)
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
             self._strip_disconnected_preserved_mte(cell)
             self._strip_complex_preserved_mte(cell)
-        elif self.extension.n_extensions > 0 and self.extension.extension is not None:
+        elif (
+            not self._is_collar_extend_export()
+            and reshaped_mte is None
+            and self.extension.n_extensions > 0
+            and self.extension.extension is not None
+        ):
             net = self.extension.extension
             self._strip_mte_merged_into_route(cell, net)
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
@@ -1780,17 +1813,20 @@ class MteRtegAssembly:
                 self._strip_mbe_merged_into_route(cell, mbe_net)
                 tagged = assign_layer(mbe_net, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
-        if self.layermap is not None and self.mbe_body is not None:
-            body = self.mbe_body
-            reshaped_mte = getattr(body, "mte_extension", None)
-            if reshaped_mte is not None:
-                replaced = getattr(body, "replaced_mte_extension", None) or reshaped_mte
-                self._strip_mte_extension_stub(
-                    cell,
-                    replaced,
-                    reshaped=reshaped_mte,
-                    overlap_fraction=0.15,
+        # --- MBE body (6.2 cap+filler or 6.3 center_pad filler); optional reshaped MTE ---
+        if self.layermap is not None and body is not None and getattr(body, "n_pieces", 0) > 0:
+            if reshaped_mte is not None and not self._is_collar_extend_export():
+                replaced = (
+                    getattr(body, "replaced_mte_extension", None)
+                    or self.extension.extension
                 )
+                if replaced is not None:
+                    self._strip_mte_extension_stub(
+                        cell,
+                        replaced,
+                        reshaped=reshaped_mte,
+                        overlap_fraction=0.15,
+                    )
                 tagged = assign_layer(reshaped_mte, self.layermap, "BAW_MTE")
                 cell.add(
                     gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype)

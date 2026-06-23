@@ -14,8 +14,10 @@ for p in (str(SRC), str(TESTS)):
 
 from kb331_pipeline import load_kb331_pipeline
 from prep_rteg_frame import (
+    DEFAULT_MBE_FILLER_LEFT_GAP_UM,
     DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM,
     assembly_placement_origin,
+    ppd_top_ground_square_right_x,
     resonator_filler_right_shift,
 )
 from rteg_collect import _resonator_rteg_bbox
@@ -91,6 +93,22 @@ class TestPrepRtegFrameKB331(unittest.TestCase):
         )
         self.assertEqual(shift_no_margin, (0.0, 0.0))
         self.assertEqual(shift_with_margin, (0.0, 0.0))
+
+    def test_mbe_filler_left_gap_to_top_ground_square(self) -> None:
+        for idx, asm in enumerate(self.pipeline["frame_assemblies"]):
+            probe_right = ppd_top_ground_square_right_x(
+                asm.ppd_assembly,
+                asm.assembly_origin,
+            )
+            self.assertIsNotNone(probe_right, f"index {idx}: top ground square")
+            filler_x0 = asm.mbe_filler_bbox[0][0]
+            gap = filler_x0 - probe_right
+            self.assertAlmostEqual(
+                gap,
+                DEFAULT_MBE_FILLER_LEFT_GAP_UM,
+                places=1,
+                msg=f"index {idx}: filler left should be 60 µm from top ground square",
+            )
 
 
 if __name__ == "__main__":

@@ -17,12 +17,18 @@ from pathlib import Path
 import gdstk
 import pandas as pd
 
-from prep_resonator_ppd import RESONATOR_METAL_LAYERS, ResonatorPpdAssembly
-from rteg_utils import bbox_center, frame_top_cell, translate_bbox
+from prep_resonator_ppd import (
+    MIN_KEEPOUT_POLY_AREA,
+    RESONATOR_METAL_LAYERS,
+    ResonatorPpdAssembly,
+    ppd_pad_keepout_polys,
+)
+from rteg_utils import bbox_center, frame_top_cell, split_by_y_gaps, translate_bbox
 
 DEFAULT_X_MARGIN_PCT = 0.04
 DEFAULT_Y_MARGIN_PCT = 0.07
 DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM = 10.0
+DEFAULT_MBE_FILLER_LEFT_GAP_UM = 60.0
 MBE_LAYER = 2
 MBE_DATATYPE = 0
 INNER_FRAME_RING_MIN_AREA = 10_000.0
@@ -71,23 +77,6 @@ def _margined_content_bbox(
         (ix0 + x_margin_pct * iw, iy0 + y_margin_pct * ih),
         (ix1 - x_margin_pct * iw, iy1 - y_margin_pct * ih),
     )
-
-
-def frame_content_center(
-    frame_cell: gdstk.Cell,
-    frame_origin: tuple[float, float] = (0.0, 0.0),
-    *,
-    x_margin_pct: float = DEFAULT_X_MARGIN_PCT,
-    y_margin_pct: float = DEFAULT_Y_MARGIN_PCT,
-) -> tuple[float, float]:
-    """Center of the content box after percentage margins inside the inner die frame."""
-    inner_bb = inner_die_frame_bbox(frame_cell, frame_origin)
-    content_bb = _margined_content_bbox(
-        inner_bb,
-        x_margin_pct=x_margin_pct,
-        y_margin_pct=y_margin_pct,
-    )
-    return bbox_center(content_bb)
 
 
 def _resonator_metal_x1_local(assembly: ResonatorPpdAssembly) -> float:
@@ -208,6 +197,43 @@ def _add_placed_ppd_resonator_refs(
     )
 
 
+def ppd_top_ground_square_right_x(
+    assembly: ResonatorPpdAssembly,
+    assembly_origin: tuple[float, float],
+    *,
+    layer: int = MBE_LAYER,
+    datatype: int = MBE_DATATYPE,
+) -> float | None:
+    """
+    Right edge of the top GSG ground probe square in RTEG world coordinates.
+
+    Uses the leftmost top-band MBE pad polygon from the placed PPD frame.
+    """
+    ppd_ref, _ = _assembly_references(assembly)
+    ox, oy = assembly_origin
+    ppd_origin = (ox + ppd_ref.origin[0], oy + ppd_ref.origin[1])
+    pad_polys = [
+        poly
+        for poly in ppd_pad_keepout_polys(ppd_ref.cell, ppd_origin)
+        if poly.layer == layer
+        and poly.datatype == datatype
+        and abs(poly.area()) >= MIN_KEEPOUT_POLY_AREA
+    ]
+    if not pad_polys:
+        return None
+    top_polys, _, _ = split_by_y_gaps(pad_polys)
+    if not top_polys:
+        return None
+    leftmost = min(
+        top_polys,
+        key=lambda poly: poly.bounding_box()[0][0] if poly.bounding_box() else 0.0,
+    )
+    bb = leftmost.bounding_box()
+    if bb is None:
+        return None
+    return bb[1][0]
+
+
 def mbe_width_filler_polygon(
     assembly: ResonatorPpdAssembly,
     assembly_origin: tuple[float, float],
@@ -216,13 +242,15 @@ def mbe_width_filler_polygon(
     *,
     layer: int = MBE_LAYER,
     datatype: int = MBE_DATATYPE,
+    filler_left_gap_um: float = DEFAULT_MBE_FILLER_LEFT_GAP_UM,
 ) -> gdstk.Polygon:
     """
     MBE plate on the right half of the inner die frame.
 
     Height matches the placed GSG/resonator assembly bbox. Its right edge sits
-    at the 4% X margin inside the inner die frame; its left edge is the
-    inner-frame center line.
+    at the 4% X margin inside the inner die frame. Its left edge is the minimum
+    of the inner-frame center line and ``top ground square right + gap`` so the
+    filler sits ``filler_left_gap_um`` from the top GSG ground probe square.
     """
     asm_bb = assembly.top_cell.bounding_box()
     if asm_bb is None:
@@ -235,6 +263,9 @@ def mbe_width_filler_polygon(
     (ix0, _iy0), (ix1, _iy1) = inner_bb
     (_cx0, _cy0), (cx1, _cy1) = content_bb
     filler_x0 = (ix0 + ix1) / 2.0
+    probe_right = ppd_top_ground_square_right_x(assembly, assembly_origin)
+    if probe_right is not None:
+        filler_x0 = min(filler_x0, probe_right + filler_left_gap_um)
     if filler_x0 >= cx1 - 1e-6:
         raise ValueError("Inner frame is too narrow for the MBE width filler")
 
@@ -341,6 +372,7 @@ def prep_rteg_in_frame(
     x_margin_pct: float = DEFAULT_X_MARGIN_PCT,
     y_margin_pct: float = DEFAULT_Y_MARGIN_PCT,
     resonator_filler_right_margin_um: float = DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM,
+    filler_left_gap_um: float = DEFAULT_MBE_FILLER_LEFT_GAP_UM,
 ) -> list[RtegFrameAssembly]:
     """
     Build one die-frame + PPD assembly per step-3 object.
@@ -349,7 +381,8 @@ def prep_rteg_in_frame(
     left-aligned in X (4%) and centered in Y (7%). When needed, only the
     resonator is shifted left to keep its metal clear of the MBE filler right
     edge; the PPD/GSG frame stays fixed. An MBE rectangle fills the right side
-    from the inner-frame center to the margined right edge at the same height
+    from ``top ground square + filler_left_gap_um`` (or the inner-frame center,
+    whichever is further left) to the margined right edge at the same height
     as the placed assembly.
     """
     if not assemblies:
@@ -380,7 +413,11 @@ def prep_rteg_in_frame(
             resonator_filler_right_margin_um=resonator_filler_right_margin_um,
         )
         filler = mbe_width_filler_polygon(
-            ppd_asm, asm_origin, inner_bb, content_bb
+            ppd_asm,
+            asm_origin,
+            inner_bb,
+            content_bb,
+            filler_left_gap_um=filler_left_gap_um,
         )
         filler_bb = filler.bounding_box()
         if filler_bb is None:

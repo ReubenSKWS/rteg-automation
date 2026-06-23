@@ -79,6 +79,7 @@ class MteBuildConfig:
     boolean_precision: float = 1e-3
     inside_probe_half_um: float = 0.25
     feasible_merge_search_iterations: int = 24
+    max_preserved_mte_vertices_after_pad_route: int = 15
     # SKILL ``rdsBawResonatorTEGConnection`` collar intercept constants
     skill_collar_shrink_um: float = 1.0
     skill_body_grow_um: float = 3.0
@@ -127,6 +128,7 @@ class MteExtensionResult:
     extension_draw: CollarExtensionDraw | None = None
     route_draw: object | None = None  # MteRouteDraw when step 5.4 routed
     routed_net: gdstk.Polygon | None = None
+    resonator_body_mte_polys: list[gdstk.Polygon] = field(default_factory=list)
     drc_violations: list[str] = field(default_factory=list)
 
 
@@ -1161,6 +1163,7 @@ def _extension_for_roles(
         is_connected=True,
         collar_overlap_um2=abs(draw.polygon.area()),
         extension_draw=draw,
+        resonator_body_mte_polys=list(roles.resonator_body_mte),
     )
 
 
@@ -1182,170 +1185,6 @@ def _fmt_point(pt: Point) -> str:
 
 def _fmt_edge(edge: Edge) -> str:
     return f"{_fmt_point(edge[0])} -> {_fmt_point(edge[1])}"
-
-
-def _union_signal_pad_bbox(
-    signal_polys: Sequence[gdstk.Polygon],
-) -> tuple[tuple[float, float], tuple[float, float]] | None:
-    boxes = [p.bounding_box() for p in signal_polys if p.bounding_box() is not None]
-    if not boxes:
-        return None
-    x0 = min(b[0][0] for b in boxes)
-    y0 = min(b[0][1] for b in boxes)
-    x1 = max(b[1][0] for b in boxes)
-    y1 = max(b[1][1] for b in boxes)
-    return (x0, y0), (x1, y1)
-
-
-def _skill_outer_collar_points_all_pieces(
-    preserved_polys: Sequence[gdstk.Polygon],
-    body_mte_polys: Sequence[gdstk.Polygon],
-    cfg: MteBuildConfig,
-) -> list[tuple[int, Point]]:
-    """``mteclrOut`` from every preserved MTE collar piece (deduped)."""
-    outer: list[tuple[int, Point]] = []
-    for piece_idx, piece in enumerate(preserved_polys):
-        for pt in _skill_outer_collar_points(piece, body_mte_polys, cfg):
-            if not any(
-                math.hypot(pt[0] - q[1][0], pt[1] - q[1][1]) < 0.05 for q in outer
-            ):
-                outer.append((piece_idx, pt))
-    return outer
-
-
-def skill_pad_anchor_overview_rows(
-    roles_by_index: Mapping[int, RtegGeometryRoles],
-    *,
-    inst_names: Mapping[int, str] | None = None,
-    cfg: MteBuildConfig | None = None,
-) -> list[dict[str, object]]:
-    """
-    SKILL step 1 — pad-side anchors for ``rdsBawResonatorTEGConnection``.
-
-    One row per resonator: signal-pad bbox, SKILL ``MTERect`` (5 µm east of pad),
-    ``vtbuporgn`` / ``vtbdnorgn`` on the pad-facing edge (conn vs slope-search expand).
-    """
-    c = cfg or MteBuildConfig()
-    skill_mte_rect_width_um = 5.0
-    rows: list[dict[str, object]] = []
-    for idx in sorted(roles_by_index):
-        roles = roles_by_index[idx]
-        signal_polys = [tp.polygon for tp in roles.ground_plates.center]
-        row: dict[str, object] = {
-            "index": idx,
-            "inst_name": inst_names.get(idx) if inst_names else None,
-            "n_signal_pads": len(signal_polys),
-        }
-        bbox = _union_signal_pad_bbox(signal_polys)
-        if bbox is None:
-            row.update(
-                {
-                    "pad_bbox": None,
-                    "mte_rect_ll": None,
-                    "mte_rect_ur": None,
-                    "vtb_up_conn": None,
-                    "vtb_dn_conn": None,
-                    "vtb_up_slope": None,
-                    "vtb_dn_slope": None,
-                }
-            )
-            rows.append(row)
-            continue
-        (x0, y0), (x1, y1) = bbox
-        mte_rect_ll = (x1, y0)
-        mte_rect_ur = (x1 + skill_mte_rect_width_um, y1)
-        vtb_up_conn, vtb_dn_conn = _skill_pad_vtb_corners(signal_polys, expand_um=0.0)
-        vtb_up_slope, vtb_dn_slope = _skill_pad_vtb_corners(
-            signal_polys, expand_um=c.skill_pad_expand_um
-        )
-        row.update(
-            {
-                "pad_bbox": f"({x0:.2f},{y0:.2f})-({x1:.2f},{y1:.2f})",
-                "mte_rect_ll": _fmt_point(mte_rect_ll),
-                "mte_rect_ur": _fmt_point(mte_rect_ur),
-                "vtb_up_conn": _fmt_point(vtb_up_conn),
-                "vtb_dn_conn": _fmt_point(vtb_dn_conn),
-                "vtb_up_slope": _fmt_point(vtb_up_slope),
-                "vtb_dn_slope": _fmt_point(vtb_dn_slope),
-            }
-        )
-        rows.append(row)
-    return rows
-
-
-def skill_outer_collar_overview_rows(
-    roles_by_index: Mapping[int, RtegGeometryRoles],
-    *,
-    inst_names: Mapping[int, str] | None = None,
-    cfg: MteBuildConfig | None = None,
-) -> list[dict[str, object]]:
-    """SKILL step 2 summary — shrunk-collar vertex filter → ``mteclrOut`` count."""
-    c = cfg or MteBuildConfig()
-    rows: list[dict[str, object]] = []
-    for idx in sorted(roles_by_index):
-        roles = roles_by_index[idx]
-        preserved_polys = [tp.polygon for tp in roles.preserved.mte]
-        row: dict[str, object] = {
-            "index": idx,
-            "inst_name": inst_names.get(idx) if inst_names else None,
-            "n_preserved_mte": len(preserved_polys),
-            "collar_shrink_um": c.skill_collar_shrink_um,
-            "body_grow_um": c.skill_body_grow_um,
-        }
-        if not preserved_polys:
-            row.update({"n_shrunk_vertices_total": 0, "n_outer_pts": 0})
-            rows.append(row)
-            continue
-        n_shrunk = 0
-        for poly in preserved_polys:
-            shrunk = _offset_collar(
-                poly, -c.skill_collar_shrink_um, precision=c.boolean_precision
-            )
-            if shrunk is not None:
-                n_shrunk += len(shrunk.points)
-        outer = _skill_outer_collar_points_all_pieces(
-            preserved_polys, roles.resonator_body_mte, c
-        )
-        row.update(
-            {
-                "n_shrunk_vertices_total": n_shrunk,
-                "n_outer_pts": len(outer),
-            }
-        )
-        rows.append(row)
-    return rows
-
-
-def skill_outer_collar_point_rows(
-    roles_by_index: Mapping[int, RtegGeometryRoles],
-    *,
-    inst_names: Mapping[int, str] | None = None,
-    cfg: MteBuildConfig | None = None,
-) -> list[dict[str, object]]:
-    """SKILL step 2 detail — each ``mteclrOut`` vertex (one row per point)."""
-    c = cfg or MteBuildConfig()
-    rows: list[dict[str, object]] = []
-    for idx in sorted(roles_by_index):
-        roles = roles_by_index[idx]
-        preserved_polys = [tp.polygon for tp in roles.preserved.mte]
-        if not preserved_polys:
-            continue
-        outer = _skill_outer_collar_points_all_pieces(
-            preserved_polys, roles.resonator_body_mte, c
-        )
-        for point_idx, (piece_idx, (x, y)) in enumerate(outer):
-            rows.append(
-                {
-                    "index": idx,
-                    "inst_name": inst_names.get(idx) if inst_names else None,
-                    "point_idx": point_idx,
-                    "piece_idx": piece_idx,
-                    "x_um": round(x, 3),
-                    "y_um": round(y, 3),
-                    "n_outer_pts": len(outer),
-                }
-            )
-    return rows
 
 
 def mte_extensions_overview_rows(
@@ -1709,17 +1548,230 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
+    def _polygon_matches_any(
+        self,
+        poly: gdstk.Polygon,
+        candidates: Sequence[gdstk.Polygon],
+        *,
+        boolean_precision: float = 1e-3,
+        overlap_fraction: float = 0.85,
+    ) -> bool:
+        if _polygon_key(poly) in {_polygon_key(c) for c in candidates}:
+            return True
+        poly_area = abs(poly.area())
+        if poly_area < 1e-6:
+            return False
+        for target in candidates:
+            inter = gdstk.boolean(poly, target, "and", precision=boolean_precision)
+            if not inter:
+                continue
+            overlap = sum(abs(p.area()) for p in inter)
+            if overlap / poly_area >= overlap_fraction:
+                return True
+        return False
+
+    def _strip_preserved_mte_except(
+        self,
+        cell: gdstk.Cell,
+        keep: Sequence[gdstk.Polygon],
+        *,
+        preserved_pool: Sequence[gdstk.Polygon] | None = None,
+        boolean_precision: float = 1e-3,
+        overlap_fraction: float = 0.85,
+    ) -> None:
+        """Drop attached filter MTE on ``cell`` except the collar + extension stub."""
+        if self.layermap is None:
+            return
+        if not keep and not preserved_pool:
+            return
+        mte_pair = self.layermap.pair("BAW_MTE")
+        pool = list(preserved_pool or keep)
+
+        kept: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mte_pair:
+                kept.append(poly)
+                continue
+            if pool and not self._polygon_matches_any(
+                poly,
+                pool,
+                boolean_precision=boolean_precision,
+                overlap_fraction=overlap_fraction,
+            ):
+                kept.append(poly)
+                continue
+            if self._polygon_matches_any(
+                poly,
+                keep,
+                boolean_precision=boolean_precision,
+                overlap_fraction=overlap_fraction,
+            ):
+                kept.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*kept)
+
+    def _strip_preserved_mte_for_pad_route_on_frame(self) -> None:
+        """
+        Drop extra filter ``connectMTE`` pieces on the frame cell only.
+
+        Resonator-body MTE lives inside the resonator reference and is untouched.
+        Frame-template MTE (pads, etc.) is also untouched.
+
+        Applies only when step 5.4 routed to the center pad (``routed_net`` set);
+        ``collar_extend`` resonators skip this path entirely.
+        """
+        if self.layermap is None or self.extension.routed_net is None:
+            return
+        from rteg_mte_route import identify_preserved_mte_parts
+
+        try:
+            parts = identify_preserved_mte_parts(
+                self.extension.preserved_collar_polygons,
+                self.extension.resonator_body_mte_polys,
+            )
+        except ValueError:
+            return
+        max_vertices = MteBuildConfig().max_preserved_mte_vertices_after_pad_route
+        keep: list[gdstk.Polygon] = []
+        if len(parts.extension.points) <= max_vertices:
+            keep.append(parts.extension)
+        if parts.collar is not None and len(parts.collar.points) <= max_vertices:
+            keep.append(parts.collar)
+        self._strip_preserved_mte_except(
+            self.frame.top_cell,
+            keep,
+            preserved_pool=self.extension.preserved_collar_polygons,
+        )
+
+    def _connected_mte_cluster(
+        self,
+        mte_polys: Sequence[gdstk.Polygon],
+        seeds: Sequence[gdstk.Polygon],
+        *,
+        boolean_precision: float = 1e-3,
+        overlap_fraction: float = 0.85,
+    ) -> list[gdstk.Polygon]:
+        """Flood-fill MTE polygons that boolean-touch any seed."""
+        cluster: list[gdstk.Polygon] = []
+        for seed in seeds:
+            for poly in mte_polys:
+                if poly in cluster:
+                    continue
+                if self._polygon_matches_any(
+                    poly,
+                    [seed],
+                    boolean_precision=boolean_precision,
+                    overlap_fraction=overlap_fraction,
+                ) or polys_touch(poly, seed, precision=boolean_precision):
+                    cluster.append(poly)
+
+        changed = True
+        while changed:
+            changed = False
+            for poly in mte_polys:
+                if poly in cluster:
+                    continue
+                if any(
+                    polys_touch(poly, member, precision=boolean_precision)
+                    for member in cluster
+                ):
+                    cluster.append(poly)
+                    changed = True
+        return cluster
+
+    def _strip_disconnected_preserved_mte(self, cell: gdstk.Cell) -> None:
+        """
+        Drop preserved filter MTE that does not touch the routed signal cluster.
+
+        After step 5.4 the layout should retain only resonator-body MTE, the
+        extension stub, any collar that actually bridges to them, and the pad
+        route. Spurious stadium shells or distant ``connectMTE`` tabs that
+        ``identify_preserved_mte_parts`` mis-labels as the collar are removed.
+        Frame-template MTE (pads, etc.) is untouched.
+        """
+        if self.layermap is None or self.extension.routed_net is None:
+            return
+        from rteg_mte_route import identify_preserved_mte_parts
+
+        mte_pair = self.layermap.pair("BAW_MTE")
+        mte_polys = [p for p in cell.polygons if (p.layer, p.datatype) == mte_pair]
+        if not mte_polys:
+            return
+
+        pool = self.extension.preserved_collar_polygons
+        seeds: list[gdstk.Polygon] = list(self.extension.resonator_body_mte_polys)
+        seeds.append(self.extension.routed_net)
+        try:
+            parts = identify_preserved_mte_parts(
+                self.extension.preserved_collar_polygons,
+                self.extension.resonator_body_mte_polys,
+            )
+            seeds.append(parts.extension)
+        except ValueError:
+            pass
+
+        cluster = self._connected_mte_cluster(mte_polys, seeds)
+        cluster_ids = {id(p) for p in cluster}
+
+        kept: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mte_pair:
+                kept.append(poly)
+                continue
+            if pool and not self._polygon_matches_any(poly, pool):
+                kept.append(poly)
+                continue
+            if id(poly) in cluster_ids:
+                kept.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*kept)
+
+    def _strip_complex_preserved_mte(self, cell: gdstk.Cell) -> None:
+        """
+        Drop high-vertex preserved filter MTE left under the step-5.4 route.
+
+        Filter ``connectMTE`` stadium shells (often 100+ vertices) can overlap
+        the clean pad-route quad; resonator-body MTE and the routed net are kept.
+        """
+        if self.layermap is None or self.extension.routed_net is None:
+            return
+        max_vertices = MteBuildConfig().max_preserved_mte_vertices_after_pad_route
+        mte_pair = self.layermap.pair("BAW_MTE")
+        pool = self.extension.preserved_collar_polygons
+        routed = self.extension.routed_net
+
+        kept: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mte_pair:
+                kept.append(poly)
+                continue
+            if pool and self._polygon_matches_any(poly, pool):
+                if self._polygon_matches_any(poly, [routed]):
+                    kept.append(poly)
+                    continue
+                if len(poly.points) > max_vertices:
+                    continue
+            kept.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*kept)
+
     def flatten(self) -> gdstk.Cell:
+        if self.extension.routed_net is not None:
+            self._strip_preserved_mte_for_pad_route_on_frame()
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
         if self.mbe_body is not None and getattr(self.mbe_body, "n_pieces", 0) > 0:
             self._strip_raw_filler(cell)
             absorbed = getattr(self.mbe_body, "absorbed_mbe", None) or []
             if absorbed:
                 self._strip_absorbed_mbe(cell, absorbed)
-        net = self.extension.routed_net
-        if net is None and self.extension.n_extensions > 0:
+        if self.extension.routed_net is not None:
+            net = self.extension.routed_net
+            self._strip_mte_merged_into_route(cell, net)
+            cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
+            self._strip_disconnected_preserved_mte(cell)
+            self._strip_complex_preserved_mte(cell)
+        elif self.extension.n_extensions > 0 and self.extension.extension is not None:
             net = self.extension.extension
-        if net is not None:
             self._strip_mte_merged_into_route(cell, net)
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
         if self.layermap is not None and self.mbe_extension is not None:
@@ -1778,7 +1830,7 @@ def export_mte_extensions_gds(
 
     For the complete pipeline output (steps 4ΓÇô6.3), prefer
     :func:`export_full_rteg_gds` which validates all indices and uses the
-    ``routed`` filename suffix.
+    one GDS filename per resonator (no stage suffix).
     """
     mbe_map = mbe_extensions or {}
     body_map = mbe_bodies or {}
@@ -1853,7 +1905,7 @@ def export_full_rteg_gds(
         mbe_extensions=mbe_extensions,
         mbe_bodies=mbe_bodies,
         parent=parent,
-        stage="routed",
+        stage="",
         flatten=flatten,
         write_lyp=write_lyp,
     )
@@ -1884,9 +1936,6 @@ __all__ = [
     "find_outward_lip_ab",
     "mte_extensions_overview_rows",
     "mte_intercept_breakdown_rows",
-    "skill_outer_collar_overview_rows",
-    "skill_outer_collar_point_rows",
-    "skill_pad_anchor_overview_rows",
     "select_extension_collar",
     "select_extension_collar_from_pieces",
 ]

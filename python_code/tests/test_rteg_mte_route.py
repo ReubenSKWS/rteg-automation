@@ -17,7 +17,11 @@ for p in (str(SRC), str(TESTS)):
 
 from kb331_pipeline import load_kb331_pipeline
 from rteg_classify import classify_nodes
-from rteg_collect import collect_geometry_roles, collect_orientation_inputs
+from rteg_collect import (
+    attach_preserved_filter_interconnect,
+    collect_geometry_roles,
+    collect_orientation_inputs,
+)
 from rteg_mte_extensions import MteBuildConfig, CollarExtensionDraw, build_mte_extensions
 from rteg_mte_route import (
     MteRouteConfig,
@@ -377,6 +381,116 @@ class TestMteRouteKB331(unittest.TestCase):
             resonator_index=index,
         )
         self.assertIsNone(route)
+
+    def test_center_pad_strip_extra_preserved_mte_on_frame(self):
+        from rteg_mte_extensions import MteRtegAssembly
+
+        index = 1
+        ext = self.routed[index]
+        self.assertIsNotNone(ext.routed_net)
+        self.assertGreater(len(self.all_roles[index].preserved.mte), 2)
+
+        frame_asm = self.ctx["frame_assemblies"][index]
+        res = self.ctx["res_list"][index]
+        attach_preserved_filter_interconnect(
+            frame_asm, res, self.ctx["identification"], self.ctx["layermap"]
+        )
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        top = frame_asm.top_cell
+        before = [p for p in top.polygons if (p.layer, p.datatype) == mte_pair]
+        self.assertGreater(len(before), 2)
+
+        assert ext.collar is not None
+        asm = MteRtegAssembly(
+            frame=frame_asm, extension=ext, layermap=self.ctx["layermap"]
+        )
+        asm._strip_preserved_mte_for_pad_route_on_frame()
+        after = [p for p in top.polygons if (p.layer, p.datatype) == mte_pair]
+        self.assertGreaterEqual(len(after), 1)
+        self.assertLess(len(after), len(before))
+        # Frame template MTE (pads, etc.) is untouched; only attached filter pieces drop.
+        self.assertGreater(len(after), len(before) - len(ext.preserved_collar_polygons))
+
+    def test_center_pad_removes_disconnected_preserved_mte(self):
+        from rteg_mte_extensions import MteRtegAssembly
+
+        index = 3
+        ext = self.routed[index]
+        self.assertIsNotNone(ext.routed_net)
+
+        frame_asm = self.ctx["frame_assemblies"][index]
+        res = self.ctx["res_list"][index]
+        attach_preserved_filter_interconnect(
+            frame_asm, res, self.ctx["identification"], self.ctx["layermap"]
+        )
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        asm = MteRtegAssembly(
+            frame=frame_asm, extension=ext, layermap=self.ctx["layermap"]
+        )
+        cell = asm.flatten()
+        mte_polys = [p for p in cell.polygons if (p.layer, p.datatype) == mte_pair]
+        self.assertGreater(len(mte_polys), 0)
+        largest = max(mte_polys, key=lambda p: abs(p.area()))
+        # Index 3 had a ~5191 µm² stadium mis-identified as collar, far from body.
+        self.assertLess(abs(largest.area()), 4000.0)
+
+    def test_center_pad_removes_complex_overlapping_preserved_mte(self):
+        from rteg_mte_extensions import MteRtegAssembly
+
+        index = 6
+        ext = self.routed[index]
+        self.assertIsNotNone(ext.routed_net)
+
+        frame_asm = self.ctx["frame_assemblies"][index]
+        res = self.ctx["res_list"][index]
+        attach_preserved_filter_interconnect(
+            frame_asm, res, self.ctx["identification"], self.ctx["layermap"]
+        )
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        asm = MteRtegAssembly(
+            frame=frame_asm, extension=ext, layermap=self.ctx["layermap"]
+        )
+        cell = asm.flatten()
+        mte_polys = [p for p in cell.polygons if (p.layer, p.datatype) == mte_pair]
+        pool_matches = [
+            p
+            for p in mte_polys
+            if asm._polygon_matches_any(p, ext.preserved_collar_polygons)
+        ]
+        self.assertEqual(pool_matches, [])
+        routed = [
+            p
+            for p in mte_polys
+            if asm._polygon_matches_any(p, [ext.routed_net])
+        ]
+        self.assertEqual(len(routed), 1)
+
+    def test_collar_extend_not_stripped_by_pad_route_logic(self):
+        from rteg_mte_extensions import MteRtegAssembly
+
+        index = 0
+        ext = self.routed[0]
+        self.assertIsNone(ext.routed_net)
+
+        frame_asm = self.ctx["frame_assemblies"][index]
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        before = [
+            p
+            for p in frame_asm.top_cell.polygons
+            if (p.layer, p.datatype) == mte_pair
+        ]
+
+        asm = MteRtegAssembly(
+            frame=frame_asm, extension=ext, layermap=self.ctx["layermap"]
+        )
+        asm._strip_preserved_mte_for_pad_route_on_frame()
+
+        after = [
+            p
+            for p in frame_asm.top_cell.polygons
+            if (p.layer, p.datatype) == mte_pair
+        ]
+        self.assertEqual(len(after), len(before))
 
 
 if __name__ == "__main__":

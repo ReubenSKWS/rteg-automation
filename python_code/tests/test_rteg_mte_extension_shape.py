@@ -22,11 +22,18 @@ from rteg_collect import (
 )
 from rteg_mbe_body import MbeBodyConfig, build_mbe_body_collar_extends
 from rteg_mbe_extensions import MbeConnectionConfig, build_mbe_extensions
-from rteg_mte_route import identify_preserved_mte_parts
+from rteg_mte_route import (
+    disconnected_preserved_mte_orphans,
+    identify_preserved_mte_parts,
+    mte_extension_is_perfect,
+)
 from rteg_mte_extension_shape import simplify_mte_extension
 from rteg_mte_extensions import MteBuildConfig, MteRtegAssembly, build_mte_extensions
 
 COLLAR_EXTEND_INDICES = (0, 2, 5, 7)
+PERFECT_EXTENSION_INDICES = (0, 2)
+WILD_EXTENSION_INDICES = (5, 7)
+ORPHAN_REMOVAL_INDICES = (0, 2, 5)
 
 
 class TestMteExtensionSimplify(unittest.TestCase):
@@ -103,9 +110,64 @@ class TestMteExtensionSimplify(unittest.TestCase):
         self.assertGreater(leg_far[0], 300.0)
         self.assertGreater(leg_mouth[1], 315.0)
 
-    def test_collar_extend_export_leaves_mte_unchanged(self):
+    def test_perfect_extension_indices_identified(self):
+        for index in PERFECT_EXTENSION_INDICES:
+            roles = self.all_roles[index]
+            preserved = [tp.polygon for tp in roles.preserved.mte]
+            parts = identify_preserved_mte_parts(
+                preserved,
+                roles.resonator_body_mte,
+                boolean_precision=1e-3,
+            )
+            self.assertTrue(
+                mte_extension_is_perfect(
+                    parts,
+                    roles.resonator_body_mte,
+                    precision=1e-3,
+                ),
+                msg=f"index {index} should be a perfect extension",
+            )
+        for index in WILD_EXTENSION_INDICES:
+            roles = self.all_roles[index]
+            preserved = [tp.polygon for tp in roles.preserved.mte]
+            parts = identify_preserved_mte_parts(
+                preserved,
+                roles.resonator_body_mte,
+                boolean_precision=1e-3,
+            )
+            self.assertFalse(
+                mte_extension_is_perfect(
+                    parts,
+                    roles.resonator_body_mte,
+                    precision=1e-3,
+                ),
+                msg=f"index {index} should be a wild extension (redraw later)",
+            )
+
+    def test_detached_mte_orphans_removed_on_export(self):
         mte_pair = self.ctx["layermap"].pair("BAW_MTE")
-        for index in COLLAR_EXTEND_INDICES:
+        for index in ORPHAN_REMOVAL_INDICES:
+            roles = self.all_roles[index]
+            preserved = [tp.polygon for tp in roles.preserved.mte]
+            parts = identify_preserved_mte_parts(
+                preserved,
+                roles.resonator_body_mte,
+                boolean_precision=1e-3,
+            )
+            orphans = disconnected_preserved_mte_orphans(
+                preserved,
+                roles.resonator_body_mte,
+                parts,
+                precision=1e-3,
+            )
+            self.assertGreater(len(orphans), 0, msg=f"index {index}")
+            orphan_keys = {_polygon_key(p) for p in orphans}
+            keeper_keys = {
+                _polygon_key(p)
+                for p in preserved
+                if _polygon_key(p) not in orphan_keys
+            }
+
             frame_asm = self.ctx["frame_assemblies"][index]
             res = self.ctx["res_list"][index]
             attach_preserved_filter_interconnect(
@@ -114,33 +176,98 @@ class TestMteExtensionSimplify(unittest.TestCase):
                 self.ctx["identification"],
                 self.ctx["layermap"],
             )
-            mte_only = MteRtegAssembly(
-                frame_asm,
-                self.all_mte[index],
-                layermap=self.ctx["layermap"],
-                mbe_extension=self.all_mbe[index],
-                mbe_body=None,
-            ).flatten()
-            full = MteRtegAssembly(
-                frame_asm,
-                self.all_mte[index],
-                layermap=self.ctx["layermap"],
-                mbe_extension=self.all_mbe[index],
-                mbe_body=self.all_body[index],
-            ).flatten()
-
-            def mte_keys(cell: object) -> set[tuple[float, ...]]:
-                return {
-                    _polygon_key(p)
-                    for p in cell.polygons
-                    if (p.layer, p.datatype) == mte_pair
-                }
-
-            self.assertEqual(
-                mte_keys(mte_only),
-                mte_keys(full),
-                msg=f"index {index}: step 6.2 must not add or remove MTE polygons",
+            before = {
+                _polygon_key(p)
+                for p in MteRtegAssembly(
+                    frame_asm,
+                    self.all_mte[index],
+                    layermap=self.ctx["layermap"],
+                    mbe_extension=self.all_mbe[index],
+                    mbe_body=None,
+                ).flatten().polygons
+                if (p.layer, p.datatype) == mte_pair
+            }
+            after = {
+                _polygon_key(p)
+                for p in MteRtegAssembly(
+                    frame_asm,
+                    self.all_mte[index],
+                    layermap=self.ctx["layermap"],
+                    mbe_extension=self.all_mbe[index],
+                    mbe_body=self.all_body[index],
+                ).flatten().polygons
+                if (p.layer, p.datatype) == mte_pair
+            }
+            self.assertTrue(
+                orphan_keys <= before,
+                msg=f"index {index}: orphan missing before export",
             )
+            self.assertFalse(
+                orphan_keys & after,
+                msg=f"index {index}: orphan must be removed on export",
+            )
+            self.assertEqual(
+                keeper_keys & before,
+                keeper_keys & after,
+                msg=f"index {index}: connected MTE cluster must be unchanged",
+            )
+            self.assertEqual(
+                [_polygon_key(p) for p in self.all_body[index].removed_mte_orphans],
+                [_polygon_key(p) for p in orphans],
+                msg=f"index {index}: body result should record orphans",
+            )
+
+    def test_index7_no_orphans_removed(self):
+        """Index 7 has no detached preserved MTE — export leaves MTE unchanged."""
+        index = 7
+        mte_pair = self.ctx["layermap"].pair("BAW_MTE")
+        roles = self.all_roles[index]
+        preserved = [tp.polygon for tp in roles.preserved.mte]
+        parts = identify_preserved_mte_parts(
+            preserved,
+            roles.resonator_body_mte,
+            boolean_precision=1e-3,
+        )
+        orphans = disconnected_preserved_mte_orphans(
+            preserved,
+            roles.resonator_body_mte,
+            parts,
+            precision=1e-3,
+        )
+        self.assertEqual(orphans, [])
+
+        frame_asm = self.ctx["frame_assemblies"][index]
+        res = self.ctx["res_list"][index]
+        attach_preserved_filter_interconnect(
+            frame_asm,
+            res,
+            self.ctx["identification"],
+            self.ctx["layermap"],
+        )
+        mte_only = MteRtegAssembly(
+            frame_asm,
+            self.all_mte[index],
+            layermap=self.ctx["layermap"],
+            mbe_extension=self.all_mbe[index],
+            mbe_body=None,
+        ).flatten()
+        full = MteRtegAssembly(
+            frame_asm,
+            self.all_mte[index],
+            layermap=self.ctx["layermap"],
+            mbe_extension=self.all_mbe[index],
+            mbe_body=self.all_body[index],
+        ).flatten()
+
+        def mte_keys(cell: object) -> set[tuple[float, ...]]:
+            return {
+                _polygon_key(p)
+                for p in cell.polygons
+                if (p.layer, p.datatype) == mte_pair
+            }
+
+        self.assertEqual(mte_keys(mte_only), mte_keys(full))
+        self.assertEqual(self.all_body[index].removed_mte_orphans, [])
 
     def test_collar_extend_export_preserves_mte_collar(self):
         mte_pair = self.ctx["layermap"].pair("BAW_MTE")
@@ -177,6 +304,10 @@ class TestMteExtensionSimplify(unittest.TestCase):
             body = self.all_body[index]
             self.assertIsNone(
                 body.mte_extension,
+                msg=f"index {index}: step 6.2 must not replace filter MTE",
+            )
+            self.assertIsNone(
+                body.replaced_mte_extension,
                 msg=f"index {index}: step 6.2 must not replace filter MTE",
             )
 

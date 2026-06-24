@@ -2,8 +2,8 @@
 Step 6.2 — MBE ground body for ``collar_extend`` resonators.
 
 Draws an MBE cap on the preserved filter MTE extension stub and a carved filler
-bridge. Filter MTE metal is read for geometry only; export leaves it untouched
-(see ``MteRtegAssembly._is_collar_extend_export``).
+bridge. For ``collar_extend`` resonators, export drops disconnected preserved MTE
+orphans only — collar, extension, and body-attached pieces are never modified.
 
 Step 6.3 (``center_pad``) lives in ``rteg_mbe_body_center_pad.py``.
 """
@@ -35,7 +35,10 @@ from rteg_mbe_body_center_pad import (
 )
 from rteg_mbe_extensions import MbeConnectionConfig, MbeExtensionResult, tag_baw_mbe
 from rteg_mte_extensions import CollarExtensionDraw, MteExtensionResult
-from rteg_mte_route import identify_preserved_mte_parts
+from rteg_mte_route import (
+    disconnected_preserved_mte_orphans,
+    identify_preserved_mte_parts,
+)
 
 Point = tuple[float, float]
 
@@ -652,10 +655,16 @@ def build_mbe_body_collar_extend(
         roles.resonator_body_mte,
         boolean_precision=c.boolean_precision,
     )
-    # Geometry input only — export does not add or replace MTE (see flatten).
     mte_ext = parts.extension
     if mte_ext is None:
         return _empty_mbe_body_result(violations=["missing preserved MTE interconnect"])
+
+    removed_orphans = disconnected_preserved_mte_orphans(
+        preserved_polys,
+        roles.resonator_body_mte,
+        parts,
+        precision=c.boolean_precision,
+    )
 
     cap = draw_mbe_cap_on_mte_extension(
         mte_ext,
@@ -708,6 +717,7 @@ def build_mbe_body_collar_extend(
         drc_violations=violations,
         mte_extension=None,
         replaced_mte_extension=None,
+        removed_mte_orphans=removed_orphans,
     )
 
 

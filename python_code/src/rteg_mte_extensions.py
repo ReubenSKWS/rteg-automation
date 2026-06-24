@@ -1623,6 +1623,45 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*kept)
 
+    def _strip_preserved_mte_orphans(
+        self,
+        cell: gdstk.Cell,
+        orphans: Sequence[gdstk.Polygon],
+        *,
+        preserved_pool: Sequence[gdstk.Polygon] | None = None,
+        boolean_precision: float = 1e-3,
+        overlap_fraction: float = 0.85,
+    ) -> None:
+        """Drop disconnected preserved filter MTE pieces (step 6.2 perfect extension)."""
+        if self.layermap is None or not orphans:
+            return
+        mte_pair = self.layermap.pair("BAW_MTE")
+        pool = list(preserved_pool or orphans)
+
+        kept: list[gdstk.Polygon] = []
+        for poly in cell.polygons:
+            if (poly.layer, poly.datatype) != mte_pair:
+                kept.append(poly)
+                continue
+            if pool and not self._polygon_matches_any(
+                poly,
+                pool,
+                boolean_precision=boolean_precision,
+                overlap_fraction=overlap_fraction,
+            ):
+                kept.append(poly)
+                continue
+            if self._polygon_matches_any(
+                poly,
+                orphans,
+                boolean_precision=boolean_precision,
+                overlap_fraction=overlap_fraction,
+            ):
+                continue
+            kept.append(poly)
+        cell.remove(*cell.polygons)
+        cell.add(*kept)
+
     def _strip_preserved_mte_for_pad_route_on_frame(self) -> None:
         """
         Drop extra filter ``connectMTE`` pieces on the frame cell only.
@@ -1791,6 +1830,13 @@ class MteRtegAssembly:
             absorbed = getattr(body, "absorbed_mbe", None) or []
             if absorbed:
                 self._strip_absorbed_mbe(cell, absorbed)
+            orphans = getattr(body, "removed_mte_orphans", None) or []
+            if orphans and self._is_collar_extend_export():
+                self._strip_preserved_mte_orphans(
+                    cell,
+                    orphans,
+                    preserved_pool=self.extension.preserved_collar_polygons,
+                )
         # --- MTE export: routed net (center_pad) or 5.3 stub (legacy); collar_extend skips ---
         if self.extension.routed_net is not None:
             net = self.extension.routed_net

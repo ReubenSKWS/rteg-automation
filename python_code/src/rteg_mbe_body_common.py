@@ -20,6 +20,7 @@ class MbeBodyResult:
     absorbed_mbe: list[gdstk.Polygon] = field(default_factory=list)
     mte_extension: gdstk.Polygon | None = None
     replaced_mte_extension: gdstk.Polygon | None = None
+    removed_mte_orphans: list[gdstk.Polygon] = field(default_factory=list)
 
 
 def empty_mbe_body_result(*, violations: list[str] | None = None) -> MbeBodyResult:

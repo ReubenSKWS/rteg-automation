@@ -370,6 +370,113 @@ def _polygon_key(poly: gdstk.Polygon) -> tuple[float, float, float, float, float
     return (round(x0, 3), round(y0, 3), round(x1, 3), round(y1, 3), round(abs(poly.area()), 3))
 
 
+def mte_extension_is_perfect(
+    parts: PreservedMteParts,
+    body_mte_polys: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+    max_body_overlap_fraction: float = 0.5,
+) -> bool:
+    """
+    True when the preserved MTE extension is already a flat filter-side stub.
+
+    Wild resonators (indices 5/7 on KB331) attach the extension polygon entirely
+    to resonator-body MTE; those need a redraw and are excluded here.
+    """
+    ext = parts.extension
+    ext_area = abs(ext.area())
+    if ext_area < 1e-6:
+        return False
+    overlap = preserved_mte_overlap_with_body(ext, body_mte_polys, precision=precision)
+    return overlap / ext_area <= max_body_overlap_fraction
+
+
+def _preserved_mte_connected_cluster(
+    preserved_polys: Sequence[gdstk.Polygon],
+    seeds: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+    min_overlap_um2: float = 0.01,
+) -> list[gdstk.Polygon]:
+    """Flood-fill preserved filter MTE polygons boolean-touching any seed."""
+    cluster: list[gdstk.Polygon] = []
+    seed_keys = {_polygon_key(seed) for seed in seeds}
+
+    for poly in preserved_polys:
+        key = _polygon_key(poly)
+        if key in seed_keys or any(
+            polys_touch(
+                poly,
+                seed,
+                precision=precision,
+                min_overlap_um2=min_overlap_um2,
+            )
+            for seed in seeds
+        ):
+            cluster.append(poly)
+
+    changed = True
+    while changed:
+        changed = False
+        for poly in preserved_polys:
+            if poly in cluster:
+                continue
+            if any(
+                polys_touch(
+                    member,
+                    poly,
+                    precision=precision,
+                    min_overlap_um2=min_overlap_um2,
+                )
+                for member in cluster
+            ):
+                cluster.append(poly)
+                changed = True
+    return cluster
+
+
+def disconnected_preserved_mte_orphans(
+    preserved_polys: Sequence[gdstk.Polygon],
+    body_mte_polys: Sequence[gdstk.Polygon],
+    parts: PreservedMteParts,
+    *,
+    precision: float = 1e-3,
+    min_overlap_um2: float = 0.01,
+) -> list[gdstk.Polygon]:
+    """
+    Preserved filter MTE pieces not connected to body + collar + extension.
+
+    Only returns polygons from ``preserved_polys``; frame-template MTE is never
+    included.
+    """
+    seeds: list[gdstk.Polygon] = list(body_mte_polys)
+    seeds.append(parts.extension)
+    if parts.collar is not None:
+        seeds.append(parts.collar)
+    for poly in preserved_polys:
+        if preserved_mte_overlap_with_body(poly, body_mte_polys, precision=precision) >= min_overlap_um2:
+            seeds.append(poly)
+        elif any(
+            polys_touch(
+                poly,
+                body,
+                precision=precision,
+                min_overlap_um2=min_overlap_um2,
+            )
+            for body in body_mte_polys
+        ):
+            seeds.append(poly)
+
+    cluster = _preserved_mte_connected_cluster(
+        preserved_polys,
+        seeds,
+        precision=precision,
+        min_overlap_um2=min_overlap_um2,
+    )
+    cluster_keys = {_polygon_key(poly) for poly in cluster}
+    return [poly for poly in preserved_polys if _polygon_key(poly) not in cluster_keys]
+
+
 def _junction_on_shared_boundary(
     extension: gdstk.Polygon,
     collar: gdstk.Polygon,
@@ -1063,10 +1170,12 @@ __all__ = [
     "build_mte_pad_routes",
     "collar_extension_junction_corners",
     "collar_mouth_facing_pad",
+    "disconnected_preserved_mte_orphans",
     "identify_preserved_mte_parts",
     "junction_route_corners_for_merge",
     "merge_mte_route_with_extensions",
     "merge_pad_route_with_preserved",
+    "mte_extension_is_perfect",
     "mte_route_overview_rows",
     "pick_pad_attachment_edge",
     "pick_route_start",

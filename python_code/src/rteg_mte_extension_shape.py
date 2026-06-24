@@ -3,9 +3,7 @@ Optional MTE extension simplification helpers (not used in the current pipeline)
 
 ``simplify_mte_extension`` and ``retrace_mte_extension_along_collar`` reshape the
 preserved filter MTE extension stub only — collar and resonator body MTE are
-never modified. Intended for future step 6.2 export work; today
-``build_mbe_body_collar_extend`` reads filter MTE as-is and export leaves it
-untouched.
+never modified.
 """
 from __future__ import annotations
 

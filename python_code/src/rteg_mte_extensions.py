@@ -12,7 +12,6 @@ no new lip extension is drawn.
 from __future__ import annotations
 
 import math
-import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1272,7 +1271,6 @@ class MteRtegAssembly:
     extension: MteExtensionResult
     layermap: LayerMap | None = None
     mbe_extension: object | None = None
-    mbe_body: object | None = None
 
     @property
     def index(self) -> int:
@@ -1289,146 +1287,6 @@ class MteRtegAssembly:
     @property
     def library(self) -> gdstk.Library:
         return self.frame.library
-
-    def _strip_raw_filler(self, cell: gdstk.Cell) -> None:
-        """Remove the step-4 width filler rectangle before writing the carved body."""
-        if self.layermap is None:
-            return
-        mbe_pair = self.layermap.pair("BAW_MBE")
-        (fx0, fy0), (fx1, fy1) = self.frame.mbe_filler_bbox
-        tol = 1.0
-        keep: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mbe_pair:
-                keep.append(poly)
-                continue
-            bb = poly.bounding_box()
-            if bb is None:
-                keep.append(poly)
-                continue
-            if (
-                abs(bb[0][0] - fx0) <= tol
-                and abs(bb[0][1] - fy0) <= tol
-                and abs(bb[1][0] - fx1) <= tol
-                and abs(bb[1][1] - fy1) <= tol
-            ):
-                continue
-            keep.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*keep)
-
-    def _strip_absorbed_mbe(
-        self,
-        cell: gdstk.Cell,
-        absorbed: Sequence[gdstk.Polygon],
-        *,
-        overlap_fraction: float = 0.85,
-        boolean_precision: float = 1e-3,
-    ) -> None:
-        """Drop preserved MBE polygons already merged into the center-pad filler."""
-        if not absorbed or self.layermap is None:
-            return
-        mbe_pair = self.layermap.pair("BAW_MBE")
-        keep: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mbe_pair:
-                keep.append(poly)
-                continue
-            drop = False
-            poly_area = abs(poly.area())
-            for target in absorbed:
-                overlap = gdstk.boolean(
-                    poly,
-                    target,
-                    "and",
-                    precision=boolean_precision,
-                )
-                if not overlap:
-                    continue
-                overlap_area = sum(abs(p.area()) for p in overlap)
-                if poly_area > 1e-6 and overlap_area / poly_area >= overlap_fraction:
-                    drop = True
-                    break
-            if not drop:
-                keep.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*keep)
-
-    def _strip_mbe_inside_filler_bbox(
-        self,
-        cell: gdstk.Cell,
-        filler: gdstk.Polygon,
-        *,
-        tol: float = 1.0,
-    ) -> None:
-        """Clear frame MBE inside the step-4 filler window before writing the body."""
-        if self.layermap is None:
-            return
-        mbe_pair = self.layermap.pair("BAW_MBE")
-        fbb = filler.bounding_box()
-        if fbb is None:
-            return
-        (fx0, fy0), (fx1, fy1) = fbb
-        keep: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mbe_pair:
-                keep.append(poly)
-                continue
-            bb = poly.bounding_box()
-            if bb is None:
-                keep.append(poly)
-                continue
-            inside = (
-                bb[0][0] >= fx0 - tol
-                and bb[0][1] >= fy0 - tol
-                and bb[1][0] <= fx1 + tol
-                and bb[1][1] <= fy1 + tol
-            )
-            if inside:
-                continue
-            keep.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*keep)
-
-    def _strip_overlapping_mbe_in_filler(
-        self,
-        cell: gdstk.Cell,
-        filler_polys: Sequence[gdstk.Polygon],
-        *,
-        overlap_fraction: float = 0.85,
-        boolean_precision: float = 1e-3,
-    ) -> None:
-        """Remove frame MBE that substantially duplicates generated filler metal."""
-        if not filler_polys or self.layermap is None:
-            return
-        mbe_pair = self.layermap.pair("BAW_MBE")
-        keep: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mbe_pair:
-                keep.append(poly)
-                continue
-            poly_area = abs(poly.area())
-            drop = False
-            for filler in filler_polys:
-                overlap = gdstk.boolean(
-                    poly,
-                    filler,
-                    "and",
-                    precision=boolean_precision,
-                )
-                if not overlap:
-                    continue
-                overlap_area = sum(abs(p.area()) for p in overlap)
-                if (
-                    poly_area > 1e-6
-                    and overlap_area / poly_area >= overlap_fraction
-                ):
-                    drop = True
-                    break
-            if not drop:
-                keep.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*keep)
 
     def _strip_mbe_merged_into_route(
         self,
@@ -1516,51 +1374,6 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*keep)
 
-    def _strip_mte_extension_stub(
-        self,
-        cell: gdstk.Cell,
-        replaced: gdstk.Polygon,
-        *,
-        reshaped: gdstk.Polygon | None = None,
-        overlap_fraction: float = 0.15,
-        boolean_precision: float = 1e-3,
-    ) -> None:
-        """Drop preserved MTE extension stubs replaced by step 6.2 reshape."""
-        if self.layermap is None:
-            return
-        mte_pair = self.layermap.pair("BAW_MTE")
-        targets = [replaced]
-        if reshaped is not None:
-            targets.append(reshaped)
-        collar_keep = self._preserved_mte_collar_keepers()
-        keep: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mte_pair:
-                keep.append(poly)
-                continue
-            if collar_keep and self._is_preserved_mte_collar(poly):
-                keep.append(poly)
-                continue
-            poly_area = abs(poly.area())
-            drop = False
-            for target in targets:
-                overlap = gdstk.boolean(
-                    poly, target, "and", precision=boolean_precision
-                )
-                if (
-                    overlap
-                    and poly_area > 1e-6
-                    and sum(abs(p.area()) for p in overlap) / poly_area
-                    >= overlap_fraction
-                ):
-                    drop = True
-                    break
-            if drop:
-                continue
-            keep.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*keep)
-
     def _polygon_matches_any(
         self,
         poly: gdstk.Polygon,
@@ -1620,45 +1433,6 @@ class MteRtegAssembly:
                 overlap_fraction=overlap_fraction,
             ):
                 kept.append(poly)
-        cell.remove(*cell.polygons)
-        cell.add(*kept)
-
-    def _strip_preserved_mte_orphans(
-        self,
-        cell: gdstk.Cell,
-        orphans: Sequence[gdstk.Polygon],
-        *,
-        preserved_pool: Sequence[gdstk.Polygon] | None = None,
-        boolean_precision: float = 1e-3,
-        overlap_fraction: float = 0.85,
-    ) -> None:
-        """Drop disconnected preserved filter MTE pieces (step 6.2 perfect extension)."""
-        if self.layermap is None or not orphans:
-            return
-        mte_pair = self.layermap.pair("BAW_MTE")
-        pool = list(preserved_pool or orphans)
-
-        kept: list[gdstk.Polygon] = []
-        for poly in cell.polygons:
-            if (poly.layer, poly.datatype) != mte_pair:
-                kept.append(poly)
-                continue
-            if pool and not self._polygon_matches_any(
-                poly,
-                pool,
-                boolean_precision=boolean_precision,
-                overlap_fraction=overlap_fraction,
-            ):
-                kept.append(poly)
-                continue
-            if self._polygon_matches_any(
-                poly,
-                orphans,
-                boolean_precision=boolean_precision,
-                overlap_fraction=overlap_fraction,
-            ):
-                continue
-            kept.append(poly)
         cell.remove(*cell.polygons)
         cell.add(*kept)
 
@@ -1807,49 +1581,17 @@ class MteRtegAssembly:
         cell.remove(*cell.polygons)
         cell.add(*kept)
 
-    def _is_collar_extend_export(self) -> bool:
-        """Step 6.2: MTE not routed to center pad — leave filter MTE untouched."""
-        return self.extension.routed_net is None and (
-            self.mbe_body is not None
-            and getattr(self.mbe_body, "cap", None) is not None
-        )
-
     def flatten(self) -> gdstk.Cell:
-        # --- center_pad (5.4): strip extra preserved MTE on frame before flatten ---
         if self.extension.routed_net is not None:
             self._strip_preserved_mte_for_pad_route_on_frame()
         cell = self.frame.flatten().copy(f"rteg_{self.index:02d}_{self.inst_name}_mte")
-        body = self.mbe_body
-        reshaped_mte = (
-            getattr(body, "mte_extension", None)
-            if body is not None and getattr(body, "n_pieces", 0) > 0
-            else None
-        )
-        if body is not None and getattr(body, "n_pieces", 0) > 0:
-            self._strip_raw_filler(cell)
-            absorbed = getattr(body, "absorbed_mbe", None) or []
-            if absorbed:
-                self._strip_absorbed_mbe(cell, absorbed)
-            orphans = getattr(body, "removed_mte_orphans", None) or []
-            if orphans and self._is_collar_extend_export():
-                self._strip_preserved_mte_orphans(
-                    cell,
-                    orphans,
-                    preserved_pool=self.extension.preserved_collar_polygons,
-                )
-        # --- MTE export: routed net (center_pad) or 5.3 stub (legacy); collar_extend skips ---
         if self.extension.routed_net is not None:
             net = self.extension.routed_net
             self._strip_mte_merged_into_route(cell, net)
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
             self._strip_disconnected_preserved_mte(cell)
             self._strip_complex_preserved_mte(cell)
-        elif (
-            not self._is_collar_extend_export()
-            and reshaped_mte is None
-            and self.extension.n_extensions > 0
-            and self.extension.extension is not None
-        ):
+        elif self.extension.n_extensions > 0 and self.extension.extension is not None:
             net = self.extension.extension
             self._strip_mte_merged_into_route(cell, net)
             cell.add(gdstk.Polygon(net.points, net.layer, net.datatype))
@@ -1858,35 +1600,6 @@ class MteRtegAssembly:
             if mbe_net is not None and self.mbe_extension.n_extensions > 0:
                 self._strip_mbe_merged_into_route(cell, mbe_net)
                 tagged = assign_layer(mbe_net, self.layermap, "BAW_MBE")
-                cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
-        # --- MBE body (6.2 cap+filler or 6.3 center_pad filler); optional reshaped MTE ---
-        if self.layermap is not None and body is not None and getattr(body, "n_pieces", 0) > 0:
-            if reshaped_mte is not None and not self._is_collar_extend_export():
-                replaced = (
-                    getattr(body, "replaced_mte_extension", None)
-                    or self.extension.extension
-                )
-                if replaced is not None:
-                    self._strip_mte_extension_stub(
-                        cell,
-                        replaced,
-                        reshaped=reshaped_mte,
-                        overlap_fraction=0.15,
-                    )
-                tagged = assign_layer(reshaped_mte, self.layermap, "BAW_MTE")
-                cell.add(
-                    gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype)
-                )
-            if getattr(body, "cap", None) is not None:
-                tagged = assign_layer(body.cap, self.layermap, "BAW_MBE")
-                cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
-            filler_polys = getattr(body, "filler", []) or []
-            if len(filler_polys) == 1:
-                self._strip_mbe_inside_filler_bbox(cell, filler_polys[0])
-            elif filler_polys:
-                self._strip_overlapping_mbe_in_filler(cell, filler_polys)
-            for poly in filler_polys:
-                tagged = assign_layer(poly, self.layermap, "BAW_MBE")
                 cell.add(gdstk.Polygon(tagged.points, tagged.layer, tagged.datatype))
         return cell
 
@@ -1898,35 +1611,22 @@ def export_mte_extensions_gds(
     *,
     layermap: LayerMap,
     mbe_extensions: Mapping[int, object] | None = None,
-    mbe_bodies: Mapping[int, object] | None = None,
     parent: str | None = None,
     stage: str = "mte",
     flatten: bool = True,
     write_lyp: bool = True,
 ) -> list[ExportResult]:
-    """
-    Export one GDS per resonator: frame + MTE route/extension (+ optional MBE).
-
-    Pass ``mbe_extensions`` from step 6.1 and ``mbe_bodies`` from steps 6.2/6.3
-    to write MTE (5/0) and MBE (2/0) into the same file under ``output_dir``.
-
-    For the complete pipeline output (steps 4ΓÇô6.3), prefer
-    :func:`export_full_rteg_gds` which validates all indices and uses the
-    one GDS filename per resonator (no stage suffix).
-    """
+    """Export one GDS per resonator: frame + MTE route/extension (+ optional MBE)."""
     mbe_map = mbe_extensions or {}
-    body_map = mbe_bodies or {}
     assemblies: list[MteRtegAssembly] = []
     for asm in frame_assemblies:
         if asm.index not in extensions:
             continue
         mte = extensions[asm.index]
         mbe = mbe_map.get(asm.index)
-        body = body_map.get(asm.index)
         has_mte = mte.n_extensions > 0 or mte.routed_net is not None
         has_mbe = mbe is not None and mbe.n_extensions > 0
-        has_body = body is not None and body.n_pieces > 0
-        if not has_mte and not has_mbe and not has_body:
+        if not has_mte and not has_mbe:
             continue
         assemblies.append(
             MteRtegAssembly(
@@ -1934,7 +1634,6 @@ def export_mte_extensions_gds(
                 extension=mte,
                 layermap=layermap,
                 mbe_extension=mbe if has_mbe else None,
-                mbe_body=body if has_body else None,
             )
         )
     return export_gds(
@@ -1948,60 +1647,6 @@ def export_mte_extensions_gds(
     )
 
 
-def export_full_rteg_gds(
-    frame_assemblies: Sequence[RtegFrameAssembly],
-    extensions: Mapping[int, MteExtensionResult],
-    output_dir: str | Path,
-    *,
-    layermap: LayerMap,
-    mbe_extensions: Mapping[int, object],
-    mbe_bodies: Mapping[int, object],
-    parent: str | None = None,
-    flatten: bool = True,
-    write_lyp: bool = True,
-) -> list[ExportResult]:
-    """
-    Export the complete routed RTEG (steps 4ΓÇô6.3) ΓÇö one GDS per resonator.
-
-    Each file includes the die frame, PPD, resonator placement (including any
-    step-4 resonator-only shift), preserved filter MTE and pad routes (5.3–5.4),
-    MBE signal routes where applicable (6.1), and carved MBE ground filler
-    (6.2 for ``collar_extend``, 6.3 for ``center_pad``).
-
-    ``mbe_bodies`` must be the merged dict from steps 6.2 and 6.3, e.g.
-    ``merge_mbe_bodies(collar_extend_body, center_pad_body)``.
-    """
-    expected = {asm.index for asm in frame_assemblies}
-    missing_mte = expected - set(extensions)
-    if missing_mte:
-        raise ValueError(
-            "Full RTEG export requires MTE extensions for every framed resonator; "
-            f"missing indices: {sorted(missing_mte)}"
-        )
-
-    results = export_mte_extensions_gds(
-        frame_assemblies,
-        extensions,
-        output_dir,
-        layermap=layermap,
-        mbe_extensions=mbe_extensions,
-        mbe_bodies=mbe_bodies,
-        parent=parent,
-        stage="",
-        flatten=flatten,
-        write_lyp=write_lyp,
-    )
-    exported = {r.index for r in results}
-    if exported != expected:
-        missing = sorted(expected - exported)
-        warnings.warn(
-            "Full RTEG export did not write GDS for indices "
-            f"{missing}. Confirm steps 5.3ΓÇô6.3 ran and routing applied.",
-            stacklevel=2,
-        )
-    return results
-
-
 __all__ = [
     "CollarExtensionDraw",
     "LipIntercept",
@@ -2012,7 +1657,6 @@ __all__ = [
     "build_preserved_extension_draw",
     "draw_collar_extension",
     "draw_lip_extension",
-    "export_full_rteg_gds",
     "export_mte_extensions_gds",
     "extension_is_connected",
     "find_outward_lip_ab",

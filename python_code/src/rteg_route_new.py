@@ -542,8 +542,42 @@ def build_signal_route(
         ring = list(reversed(ring))
     connector = gdstk.Polygon(ring, layer=layer, datatype=datatype)
 
-    # Merge connector + preexisting connect finger + extra merge polys into one.
-    pieces = [connector, *contact.bridging, *merge_polys]
+    # Clip bridging fingers at the pad's front face (the face that faces the resonator)
+    # so the merged net's left edge is a straight vertical line exactly at the pad's
+    # front face — not leaking into or past the pad interior.
+    (px0, py0), (px1, py1) = launch_bbox
+    cx, cy = (px0 + px1) / 2.0, (py0 + py1) / 2.0
+    dx, dy = mouth[0] - cx, mouth[1] - cy
+    _BIG = 1e5
+    if abs(dx) >= abs(dy):
+        # vertical facing edge: front face = px1 (dx>=0) or px0 (dx<0)
+        front_x = px1 if dx >= 0 else px0
+        if dx >= 0:
+            keep_half = gdstk.Polygon([(front_x, py0 - _BIG), (front_x, py1 + _BIG),
+                                        (front_x + _BIG, py1 + _BIG), (front_x + _BIG, py0 - _BIG)])
+        else:
+            keep_half = gdstk.Polygon([(front_x - _BIG, py0 - _BIG), (front_x - _BIG, py1 + _BIG),
+                                        (front_x, py1 + _BIG), (front_x, py0 - _BIG)])
+    else:
+        # horizontal facing edge: front face = py1 (dy>=0) or py0 (dy<0)
+        front_y = py1 if dy >= 0 else py0
+        if dy >= 0:
+            keep_half = gdstk.Polygon([(px0 - _BIG, front_y), (px0 - _BIG, front_y + _BIG),
+                                        (px1 + _BIG, front_y + _BIG), (px1 + _BIG, front_y)])
+        else:
+            keep_half = gdstk.Polygon([(px0 - _BIG, front_y - _BIG), (px0 - _BIG, front_y),
+                                        (px1 + _BIG, front_y), (px1 + _BIG, front_y - _BIG)])
+
+    # Clip each bridging piece to the resonator-side half only.
+    clipped_bridging: list[gdstk.Polygon] = []
+    for bp in contact.bridging:
+        cb = gdstk.boolean([bp], [keep_half], "and", precision=precision)
+        clipped_bridging.extend(cb)
+
+    # Merge connector + clipped bridging + any extra pieces.
+    # The connector's launch corners already sit at the pad front face, so the
+    # merged net's leftmost edge is the pad front face — a straight vertical line.
+    pieces = [connector, *clipped_bridging, *merge_polys]
     merged = gdstk.boolean(pieces, [], "or", precision=precision)
     if merged:
         net = max(merged, key=lambda p: abs(p.area()))
@@ -792,6 +826,21 @@ def build_resonator_route(
     # --- ground filler ---
     filler_nets: list[gdstk.Polygon] = []
     if filler:
+        # Clip filler height to the outer extent of the GSG top/bottom ground plates
+        # so the filler rectangle aligns with the frame's MBE plate height.
+        top_bb = polys_bbox([tp.polygon for tp in roles.ground_plates.top])
+        bot_bb = polys_bbox([tp.polygon for tp in roles.ground_plates.bottom])
+        if top_bb and bot_bb:
+            y_hi = top_bb[1][1]
+            y_lo = bot_bb[0][1]
+            _BIG = 1e5
+            height_mask = gdstk.Polygon([(-_BIG, y_lo), (-_BIG, y_hi), (_BIG, y_hi), (_BIG, y_lo)])
+            filler_clipped: list[gdstk.Polygon] = []
+            for fp in filler:
+                filler_clipped.extend(gdstk.boolean([fp], [height_mask], "and", precision=precision))
+        else:
+            filler_clipped = list(filler)
+
         sig_route = [signal_net] if signal_net is not None else []
         if center_pad:                      # ground = MBE: trace body edge, edge-touch
             connection: list[gdstk.Polygon] = []
@@ -807,7 +856,7 @@ def build_resonator_route(
             clear_specs = [(sig_route, signal_clearance_um),
                            ([*body_mbe, *body_mte], body_clearance_um)]
         filler_nets = build_ground_filler(
-            filler, clear_specs, connection,
+            filler_clipped, clear_specs, connection,
             layer=mbe_pair[0], datatype=mbe_pair[1], precision=precision,
         )
         strip |= {_route_poly_key(p) for p in filler}

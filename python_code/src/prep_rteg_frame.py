@@ -293,6 +293,28 @@ def _load_frame_cell(
     return lib, cell
 
 
+def _strip_frame_mbe_orphans(frame_cell: gdstk.Cell) -> gdstk.Cell:
+    """
+    Return a flat copy of the frame cell with interior MBE orphans removed.
+
+    Only the outer MBE ring (largest area polygon on the MBE layer) is kept;
+    all smaller standalone MBE pieces inside the frame are dropped. Every
+    polygon on other layers is kept intact.
+    """
+    flat = frame_cell.flatten()
+    mbe = [p for p in flat.polygons
+           if p.layer == MBE_LAYER and p.datatype == MBE_DATATYPE]
+    other = [p for p in flat.polygons
+             if not (p.layer == MBE_LAYER and p.datatype == MBE_DATATYPE)]
+    clean = gdstk.Cell(frame_cell.name)
+    if mbe:
+        ring = max(mbe, key=lambda p: abs(p.area()))
+        clean.add(ring)
+    for p in other:
+        clean.add(p)
+    return clean
+
+
 def _assembly_exceeds_content_x(
     assembly: ResonatorPpdAssembly,
     assembly_origin: tuple[float, float],
@@ -389,6 +411,7 @@ def prep_rteg_in_frame(
         return []
 
     frame_lib, frame_master = _load_frame_cell(frame_gds, frame_cell)
+    frame_master = _strip_frame_mbe_orphans(frame_master)
     inner_bb = inner_die_frame_bbox(frame_master, frame_origin)
     content_bb = _margined_content_bbox(
         inner_bb,
@@ -439,8 +462,7 @@ def prep_rteg_in_frame(
         top.add(filler)
 
         out_lib = gdstk.Library()
-        for c in frame_lib.cells:
-            out_lib.add(c)
+        out_lib.add(frame_master)   # cleaned flat frame (no interior MBE orphans)
         for c in ppd_asm.library.cells:
             out_lib.add(c)
         out_lib.add(top)

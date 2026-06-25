@@ -862,6 +862,95 @@ def route_signal_with_shift(
 
 
 # --------------------------------------------------------------------------- #
+# Step 8b — geometry-driven signal shift (clean MTE→pad approach)
+# --------------------------------------------------------------------------- #
+def choose_signal_shift(
+    connect_polys: Sequence[gdstk.Polygon],
+    body_polys: Sequence[gdstk.Polygon],
+    signal_pad: Sequence[gdstk.Polygon],
+    *,
+    cavity_bbox: Bbox | None = None,
+    span_tol_um: float = 5.0,
+    precision: float = 1e-3,
+) -> Point:
+    """
+    Vertical shift that aligns the collar intercepts with the signal pad.
+
+    The signal pad sits to the side (left) at a fixed height, so the cleanest
+    route is horizontal — pad and collar mouth at the same height. If the pad's
+    height already falls inside the collar intercept span (within ``span_tol_um``),
+    the collar has a clean view and **no shift** is applied (e.g. KB331 res 6). If
+    the whole collar sits **below** the pad, shift the resonator **up**; if it sits
+    **above**, shift **down** — by the delta that brings the collar mouth center to
+    the pad height. The vertical move is clamped to keep the resonator body inside
+    ``cavity_bbox`` (the routable inner-frame envelope). No horizontal shift.
+    """
+    contact = extract_collar_contact(
+        connect_polys, body_polys, signal_pad_polys=signal_pad, precision=precision
+    )
+    if contact is None:
+        return (0.0, 0.0)
+    pad_bb = polys_bbox(list(signal_pad))
+    if pad_bb is None:
+        return (0.0, 0.0)
+    pad_y = (pad_bb[0][1] + pad_bb[1][1]) / 2.0
+
+    y_lo = min(contact.intercept_a[1], contact.intercept_b[1])
+    y_hi = max(contact.intercept_a[1], contact.intercept_b[1])
+    if y_lo - span_tol_um <= pad_y <= y_hi + span_tol_um:
+        return (0.0, 0.0)  # pad already within collar span — clean horizontal view.
+
+    dy = pad_y - (y_lo + y_hi) / 2.0  # bring collar mouth center to pad height.
+
+    # Clamp so the resonator body stays inside the routable cavity.
+    bb = polys_bbox(list(body_polys))
+    if cavity_bbox is not None and bb is not None:
+        (_x0, by0), (_x1, by1) = bb
+        (_cx0, cy0), (_cx1, cy1) = cavity_bbox
+        if dy > 0:
+            dy = min(dy, cy1 - by1)
+        elif dy < 0:
+            dy = max(dy, cy0 - by0)
+    return (0.0, dy)
+
+
+def signal_shift_for_resonator(
+    roles: object,
+    classification: object,
+    layermap: LayerMap,
+    *,
+    span_tol_um: float = 5.0,
+    precision: float = 1e-3,
+) -> Point:
+    """
+    Geometry-driven vertical signal shift for one resonator's step-5.1 roles.
+
+    Selects the signal geometry the same way as ``build_resonator_route`` (MTE for
+    center_pad, MBE for collar_extend) and delegates to ``choose_signal_shift`` to
+    align the collar intercepts with the signal-pad height. Apply the result as a
+    ``shift_overrides`` entry to ``prep_rteg_in_frame`` so it moves the resonator
+    consistently in both the frame export and the routing geometry, then re-collect
+    and route.
+    """
+    center_pad = getattr(classification, "mte_route_target", "") == "center_pad"
+    if center_pad:
+        connect = [tp.polygon for tp in roles.preserved.mte]
+        body = list(roles.resonator_body_mte)
+    else:
+        connect = [tp.polygon for tp in roles.preserved.mbe]
+        body = list(roles.resonator_body_mbe)
+    signal_pad = [tp.polygon for tp in roles.ground_plates.center]
+    if not signal_pad or not connect or not body:
+        return (0.0, 0.0)
+
+    cavity_bbox = roles.frame_boundary.cavity.polygon.bounding_box()
+    return choose_signal_shift(
+        connect, body, signal_pad,
+        cavity_bbox=cavity_bbox, span_tol_um=span_tol_um, precision=precision,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Batch orchestration (one routed resonator + export)
 # --------------------------------------------------------------------------- #
 def _route_poly_key(poly: gdstk.Polygon) -> tuple[float, float, float, float, float]:
@@ -1111,6 +1200,8 @@ __all__ = [
     "build_ground_filler",
     "build_resonator_route",
     "build_signal_route",
+    "choose_signal_shift",
+    "signal_shift_for_resonator",
     "export_route_new_gds",
     "extract_all_contacts",
     "extract_collar_contact",

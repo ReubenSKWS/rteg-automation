@@ -395,6 +395,7 @@ def prep_rteg_in_frame(
     y_margin_pct: float = DEFAULT_Y_MARGIN_PCT,
     resonator_filler_right_margin_um: float = DEFAULT_RESONATOR_FILLER_RIGHT_MARGIN_UM,
     filler_left_gap_um: float = DEFAULT_MBE_FILLER_LEFT_GAP_UM,
+    shift_overrides: dict[int, tuple[float, float]] | None = None,
 ) -> list[RtegFrameAssembly]:
     """
     Build one die-frame + PPD assembly per step-3 object.
@@ -435,6 +436,13 @@ def prep_rteg_in_frame(
             content_bb,
             resonator_filler_right_margin_um=resonator_filler_right_margin_um,
         )
+        # Caller-supplied per-resonator nudge (e.g. to land the resonator at a
+        # reference layout's placement) is applied additively on top of the auto
+        # filler-clearance shift. `resonator_frame_shift` flows through both the
+        # frame export placement and the routing-geometry collection.
+        if shift_overrides and ppd_asm.index in shift_overrides:
+            ovx, ovy = shift_overrides[ppd_asm.index]
+            res_shift = (res_shift[0] + ovx, res_shift[1] + ovy)
         filler = mbe_width_filler_polygon(
             ppd_asm,
             asm_origin,

@@ -286,6 +286,37 @@ def transitive_orphans(
     return [p for i, p in enumerate(preserved_polys) if i not in kept_idx]
 
 
+def _split_collar_extensions(
+    bridging: Sequence[gdstk.Polygon],
+    body_polys: Sequence[gdstk.Polygon],
+    *,
+    min_collar_fraction: float = 0.35,
+    precision: float = 1e-3,
+) -> tuple[list[gdstk.Polygon], list[gdstk.Polygon]]:
+    """
+    Split bridging into collar pieces (keep) vs. die filter extensions (strip).
+
+    The collar ring wraps closely around the resonator body — its overlap with the
+    body is a large fraction of its own area. The die filter extensions are thin
+    fingers that only touch the body at the intercept edge; their overlap fraction
+    is small. Pieces with overlap/total_area >= min_collar_fraction are kept;
+    the rest are extensions to delete.
+    """
+    collar: list[gdstk.Polygon] = []
+    extensions: list[gdstk.Polygon] = []
+    for p in bridging:
+        total = abs(p.area())
+        if total < 1e-6:
+            extensions.append(p)
+            continue
+        overlap = _overlap_area(p, body_polys, precision=precision)
+        if overlap / total >= min_collar_fraction:
+            collar.append(p)
+        else:
+            extensions.append(p)
+    return collar, extensions
+
+
 def extract_all_contacts(
     connect_polys: Sequence[gdstk.Polygon],
     body_polys: Sequence[gdstk.Polygon],
@@ -821,7 +852,11 @@ def build_resonator_route(
         )
         signal_net = route.net
         intercepts = (contact.intercept_a, contact.intercept_b)
-        strip |= {_route_poly_key(p) for p in contact.bridging}
+        # Keep the collar ring but strip the die filter extensions.
+        # The collar closely follows the body (high overlap fraction);
+        # extensions are filter interconnect metal that only touch at intercepts.
+        _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
+        strip |= {_route_poly_key(p) for p in ext_pieces}
 
     # --- ground filler ---
     filler_nets: list[gdstk.Polygon] = []

@@ -317,6 +317,52 @@ def _split_collar_extensions(
     return collar, extensions
 
 
+def _find_upstream_knee(
+    ext_polys: Sequence[gdstk.Polygon],
+    intercept: Point,
+    *,
+    tol: float = 1.5,
+) -> Point | None:
+    """
+    Return the die-side endpoint of the extension edge containing ``intercept``.
+
+    The die filter extension approaches the collar at a fixed angle. To reproduce
+    that approach angle in the new route, we walk each extension polygon's edges,
+    find the one whose projection onto ``intercept`` is within ``tol`` µm, and
+    return that edge's **upstream (die-side) vertex** — the endpoint farther from
+    the intercept. Inserting that vertex as a knee point makes the route's final
+    segment into the intercept parallel to the extension edge.
+
+    Returns ``None`` when no extension edge lies within ``tol`` of the intercept,
+    so the caller falls back to the unconstrained ring.
+    """
+    px, py = intercept
+    best_dist = tol + 1.0
+    best_knee: Point | None = None
+
+    for ext in ext_polys:
+        pts = _poly_points(ext)
+        n = len(pts)
+        for i in range(n):
+            x0, y0 = pts[i]
+            x1, y1 = pts[(i + 1) % n]
+            dx, dy = x1 - x0, y1 - y0
+            ll = dx * dx + dy * dy
+            if ll < 1e-18:
+                continue
+            t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / ll))
+            qx, qy = x0 + t * dx, y0 + t * dy
+            d = math.hypot(px - qx, py - qy)
+            if d < best_dist:
+                best_dist = d
+                # Die-side vertex = the endpoint farther from the intercept.
+                d0 = math.hypot(px - x0, py - y0)
+                d1 = math.hypot(px - x1, py - y1)
+                best_knee = (x0, y0) if d0 > d1 else (x1, y1)
+
+    return best_knee if best_dist <= tol else None
+
+
 def extract_all_contacts(
     connect_polys: Sequence[gdstk.Polygon],
     body_polys: Sequence[gdstk.Polygon],
@@ -531,6 +577,14 @@ class SignalRoute:
         )
 
 
+# Acceptance floor for inserting an extension-angle knee. A knee is kept only
+# when the merged net's min interior angle stays at/above this floor — measured
+# relative to the bare (no-knee) baseline so a knee that does no harm is never
+# rejected, but a knee that would carve an acute sliver into the net is dropped.
+_KNEE_NET_FLOOR_DEG = 15.0
+_KNEE_NET_EPS_DEG = 0.5
+
+
 def build_signal_route(
     contact: CollarContact,
     launch_polys: Sequence[gdstk.Polygon],
@@ -540,6 +594,7 @@ def build_signal_route(
     layer: int,
     datatype: int,
     merge_polys: Sequence[gdstk.Polygon] = (),
+    ext_polys: Sequence[gdstk.Polygon] = (),
     launch_overlap_um: float = 0.5,
     clamp_launch: bool = False,
     precision: float = 1e-3,
@@ -553,6 +608,12 @@ def build_signal_route(
     the MBE rectangle filler (MBE terminal, ``clamp_launch`` for a narrow tab).
     The collar contact / intercepts are read from the die and used verbatim; the
     resonator-facing edge follows the body boundary between them.
+
+    ``ext_polys`` are the die filter extensions for this collar. When provided, a
+    knee point is inserted before each intercept so the route's final segment into
+    the intercept runs parallel to the extension edge — reproducing the original
+    filter approach angle. Falls back to the unconstrained ring per-intercept when
+    no extension edge is found near that intercept.
     """
     launch_bbox = _signal_pad_bbox(launch_polys)
     mouth = contact.mouth_center
@@ -566,16 +627,10 @@ def build_signal_route(
         collar_body, contact.intercept_a, contact.intercept_b, contact.bridging
     )
 
-    # Ring: low launch corner → high launch corner → collar arc (a..b) → close.
-    ring: list[Point] = [launch_lo, launch_hi, *arc]
-    ring = _dedupe(ring, 0.05)
-    if _signed_area(ring) < 0:
-        ring = list(reversed(ring))
-    connector = gdstk.Polygon(ring, layer=layer, datatype=datatype)
-
     # Clip bridging fingers at the pad's front face (the face that faces the resonator)
     # so the merged net's left edge is a straight vertical line exactly at the pad's
-    # front face — not leaking into or past the pad interior.
+    # front face — not leaking into or past the pad interior. This is independent of
+    # the knee choice, so compute it once.
     (px0, py0), (px1, py1) = launch_bbox
     cx, cy = (px0 + px1) / 2.0, (py0 + py1) / 2.0
     dx, dy = mouth[0] - cx, mouth[1] - cy
@@ -599,22 +654,61 @@ def build_signal_route(
             keep_half = gdstk.Polygon([(px0 - _BIG, front_y - _BIG), (px0 - _BIG, front_y),
                                         (px1 + _BIG, front_y), (px1 + _BIG, front_y - _BIG)])
 
-    # Clip each bridging piece to the resonator-side half only.
     clipped_bridging: list[gdstk.Polygon] = []
     for bp in contact.bridging:
         cb = gdstk.boolean([bp], [keep_half], "and", precision=precision)
         clipped_bridging.extend(cb)
 
-    # Merge connector + clipped bridging + any extra pieces.
-    # The connector's launch corners already sit at the pad front face, so the
-    # merged net's leftmost edge is the pad front face — a straight vertical line.
-    pieces = [connector, *clipped_bridging, *merge_polys]
-    merged = gdstk.boolean(pieces, [], "or", precision=precision)
-    if merged:
-        net = max(merged, key=lambda p: abs(p.area()))
-        net = gdstk.Polygon(_poly_points(net), layer=layer, datatype=datatype)
-    else:
-        net = connector
+    # Candidate knee points reproduce the extension approach angle into each
+    # intercept (arc[0] ≈ intercept_a, arc[-1] ≈ intercept_b). The knee is the
+    # die-side vertex of the extension edge, so the route's final segment into the
+    # intercept runs parallel to the extension.
+    cand_a = _find_upstream_knee(ext_polys, contact.intercept_a) if ext_polys else None
+    cand_b = _find_upstream_knee(ext_polys, contact.intercept_b) if ext_polys else None
+
+    def _assemble(ka: Point | None, kb: Point | None):
+        # Ring: launch_lo → launch_hi → [knee_a] → collar arc (a..b) → [knee_b].
+        r: list[Point] = [launch_lo, launch_hi]
+        if ka is not None:
+            r.append(ka)
+        r.extend(arc)
+        if kb is not None:
+            r.append(kb)
+        r = _dedupe(r, 0.05)
+        if _signed_area(r) < 0:
+            r = list(reversed(r))
+        conn = gdstk.Polygon(r, layer=layer, datatype=datatype)
+        # Merge connector + clipped bridging + extras. The launch corners sit at the
+        # pad front face, so the merged net's leftmost edge is a straight line.
+        merged = gdstk.boolean([conn, *clipped_bridging, *merge_polys], [], "or",
+                               precision=precision)
+        if merged:
+            nt = max(merged, key=lambda p: abs(p.area()))
+            nt = gdstk.Polygon(_poly_points(nt), layer=layer, datatype=datatype)
+        else:
+            nt = conn
+        return r, conn, nt
+
+    # Pick the knee combination that matches the most extension angles without
+    # carving an acute sliver into the merged net. The bare ring (no knees) is the
+    # safe fallback; a knee combo is accepted only when the net's min interior angle
+    # stays at/above the floor relative to that baseline.
+    combos = [(cand_a, cand_b), (cand_a, None), (None, cand_b), (None, None)]
+    assembled = []
+    for ka, kb in combos:
+        r, conn, nt = _assemble(ka, kb)
+        ang = _min_interior_angle_deg(_poly_points(nt))
+        assembled.append(((ka is not None) + (kb is not None), ang, r, conn, nt))
+    base_angle = assembled[-1][1]  # (None, None)
+    accept_floor = min(_KNEE_NET_FLOOR_DEG, base_angle) - _KNEE_NET_EPS_DEG
+
+    best = None
+    for n_knees, ang, r, conn, nt in assembled:
+        if n_knees > 0 and ang < accept_floor:
+            continue
+        if best is None or (n_knees, ang) > (best[0], best[1]):
+            best = (n_knees, ang, r, conn, nt)
+    _, _, ring, connector, net = best
 
     min_angle = _min_interior_angle_deg(ring)
     body_overlap = _overlap_area(connector, body_polys, precision=precision)
@@ -846,16 +940,18 @@ def build_resonator_route(
     # --- signal route ---
     contact = extract_collar_contact(connect, body, signal_pad_polys=signal_pad, precision=precision)
     if contact is not None and signal_pad:
+        # Split the bridging into the collar ring (kept) and die filter extensions.
+        # The collar closely follows the body (high overlap fraction); extensions
+        # are filter interconnect metal that only touch at intercepts. The extension
+        # geometry also carries the approach angle the new route should reproduce.
+        _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
         route = build_signal_route(
             contact, signal_pad, body, terminal=terminal,
-            layer=s_layer, datatype=s_dt, clamp_launch=False, precision=precision,
+            layer=s_layer, datatype=s_dt, clamp_launch=False,
+            ext_polys=ext_pieces, precision=precision,
         )
         signal_net = route.net
         intercepts = (contact.intercept_a, contact.intercept_b)
-        # Keep the collar ring but strip the die filter extensions.
-        # The collar closely follows the body (high overlap fraction);
-        # extensions are filter interconnect metal that only touch at intercepts.
-        _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
         strip |= {_route_poly_key(p) for p in ext_pieces}
 
     # --- ground filler ---

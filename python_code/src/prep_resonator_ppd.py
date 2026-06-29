@@ -70,8 +70,12 @@ def ppd_pad_keepout_polys(
 ) -> list[gdstk.Polygon]:
     """Pad / frame metal from the flattened PPD, translated to ``ppd_origin``."""
     ox, oy = ppd_origin
+    # Flatten on a throwaway wrapper so the source cell keeps its references
+    # (``Cell.flatten()`` mutates in place; step 5.2b re-prep needs them intact).
+    probe = gdstk.Cell("_ppd_pad_keepout_probe")
+    probe.add(gdstk.Reference(ppd_cell))
     keepouts: list[gdstk.Polygon] = []
-    for poly in ppd_cell.flatten().polygons:
+    for poly in probe.flatten().polygons:
         if (poly.layer, poly.datatype) not in PPD_PAD_LAYERS:
             continue
         if abs(poly.area()) < MIN_KEEPOUT_POLY_AREA:

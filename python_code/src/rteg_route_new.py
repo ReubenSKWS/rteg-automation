@@ -438,8 +438,84 @@ def _signal_pad_bbox(signal_pad_polys: Sequence[gdstk.Polygon]) -> Bbox:
     return bb
 
 
+def _main_signal_pad_polygon(
+    signal_pad_polys: Sequence[gdstk.Polygon],
+) -> gdstk.Polygon:
+    """
+    GSG center probe pad in the center ground band.
+
+    ``ground_plates.center`` can include preserved filter metal after frame
+    prep; the launch target is always the left-side frame probe rectangle.
+    """
+    candidates = [p for p in signal_pad_polys if p.bounding_box() is not None]
+    if not candidates:
+        raise ValueError("signal pad has no geometry")
+    if len(candidates) == 1:
+        return candidates[0]
+    min_x0 = min(p.bounding_box()[0][0] for p in candidates)
+    frame_aligned = [
+        p for p in candidates
+        if p.bounding_box()[0][0] <= min_x0 + 1.0
+    ]
+    return max(frame_aligned or candidates, key=lambda p: abs(p.area()))
+
+
+def _probe_signal_pad_bbox(signal_pad_polys: Sequence[gdstk.Polygon]) -> Bbox:
+    """BBox of the GSG probe pad only (excludes resonator-side center-band metal)."""
+    bb = _main_signal_pad_polygon(signal_pad_polys).bounding_box()
+    if bb is None:
+        raise ValueError("signal pad has no geometry")
+    return bb
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _gsg_signal_pad_corners_tr_br(
+    launch_bbox: Bbox,
+    *,
+    overlap_um: float,
+) -> tuple[Point, Point]:
+    """
+    Top-right and bottom-right launch corners on the probe pad's right edge.
+
+    GSG signal routes always span the full probe-pad height at TR/BR.
+    """
+    (_x0, y0), (x1, y1) = launch_bbox
+    x = x1 - overlap_um
+    return (x, y1), (x, y0)
+
+
+def _pad_front_keep_half(
+    launch_bbox: Bbox,
+    launch_hi: Point,
+    launch_lo: Point,
+) -> gdstk.Polygon:
+    """Half-plane on the resonator side of the pad launch edge."""
+    (px0, py0), (px1, py1) = launch_bbox
+    _BIG = 1e5
+    if abs(launch_hi[0] - launch_lo[0]) < 1e-6:
+        front_x = px1 if abs(launch_hi[0] - px1) <= abs(launch_hi[0] - px0) else px0
+        if front_x == px1:
+            return gdstk.Polygon([
+                (front_x, py0 - _BIG), (front_x, py1 + _BIG),
+                (front_x + _BIG, py1 + _BIG), (front_x + _BIG, py0 - _BIG),
+            ])
+        return gdstk.Polygon([
+            (front_x - _BIG, py0 - _BIG), (front_x - _BIG, py1 + _BIG),
+            (front_x, py1 + _BIG), (front_x, py0 - _BIG),
+        ])
+    front_y = py1 if abs(launch_hi[1] - py1) <= abs(launch_hi[1] - py0) else py0
+    if front_y == py1:
+        return gdstk.Polygon([
+            (px0 - _BIG, front_y), (px0 - _BIG, front_y + _BIG),
+            (px1 + _BIG, front_y + _BIG), (px1 + _BIG, front_y),
+        ])
+    return gdstk.Polygon([
+        (px0 - _BIG, front_y - _BIG), (px0 - _BIG, front_y),
+        (px1 + _BIG, front_y), (px1 + _BIG, front_y - _BIG),
+    ])
 
 
 def _launch_corners(
@@ -577,12 +653,8 @@ class SignalRoute:
         )
 
 
-# Acceptance floor for inserting an extension-angle knee. A knee is kept only
-# when the merged net's min interior angle stays at/above this floor — measured
-# relative to the bare (no-knee) baseline so a knee that does no harm is never
-# rejected, but a knee that would carve an acute sliver into the net is dropped.
-_KNEE_NET_FLOOR_DEG = 15.0
-_KNEE_NET_EPS_DEG = 0.5
+# Knee combos are scored by extension-angle match (more knees preferred); interior
+# angle is reported but not used to reject steep geometry.
 
 
 def build_signal_route(
@@ -604,8 +676,9 @@ def build_signal_route(
     walk → intercept_b, then merge with the preexisting connect finger (and any
     ``merge_polys`` such as the MBE filler) into a single net polygon.
 
-    ``launch_polys`` is the center GSG signal pad (MTE terminal, full edge) or
-    the MBE rectangle filler (MBE terminal, ``clamp_launch`` for a narrow tab).
+    ``launch_polys`` is the center GSG signal pad (MTE terminal, full-height
+    top-right / bottom-right launch) or the MBE rectangle filler (MBE terminal,
+    ``clamp_launch`` for a narrow tab).
     The collar contact / intercepts are read from the die and used verbatim; the
     resonator-facing edge follows the body boundary between them.
 
@@ -615,12 +688,17 @@ def build_signal_route(
     filter approach angle. Falls back to the unconstrained ring per-intercept when
     no extension edge is found near that intercept.
     """
-    launch_bbox = _signal_pad_bbox(launch_polys)
+    launch_bbox = _probe_signal_pad_bbox(launch_polys)
     mouth = contact.mouth_center
-    launch_hi, launch_lo = _launch_corners(
-        launch_bbox, contact.intercept_a, contact.intercept_b, mouth,
-        overlap_um=launch_overlap_um, clamp_to_intercepts=clamp_launch,
-    )
+    if clamp_launch:
+        launch_hi, launch_lo = _launch_corners(
+            launch_bbox, contact.intercept_a, contact.intercept_b, mouth,
+            overlap_um=launch_overlap_um, clamp_to_intercepts=True,
+        )
+    else:
+        launch_hi, launch_lo = _gsg_signal_pad_corners_tr_br(
+            launch_bbox, overlap_um=launch_overlap_um,
+        )
 
     collar_body = _select_collar_body(body_polys, contact.intercept_a, contact.intercept_b)
     arc = _collar_arc(
@@ -628,31 +706,8 @@ def build_signal_route(
     )
 
     # Clip bridging fingers at the pad's front face (the face that faces the resonator)
-    # so the merged net's left edge is a straight vertical line exactly at the pad's
-    # front face — not leaking into or past the pad interior. This is independent of
-    # the knee choice, so compute it once.
-    (px0, py0), (px1, py1) = launch_bbox
-    cx, cy = (px0 + px1) / 2.0, (py0 + py1) / 2.0
-    dx, dy = mouth[0] - cx, mouth[1] - cy
-    _BIG = 1e5
-    if abs(dx) >= abs(dy):
-        # vertical facing edge: front face = px1 (dx>=0) or px0 (dx<0)
-        front_x = px1 if dx >= 0 else px0
-        if dx >= 0:
-            keep_half = gdstk.Polygon([(front_x, py0 - _BIG), (front_x, py1 + _BIG),
-                                        (front_x + _BIG, py1 + _BIG), (front_x + _BIG, py0 - _BIG)])
-        else:
-            keep_half = gdstk.Polygon([(front_x - _BIG, py0 - _BIG), (front_x - _BIG, py1 + _BIG),
-                                        (front_x, py1 + _BIG), (front_x, py0 - _BIG)])
-    else:
-        # horizontal facing edge: front face = py1 (dy>=0) or py0 (dy<0)
-        front_y = py1 if dy >= 0 else py0
-        if dy >= 0:
-            keep_half = gdstk.Polygon([(px0 - _BIG, front_y), (px0 - _BIG, front_y + _BIG),
-                                        (px1 + _BIG, front_y + _BIG), (px1 + _BIG, front_y)])
-        else:
-            keep_half = gdstk.Polygon([(px0 - _BIG, front_y - _BIG), (px0 - _BIG, front_y),
-                                        (px1 + _BIG, front_y), (px1 + _BIG, front_y - _BIG)])
+    # so the merged net's pad-side edge is a straight line at the launch edge.
+    keep_half = _pad_front_keep_half(launch_bbox, launch_hi, launch_lo)
 
     clipped_bridging: list[gdstk.Polygon] = []
     for bp in contact.bridging:
@@ -689,23 +744,16 @@ def build_signal_route(
             nt = conn
         return r, conn, nt
 
-    # Pick the knee combination that matches the most extension angles without
-    # carving an acute sliver into the merged net. The bare ring (no knees) is the
-    # safe fallback; a knee combo is accepted only when the net's min interior angle
-    # stays at/above the floor relative to that baseline.
+    # Pick the knee combination that matches the most extension angles.
     combos = [(cand_a, cand_b), (cand_a, None), (None, cand_b), (None, None)]
     assembled = []
     for ka, kb in combos:
         r, conn, nt = _assemble(ka, kb)
         ang = _min_interior_angle_deg(_poly_points(nt))
         assembled.append(((ka is not None) + (kb is not None), ang, r, conn, nt))
-    base_angle = assembled[-1][1]  # (None, None)
-    accept_floor = min(_KNEE_NET_FLOOR_DEG, base_angle) - _KNEE_NET_EPS_DEG
 
     best = None
     for n_knees, ang, r, conn, nt in assembled:
-        if n_knees > 0 and ang < accept_floor:
-            continue
         if best is None or (n_knees, ang) > (best[0], best[1]):
             best = (n_knees, ang, r, conn, nt)
     _, _, ring, connector, net = best
@@ -864,33 +912,69 @@ def route_signal_with_shift(
 # --------------------------------------------------------------------------- #
 # Step 8b — geometry-driven signal shift (clean MTE→pad approach)
 # --------------------------------------------------------------------------- #
+def _clamp_vertical_dy(
+    dy: float,
+    body_bbox: Bbox,
+    *,
+    y_lo: float,
+    y_hi: float,
+) -> float:
+    """Clamp ``dy`` so the body bbox stays within ``[y_lo, y_hi]`` on Y."""
+    (_x0, by0), (_x1, by1) = body_bbox
+    if dy > 0:
+        return min(dy, y_hi - by1)
+    if dy < 0:
+        return max(dy, y_lo - by0)
+    return dy
+
+
+def gsg_vertical_bounds(
+    ground_plates: object,
+    *,
+    margin_um: float = 10.0,
+) -> tuple[float, float] | None:
+    """
+    Allowed Y span for resonator metal inside the GSG probe window.
+
+    Uses the top/bottom ground pad envelopes: body bottom must clear the top of
+    the bottom ground band; body top must clear the bottom of the top ground band.
+    """
+    top_bb = polys_bbox([tp.polygon for tp in ground_plates.top])
+    bot_bb = polys_bbox([tp.polygon for tp in ground_plates.bottom])
+    if top_bb is None or bot_bb is None:
+        return None
+    y_lo = bot_bb[1][1] + margin_um
+    y_hi = top_bb[0][1] - margin_um
+    if y_hi <= y_lo:
+        return None
+    return y_lo, y_hi
+
+
 def choose_signal_shift(
     connect_polys: Sequence[gdstk.Polygon],
     body_polys: Sequence[gdstk.Polygon],
     signal_pad: Sequence[gdstk.Polygon],
     *,
     cavity_bbox: Bbox | None = None,
+    gsg_y_bounds: tuple[float, float] | None = None,
     span_tol_um: float = 5.0,
+    extra_dy_um: float = 0.0,
     precision: float = 1e-3,
 ) -> Point:
     """
     Vertical shift that aligns the collar intercepts with the signal pad.
 
-    The signal pad sits to the side (left) at a fixed height, so the cleanest
-    route is horizontal — pad and collar mouth at the same height. If the pad's
-    height already falls inside the collar intercept span (within ``span_tol_um``),
-    the collar has a clean view and **no shift** is applied (e.g. KB331 res 6). If
-    the whole collar sits **below** the pad, shift the resonator **up**; if it sits
-    **above**, shift **down** — by the delta that brings the collar mouth center to
-    the pad height. The vertical move is clamped to keep the resonator body inside
-    ``cavity_bbox`` (the routable inner-frame envelope). No horizontal shift.
+    If the pad height already falls inside the collar intercept span, no shift.
+    Otherwise shift vertically to bring the collar mouth center to the pad
+    height, then optionally nudge by ``extra_dy_um`` in the same direction.
+    Clamped to ``gsg_y_bounds`` when provided.
     """
     contact = extract_collar_contact(
         connect_polys, body_polys, signal_pad_polys=signal_pad, precision=precision
     )
     if contact is None:
         return (0.0, 0.0)
-    pad_bb = polys_bbox(list(signal_pad))
+    pad_bb = _probe_signal_pad_bbox(list(signal_pad))
     if pad_bb is None:
         return (0.0, 0.0)
     pad_y = (pad_bb[0][1] + pad_bb[1][1]) / 2.0
@@ -898,19 +982,26 @@ def choose_signal_shift(
     y_lo = min(contact.intercept_a[1], contact.intercept_b[1])
     y_hi = max(contact.intercept_a[1], contact.intercept_b[1])
     if y_lo - span_tol_um <= pad_y <= y_hi + span_tol_um:
-        return (0.0, 0.0)  # pad already within collar span — clean horizontal view.
+        return (0.0, 0.0)
 
-    dy = pad_y - (y_lo + y_hi) / 2.0  # bring collar mouth center to pad height.
+    dy = pad_y - (y_lo + y_hi) / 2.0
 
-    # Clamp so the resonator body stays inside the routable cavity.
     bb = polys_bbox(list(body_polys))
-    if cavity_bbox is not None and bb is not None:
-        (_x0, by0), (_x1, by1) = bb
-        (_cx0, cy0), (_cx1, cy1) = cavity_bbox
-        if dy > 0:
-            dy = min(dy, cy1 - by1)
-        elif dy < 0:
-            dy = max(dy, cy0 - by0)
+    if bb is None:
+        return (0.0, dy)
+
+    def _apply_bounds(delta: float) -> float:
+        if gsg_y_bounds is not None:
+            return _clamp_vertical_dy(delta, bb, y_lo=gsg_y_bounds[0], y_hi=gsg_y_bounds[1])
+        if cavity_bbox is not None:
+            (_cx0, cy0), (_cx1, cy1) = cavity_bbox
+            return _clamp_vertical_dy(delta, bb, y_lo=cy0, y_hi=cy1)
+        return delta
+
+    dy = _apply_bounds(dy)
+    if abs(dy) > 1e-6 and extra_dy_um > 0:
+        sign = 1.0 if dy > 0 else -1.0
+        dy = _apply_bounds(dy + sign * extra_dy_um)
     return (0.0, dy)
 
 
@@ -920,17 +1011,15 @@ def signal_shift_for_resonator(
     layermap: LayerMap,
     *,
     span_tol_um: float = 5.0,
+    extra_shift_um: float = 60.0,
+    frame_margin_um: float = 10.0,
     precision: float = 1e-3,
 ) -> Point:
     """
     Geometry-driven vertical signal shift for one resonator's step-5.1 roles.
 
-    Selects the signal geometry the same way as ``build_resonator_route`` (MTE for
-    center_pad, MBE for collar_extend) and delegates to ``choose_signal_shift`` to
-    align the collar intercepts with the signal-pad height. Apply the result as a
-    ``shift_overrides`` entry to ``prep_rteg_in_frame`` so it moves the resonator
-    consistently in both the frame export and the routing geometry, then re-collect
-    and route.
+    Apply the result as ``shift_overrides`` to ``prep_rteg_in_frame``, then
+    re-collect geometry and route.
     """
     center_pad = getattr(classification, "mte_route_target", "") == "center_pad"
     if center_pad:
@@ -943,10 +1032,21 @@ def signal_shift_for_resonator(
     if not signal_pad or not connect or not body:
         return (0.0, 0.0)
 
-    cavity_bbox = roles.frame_boundary.cavity.polygon.bounding_box()
+    clamp_polys = list(body)
+    for group in roles.release_holes.groups().values():
+        clamp_polys.extend(tp.polygon for tp in group)
+
+    gsg_bounds = gsg_vertical_bounds(
+        roles.ground_plates, margin_um=frame_margin_um,
+    )
     return choose_signal_shift(
-        connect, body, signal_pad,
-        cavity_bbox=cavity_bbox, span_tol_um=span_tol_um, precision=precision,
+        connect,
+        clamp_polys,
+        signal_pad,
+        gsg_y_bounds=gsg_bounds,
+        span_tol_um=span_tol_um,
+        extra_dy_um=extra_shift_um,
+        precision=precision,
     )
 
 
@@ -1027,7 +1127,10 @@ def build_resonator_route(
     intercepts: tuple[Point, Point] | None = None
 
     # --- signal route ---
-    contact = extract_collar_contact(connect, body, signal_pad_polys=signal_pad, precision=precision)
+    probe_pad = [_main_signal_pad_polygon(signal_pad)]
+    contact = extract_collar_contact(
+        connect, body, signal_pad_polys=probe_pad, precision=precision,
+    )
     if contact is not None and signal_pad:
         # Split the bridging into the collar ring (kept) and die filter extensions.
         # The collar closely follows the body (high overlap fraction); extensions
@@ -1201,6 +1304,7 @@ __all__ = [
     "build_resonator_route",
     "build_signal_route",
     "choose_signal_shift",
+    "gsg_vertical_bounds",
     "signal_shift_for_resonator",
     "export_route_new_gds",
     "extract_all_contacts",

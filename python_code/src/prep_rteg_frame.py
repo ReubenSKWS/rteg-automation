@@ -436,10 +436,6 @@ def prep_rteg_in_frame(
             content_bb,
             resonator_filler_right_margin_um=resonator_filler_right_margin_um,
         )
-        # Caller-supplied per-resonator nudge (e.g. to land the resonator at a
-        # reference layout's placement) is applied additively on top of the auto
-        # filler-clearance shift. `resonator_frame_shift` flows through both the
-        # frame export placement and the routing-geometry collection.
         if shift_overrides and ppd_asm.index in shift_overrides:
             ovx, ovy = shift_overrides[ppd_asm.index]
             res_shift = (res_shift[0] + ovx, res_shift[1] + ovy)

@@ -830,6 +830,76 @@ def apply_rev_circle_clearout_to_signal(
 # --------------------------------------------------------------------------- #
 # Step 7 — ground filler (notch the MBE plane around the signal at DRC clearance)
 # --------------------------------------------------------------------------- #
+def ground_filler_frame_mask(
+    ground_plates: object,
+    frame_boundary: object,
+) -> gdstk.Polygon | None:
+    """
+    Allowed MBE ground-filler extent: inner die cavity (left) through the step-4
+    rectangle filler (right), vertically aligned with the GSG top/bottom plates.
+    """
+    top_bb = polys_bbox([tp.polygon for tp in ground_plates.top])
+    bot_bb = polys_bbox([tp.polygon for tp in ground_plates.bottom])
+    filler = [tp.polygon for tp in ground_plates.filler]
+    filler_bb = polys_bbox(filler)
+    cavity = getattr(frame_boundary, "cavity", None)
+    cavity_poly = getattr(cavity, "polygon", None) if cavity is not None else None
+    cavity_bb = cavity_poly.bounding_box() if cavity_poly is not None else None
+    if not top_bb or not bot_bb or not filler_bb or not cavity_bb:
+        return None
+    y_lo = bot_bb[0][1]
+    y_hi = top_bb[1][1]
+    x_lo = cavity_bb[0][0]
+    x_hi = filler_bb[1][0]
+    if y_hi <= y_lo or x_hi <= x_lo:
+        return None
+    return gdstk.Polygon([(x_lo, y_lo), (x_lo, y_hi), (x_hi, y_hi), (x_hi, y_lo)])
+
+
+def _clip_polys_to_mask(
+    polys: Sequence[gdstk.Polygon],
+    mask: gdstk.Polygon,
+    *,
+    layer: int,
+    datatype: int,
+    precision: float = 1e-3,
+) -> list[gdstk.Polygon]:
+    clipped: list[gdstk.Polygon] = []
+    for poly in polys:
+        parts = gdstk.boolean([poly], [mask], "and", precision=precision) or []
+        clipped.extend(
+            gdstk.Polygon(_poly_points(part), layer, datatype) for part in parts
+        )
+    return clipped
+
+
+def _ground_mbe_collar_connection(
+    connect_mbe: Sequence[gdstk.Polygon],
+    body_mbe: Sequence[gdstk.Polygon],
+    signal_pad_polys: Sequence[gdstk.Polygon],
+    *,
+    layer: int,
+    datatype: int,
+    precision: float = 1e-3,
+) -> list[gdstk.Polygon]:
+    """
+    Preserved MBE collar bridging for ``center_pad`` ground filler.
+
+    The carved filler plane can fall short of the collar intercepts (signal and
+    REV clearout carve near the mouth on series parts). Unioning the die collar
+    finger closes the gap after preserved MBE is stripped from the frame.
+    """
+    contact = extract_collar_contact(
+        connect_mbe, body_mbe, signal_pad_polys=signal_pad_polys, precision=precision,
+    )
+    if contact is None:
+        return []
+    return [
+        gdstk.Polygon(p.points, layer, datatype)
+        for p in contact.bridging
+    ]
+
+
 def build_ground_filler(
     filler_polys: Sequence[gdstk.Polygon],
     clear_specs: Sequence[tuple[Sequence[gdstk.Polygon], float]],
@@ -1152,7 +1222,8 @@ def build_resonator_route(
     Route one resonator from its step-5.1 roles + step-5.2 classification.
 
     * **center_pad** → MTE signal to the center pad; MBE ground filler traces the
-      resonator body edge (no interior overlap) and edge-touches the MBE ground.
+      resonator body edge (no interior overlap) and unions the MBE collar bridging
+      at the mouth so ground stays continuous after preserved MBE is stripped.
     * **collar_extend** → MBE signal to the center pad; the grounded MTE extension
       is capped with MBE (clear of the MBE signal body) so the filler connects
       from the top without overlapping the resonator.
@@ -1228,8 +1299,11 @@ def build_resonator_route(
             filler_clipped = list(filler)
 
         sig_route = [signal_net] if signal_net is not None else []
-        if center_pad:                      # ground = MBE: trace body edge, edge-touch
-            connection: list[gdstk.Polygon] = []
+        if center_pad:                      # ground = MBE: carve body + collar mouth union
+            connection = _ground_mbe_collar_connection(
+                all_mbe, body_mbe, probe_pad,
+                layer=mbe_pair[0], datatype=mbe_pair[1], precision=precision,
+            )
             clear_specs = [(sig_route, signal_clearance_um),
                            ([*body_mte, *body_mbe], 0.0)]
         else:                               # ground = grounded MTE: cap the top
@@ -1250,6 +1324,17 @@ def build_resonator_route(
             filler_clipped, clear_specs, connection,
             layer=mbe_pair[0], datatype=mbe_pair[1], precision=precision,
         )
+        frame_mask = ground_filler_frame_mask(
+            roles.ground_plates, roles.frame_boundary,
+        )
+        if frame_mask is not None:
+            filler_nets = _clip_polys_to_mask(
+                filler_nets,
+                frame_mask,
+                layer=mbe_pair[0],
+                datatype=mbe_pair[1],
+                precision=precision,
+            )
         strip |= {_route_poly_key(p) for p in filler}
 
     # --- post-route BAW_REV circle clearout (pad-side connector only) ---
@@ -1380,6 +1465,7 @@ __all__ = [
     "build_all_routes",
     "build_ground_filler",
     "build_resonator_route",
+    "ground_filler_frame_mask",
     "build_signal_route",
     "choose_signal_shift",
     "gsg_vertical_bounds",

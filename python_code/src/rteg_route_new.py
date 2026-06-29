@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import gdstk
 
 from layermap import LayerMap
+from rteg_collect import grown_rev_circle_clearout_zones
 from rteg_utils import polys_bbox
 
 Point = tuple[float, float]
@@ -645,6 +646,7 @@ class SignalRoute:
     arc_len: int
     min_angle_deg: float
     body_overlap_um2: float
+    collar_polys: tuple[gdstk.Polygon, ...] = ()
 
     def is_clean(self, *, min_angle_deg: float, max_body_overlap_um2: float) -> bool:
         return (
@@ -771,7 +773,58 @@ def build_signal_route(
         arc_len=len(arc),
         min_angle_deg=min_angle,
         body_overlap_um2=body_overlap,
+        collar_polys=tuple(clipped_bridging),
     )
+
+
+# --------------------------------------------------------------------------- #
+# BAW_REV (37/0) circle clearout — PDK6 min clearance from release holes
+# --------------------------------------------------------------------------- #
+def rev_circle_polys_from_roles(roles: object) -> list[gdstk.Polygon]:
+    """Circle-only ``BAW_REV`` outlines collected in step 5.1."""
+    rev_circles = getattr(roles, "rev_release_circles", None)
+    if rev_circles is None:
+        return []
+    return list(rev_circles.polygons())
+
+
+def _carve_polygon_from_zones(
+    poly: gdstk.Polygon,
+    zones: Sequence[gdstk.Polygon],
+    *,
+    precision: float = 1e-3,
+) -> gdstk.Polygon:
+    if not zones:
+        return poly
+    carved = gdstk.boolean([poly], list(zones), "not", precision=precision)
+    if not carved:
+        return poly
+    best = max(carved, key=lambda p: abs(p.area()))
+    return gdstk.Polygon(_poly_points(best), poly.layer, poly.datatype)
+
+
+def apply_rev_circle_clearout_to_signal(
+    route: SignalRoute,
+    circle_polys: Sequence[gdstk.Polygon],
+    clearance_um: float,
+    *,
+    precision: float = 1e-3,
+) -> gdstk.Polygon:
+    """
+    Post-route ``BAW_REV`` clearout: carve only the new pad-side connector.
+
+    Preserved collar bridging stays intact (NPI metal at intercepts).
+    """
+    if not circle_polys or clearance_um <= 0:
+        return route.net
+    zones = grown_rev_circle_clearout_zones(circle_polys, clearance_um, precision=precision)
+    carved = _carve_polygon_from_zones(route.connector, zones, precision=precision)
+    pieces = [carved, *route.collar_polys]
+    merged = gdstk.boolean(pieces, [], "or", precision=precision)
+    if not merged:
+        return carved
+    best = max(merged, key=lambda p: abs(p.area()))
+    return gdstk.Polygon(_poly_points(best), route.layer, route.datatype)
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,8 +1086,7 @@ def signal_shift_for_resonator(
         return (0.0, 0.0)
 
     clamp_polys = list(body)
-    for group in roles.release_holes.groups().values():
-        clamp_polys.extend(tp.polygon for tp in group)
+    clamp_polys.extend(rev_circle_polys_from_roles(roles))
 
     gsg_bounds = gsg_vertical_bounds(
         roles.ground_plates, margin_um=frame_margin_um,
@@ -1093,6 +1145,7 @@ def build_resonator_route(
     *,
     signal_clearance_um: float = 21.0,
     body_clearance_um: float = 3.0,
+    rev_circle_clearance_um: float | None = None,
     precision: float = 1e-3,
 ) -> ResonatorRoute:
     """
@@ -1125,6 +1178,16 @@ def build_resonator_route(
     strip: set = set()
     signal_net: gdstk.Polygon | None = None
     intercepts: tuple[Point, Point] | None = None
+    signal_route: SignalRoute | None = None
+    rev_circles = rev_circle_polys_from_roles(roles)
+    rev_circles_role = getattr(roles, "rev_release_circles", None)
+    if rev_circle_clearance_um is None:
+        if rev_circles_role is not None:
+            rev_circle_clearance_um = rev_circles_role.clearance_um
+        else:
+            from prep_resonator_ppd import MIN_RELEASE_HOLE_CLEARANCE_UM
+
+            rev_circle_clearance_um = MIN_RELEASE_HOLE_CLEARANCE_UM
 
     # --- signal route ---
     probe_pad = [_main_signal_pad_polygon(signal_pad)]
@@ -1137,12 +1200,12 @@ def build_resonator_route(
         # are filter interconnect metal that only touch at intercepts. The extension
         # geometry also carries the approach angle the new route should reproduce.
         _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
-        route = build_signal_route(
+        signal_route = build_signal_route(
             contact, signal_pad, body, terminal=terminal,
             layer=s_layer, datatype=s_dt, clamp_launch=False,
             ext_polys=ext_pieces, precision=precision,
         )
-        signal_net = route.net
+        signal_net = signal_route.net
         intercepts = (contact.intercept_a, contact.intercept_b)
         strip |= {_route_poly_key(p) for p in ext_pieces}
 
@@ -1178,11 +1241,25 @@ def build_resonator_route(
             ]
             clear_specs = [(sig_route, signal_clearance_um),
                            ([*body_mbe, *body_mte], body_clearance_um)]
+        if rev_circles:
+            clear_specs = [
+                *clear_specs,
+                (rev_circles, rev_circle_clearance_um),
+            ]
         filler_nets = build_ground_filler(
             filler_clipped, clear_specs, connection,
             layer=mbe_pair[0], datatype=mbe_pair[1], precision=precision,
         )
         strip |= {_route_poly_key(p) for p in filler}
+
+    # --- post-route BAW_REV circle clearout (pad-side connector only) ---
+    if signal_route is not None and rev_circles:
+        signal_net = apply_rev_circle_clearout_to_signal(
+            signal_route,
+            rev_circles,
+            rev_circle_clearance_um,
+            precision=precision,
+        )
 
     # --- cleanup: orphan MTE + wild preserved MBE filter extensions ---
     strip |= {_route_poly_key(p) for p in transitive_orphans(all_mte, body_mte, precision=precision)}
@@ -1299,6 +1376,7 @@ __all__ = [
     "CollarContact",
     "ShiftedRoute",
     "SignalRoute",
+    "apply_rev_circle_clearout_to_signal",
     "build_all_routes",
     "build_ground_filler",
     "build_resonator_route",
@@ -1309,6 +1387,7 @@ __all__ = [
     "export_route_new_gds",
     "extract_all_contacts",
     "extract_collar_contact",
+    "rev_circle_polys_from_roles",
     "route_signal_with_shift",
     "routes_overview_rows",
     "select_signal_contact",

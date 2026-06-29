@@ -157,6 +157,16 @@ def resonator_release_hole_polys(
     return _shifted_resonator_polys(res, dx, dy, layers=RELEASE_HOLE_LAYERS)
 
 
+def resonator_layer_polys(
+    res: Resonator,
+    dx: float,
+    dy: float,
+    layer_pair: tuple[int, int],
+) -> list[gdstk.Polygon]:
+    """Flattened resonator polygons on one GDS layer pair after ``(dx, dy)`` placement."""
+    return _shifted_resonator_polys(res, dx, dy, layers=frozenset({layer_pair}))
+
+
 def _metal_bbox(
     metal_polys: Sequence[gdstk.Polygon],
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:

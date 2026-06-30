@@ -1,10 +1,11 @@
 """
-Step 5.4 — straighten release-hole keepout curves on routed MBE (2/0) polygons.
+Step 5.4 — clean routed MTE/MBE polygons after boolean merge and release-hole clearout.
 
-``BAW_REV`` circle clearout (step 5.3) carves circular notches into MBE routes
-using a grown keepout ring (hole radius + PDK6 clearance). Boolean / offset ops
-leave GDS arc approximations along that ring. This module finds only those
-keepout-boundary runs and replaces each with three chord segments.
+1. **Spike removal** — boolean ``or`` / clearout can leave narrow inward notches
+   (the boundary takes a short detour instead of closing along the chord). Drop
+   acute tip vertices whose adjacent edges are short.
+2. **Keepout arc straightening** — ``BAW_REV`` circle clearout carves circular
+   notches into MBE routes; replace those ring-following runs with chord segments.
 """
 from __future__ import annotations
 
@@ -23,6 +24,19 @@ RevCircleSpec = tuple[Point, float]  # (center, radius)
 
 
 @dataclass(frozen=True)
+class SpikeCleanConfig:
+    """Tunables for removing boolean-merge inward notches on route polygons."""
+
+    max_interior_angle_deg: float = 45.0
+    max_spike_edge_um: float = 15.0
+    max_spike_height_um: float = 3.0
+    acute_interior_angle_deg: float = 25.0
+    acute_short_edge_um: float = 2.0
+    dedupe_tol_um: float = 0.05
+    boolean_precision: float = 1e-3
+
+
+@dataclass(frozen=True)
 class RouteCleanConfig:
     """Tunables for release-hole keepout notch detection on route polygons."""
 
@@ -35,6 +49,15 @@ class RouteCleanConfig:
     min_notch_span_deg: float = 20.0
     max_notch_span_deg: float = 270.0
     max_keepout_radius_um: float = 25.0
+
+
+@dataclass
+class SpikeCleanResult:
+    """Per-polygon spike-removal summary."""
+
+    before_vertices: int
+    after_vertices: int
+    spikes_removed: int
 
 
 @dataclass
@@ -58,6 +81,107 @@ def _dedupe_vertices(points: Sequence[Point], tol_um: float) -> list[Point]:
     if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tol_um:
         out[-1] = out[0]
     return out
+
+
+def _interior_angle_deg(points: Sequence[Point], index: int) -> float:
+    n = len(points)
+    p0, p1, p2 = points[(index - 1) % n], points[index], points[(index + 1) % n]
+    v1 = (p0[0] - p1[0], p0[1] - p1[1])
+    v2 = (p2[0] - p1[0], p2[1] - p1[1])
+    l1, l2 = math.hypot(*v1), math.hypot(*v2)
+    if l1 < 1e-9 or l2 < 1e-9:
+        return 180.0
+    cos = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)))
+    return math.degrees(math.acos(cos))
+
+
+def _spike_height_um(points: Sequence[Point], index: int) -> float:
+    """Perpendicular distance from ``points[index]`` to the chord at its neighbors."""
+    n = len(points)
+    ax, ay = points[(index - 1) % n]
+    bx, by = points[(index + 1) % n]
+    tx, ty = points[index]
+    lab = math.hypot(bx - ax, by - ay)
+    if lab < 1e-9:
+        return 0.0
+    return abs((by - ay) * tx - (bx - ax) * ty + bx * ay - by * ax) / lab
+
+
+def remove_polygon_spikes(
+    points: Sequence[Point],
+    cfg: SpikeCleanConfig | None = None,
+) -> tuple[list[Point], int]:
+    """
+    Drop acute tip vertices from a route ring — inward boolean notches / spikes.
+
+    Iterates until stable. Each removed vertex is an acute corner where both
+    adjacent edges are short, or a very short acute tip.
+    """
+    cfg = cfg or SpikeCleanConfig()
+    pts = _dedupe_vertices(points, cfg.dedupe_tol_um)
+    removed = 0
+    changed = True
+    while changed and len(pts) >= 4:
+        changed = False
+        n = len(pts)
+        drop: set[int] = set()
+        for i in range(n):
+            ang = _interior_angle_deg(pts, i)
+            edge_prev = math.hypot(pts[i][0] - pts[(i - 1) % n][0], pts[i][1] - pts[(i - 1) % n][1])
+            edge_next = math.hypot(pts[i][0] - pts[(i + 1) % n][0], pts[i][1] - pts[(i + 1) % n][1])
+            height = _spike_height_um(pts, i)
+            if (
+                ang < cfg.max_interior_angle_deg
+                and edge_prev < cfg.max_spike_edge_um
+                and edge_next < cfg.max_spike_edge_um
+            ):
+                drop.add(i)
+                continue
+            if (
+                ang < cfg.acute_interior_angle_deg
+                and min(edge_prev, edge_next) < cfg.acute_short_edge_um
+            ):
+                drop.add(i)
+                continue
+            if (
+                ang < cfg.max_interior_angle_deg
+                and height < cfg.max_spike_height_um
+                and max(edge_prev, edge_next) < cfg.max_spike_edge_um
+            ):
+                drop.add(i)
+        if drop:
+            pts = [pt for j, pt in enumerate(pts) if j not in drop]
+            pts = _dedupe_vertices(pts, cfg.dedupe_tol_um)
+            removed += len(drop)
+            changed = True
+    return pts, removed
+
+
+def clean_route_polygon_spikes(
+    poly: gdstk.Polygon,
+    cfg: SpikeCleanConfig | None = None,
+) -> tuple[gdstk.Polygon, SpikeCleanResult]:
+    """Remove inward boolean spikes, then re-heal with a single ``or`` merge."""
+    cfg = cfg or SpikeCleanConfig()
+    before = len(poly.points)
+    pts, removed = remove_polygon_spikes(
+        [(float(x), float(y)) for x, y in poly.points],
+        cfg,
+    )
+    out = gdstk.Polygon(pts, layer=poly.layer, datatype=poly.datatype)
+    merged = gdstk.boolean([out], [], "or", precision=cfg.boolean_precision)
+    if merged:
+        best = max(merged, key=lambda p: abs(p.area()))
+        out = gdstk.Polygon(
+            [(float(x), float(y)) for x, y in best.points],
+            layer=poly.layer,
+            datatype=poly.datatype,
+        )
+    return out, SpikeCleanResult(
+        before_vertices=before,
+        after_vertices=len(out.points),
+        spikes_removed=removed,
+    )
 
 
 def rev_circle_specs(circle_polys: Sequence[gdstk.Polygon]) -> list[RevCircleSpec]:
@@ -266,9 +390,11 @@ def clean_resonator_route(
     roles: object | None = None,
     rev_circles: Sequence[gdstk.Polygon] | None = None,
     clearance_um: float | None = None,
-) -> tuple[ResonatorRoute, list[ArcStraightenResult]]:
-    """Apply release-hole keepout curve cleanup to MBE route polygons."""
+    spike_cfg: SpikeCleanConfig | None = None,
+) -> tuple[ResonatorRoute, list[ArcStraightenResult], list[SpikeCleanResult]]:
+    """Spike removal on all route polygons, then MBE keepout-arc straightening."""
     cfg = cfg or RouteCleanConfig()
+    spike_cfg = spike_cfg or SpikeCleanConfig()
     mbe_pair = layermap.pair("BAW_MBE")
     if (cfg.layer, cfg.datatype) != mbe_pair:
         cfg = replace(cfg, layer=mbe_pair[0], datatype=mbe_pair[1])
@@ -276,31 +402,36 @@ def clean_resonator_route(
     circles = list(rev_circles if rev_circles is not None else rev_circle_polys_from_roles(roles))
     gap = clearance_um if clearance_um is not None else _clearance_um_from_roles(roles)
 
-    results: list[ArcStraightenResult] = []
+    arc_results: list[ArcStraightenResult] = []
+    spike_results: list[SpikeCleanResult] = []
+
     signal_net = route.signal_net
-    if signal_net is not None and (signal_net.layer, signal_net.datatype) == mbe_pair:
-        signal_net, res = clean_route_polygon_curves(
-            signal_net, cfg, rev_circles=circles, clearance_um=gap,
-        )
-        results.append(res)
+    if signal_net is not None:
+        signal_net, spike_res = clean_route_polygon_spikes(signal_net, spike_cfg)
+        spike_results.append(spike_res)
+        if (signal_net.layer, signal_net.datatype) == mbe_pair:
+            signal_net, arc_res = clean_route_polygon_curves(
+                signal_net, cfg, rev_circles=circles, clearance_um=gap,
+            )
+            arc_results.append(arc_res)
 
     filler_nets: list[gdstk.Polygon] = []
     for fp in route.filler_nets:
-        if (fp.layer, fp.datatype) != mbe_pair:
-            filler_nets.append(fp)
-            continue
-        cleaned, res = clean_route_polygon_curves(
-            fp, cfg, rev_circles=circles, clearance_um=gap,
-        )
+        cleaned, spike_res = clean_route_polygon_spikes(fp, spike_cfg)
+        spike_results.append(spike_res)
+        if (cleaned.layer, cleaned.datatype) == mbe_pair:
+            cleaned, arc_res = clean_route_polygon_curves(
+                cleaned, cfg, rev_circles=circles, clearance_um=gap,
+            )
+            arc_results.append(arc_res)
         filler_nets.append(cleaned)
-        results.append(res)
 
     cleaned_route = replace(
         route,
         signal_net=signal_net,
         filler_nets=filler_nets,
     )
-    return cleaned_route, results
+    return cleaned_route, arc_results, spike_results
 
 
 def clean_all_routes(
@@ -318,7 +449,7 @@ def clean_all_routes(
         if idx not in routes:
             continue
         roles = roles_by_index.get(idx) if roles_by_index else None
-        cleaned, _ = clean_resonator_route(
+        cleaned, _, _ = clean_resonator_route(
             routes[idx], layermap, cfg, roles=roles,
         )
         out[idx] = cleaned
@@ -337,16 +468,18 @@ def route_clean_overview_rows(
     for idx in sorted(routes):
         route = routes[idx]
         roles = roles_by_index.get(idx) if roles_by_index else None
-        _, results = clean_resonator_route(route, layermap, cfg, roles=roles)
+        _, arc_results, spike_results = clean_resonator_route(route, layermap, cfg, roles=roles)
         rows.append(
             {
                 "index": route.index,
                 "inst_name": route.inst_name,
-                "mbe_polys_cleaned": len(results),
-                "notches_found": sum(r.arcs_found for r in results),
-                "notches_straightened": sum(r.arcs_straightened for r in results),
-                "verts_before": sum(r.before_vertices for r in results),
-                "verts_after": sum(r.after_vertices for r in results),
+                "route_polys_cleaned": len(spike_results),
+                "spikes_removed": sum(r.spikes_removed for r in spike_results),
+                "mbe_polys_arc_cleaned": len(arc_results),
+                "notches_found": sum(r.arcs_found for r in arc_results),
+                "notches_straightened": sum(r.arcs_straightened for r in arc_results),
+                "verts_before": sum(r.before_vertices for r in spike_results),
+                "verts_after": sum(r.after_vertices for r in spike_results),
             }
         )
     return rows
@@ -356,10 +489,14 @@ __all__ = [
     "ArcStraightenResult",
     "RouteCleanConfig",
     "RevCircleSpec",
+    "SpikeCleanConfig",
+    "SpikeCleanResult",
     "clean_all_routes",
     "clean_resonator_route",
     "clean_route_polygon_curves",
+    "clean_route_polygon_spikes",
     "find_release_keepout_notch_runs",
+    "remove_polygon_spikes",
     "rev_circle_specs",
     "route_clean_overview_rows",
     "straighten_arc_run",

@@ -17,8 +17,11 @@ for p in (str(SRC),):
 from prep_resonator_ppd import MIN_RELEASE_HOLE_CLEARANCE_UM  # noqa: E402
 from rteg_route_clean import (  # noqa: E402
     RouteCleanConfig,
+    SpikeCleanConfig,
     clean_route_polygon_curves,
+    clean_route_polygon_spikes,
     find_release_keepout_notch_runs,
+    remove_polygon_spikes,
     rev_circle_specs,
 )
 
@@ -66,6 +69,27 @@ def _route_with_keepout_notch(
 
 
 class RouteCleanTests(unittest.TestCase):
+    def test_removes_inward_boolean_spike(self):
+        # Acute tip with two short edges — typical boolean-merge spike.
+        poly = gdstk.Polygon(
+            [
+                (0.0, 0.0),
+                (40.0, 0.0),
+                (40.0, 20.0),
+                (30.0, 20.0),
+                (30.5, 19.5),
+                (30.0, 19.0),  # tip
+                (29.5, 19.5),
+                (30.0, 10.0),
+                (0.0, 10.0),
+            ],
+            layer=5,
+            datatype=0,
+        )
+        cleaned, res = clean_route_polygon_spikes(poly)
+        self.assertGreater(res.spikes_removed, 0)
+        self.assertLess(len(cleaned.points), len(poly.points))
+
     def test_detects_keepout_ring_notch(self):
         center = (200.0, 200.0)
         route_poly, rev_poly = _route_with_keepout_notch(center)

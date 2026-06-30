@@ -25,11 +25,13 @@ from rteg_collect import (
 )
 from rteg_filler_bridge import (
     DEFAULT_FILLER_BRIDGE_WIDTH_UM,
+    DEFAULT_FRAME_CAP_OVERLAP_UM,
     apply_filler_bridge_all_routes,
     filler_bridge_applies,
     filler_bridge_overview_rows,
     gsg_frame_y_span,
     right_edge_bridge_polygon,
+    right_frame_cap_polygon,
     split_rectangle_plate_detected,
 )
 from rteg_route_new import build_all_routes, ground_filler_frame_mask
@@ -115,7 +117,31 @@ class TestFillerBridgeKb331(unittest.TestCase):
         filler_plate = [tp.polygon for tp in roles.ground_plates.filler]
         detected, _ = split_rectangle_plate_detected(updated[0].filler_nets, filler_plate)
         self.assertFalse(detected)
-        self.assertEqual(len(updated[0].filler_nets), 1)
+        self.assertEqual(len(updated[0].filler_nets), 2)
+
+    def test_index0_frame_cap_is_independent_polygon(self):
+        updated = apply_filler_bridge_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap, indices=(0,),
+        )
+        roles = self.all_roles[0]
+        filler_right = roles.ground_plates.filler[0].polygon.bounding_box()[1][0]
+        y_lo, y_hi = gsg_frame_y_span(roles.ground_plates)
+        assert y_lo is not None
+        plate_overlap = [
+            p for p in updated[0].filler_nets
+            if p.bounding_box()[1][0] <= filler_right + 0.02
+        ]
+        cap_pieces = [
+            p for p in updated[0].filler_nets
+            if p.bounding_box()[0][0] >= filler_right - 0.02
+        ]
+        self.assertEqual(len(updated[0].filler_nets), 2)
+        self.assertEqual(len(plate_overlap), 1)
+        self.assertEqual(len(cap_pieces), 1)
+        cap_bb = cap_pieces[0].bounding_box()
+        self.assertAlmostEqual(cap_bb[0][0], filler_right, places=2)
+        self.assertEqual(len(cap_pieces[0].points), 4)
+        self.assertNotEqual(id(plate_overlap[0]), id(cap_pieces[0]))
 
     def test_index0_bridge_matches_gsg_frame_height(self):
         rows = filler_bridge_overview_rows(
@@ -144,12 +170,53 @@ class TestFillerBridgeKb331(unittest.TestCase):
         self.assertAlmostEqual(row["bridge_length_um"], y_hi - y_lo, places=2)
         self.assertAlmostEqual(row["bridge_length_um"], mask_bb[1][1] - mask_bb[0][1], places=2)
 
+    def test_index0_frame_cap_overlaps_die_frame(self):
+        rows = filler_bridge_overview_rows(
+            self.routes, self.all_roles, self.all_classify, self.layermap, indices=(0,),
+        )
+        row = rows[0]
+        self.assertTrue(row["frame_cap_applied"])
+        self.assertEqual(row["frame_cap_overlap_um"], DEFAULT_FRAME_CAP_OVERLAP_UM)
+
+        roles = self.all_roles[0]
+        cavity_right = roles.frame_boundary.cavity.polygon.bounding_box()[1][0]
+        filler_right = roles.ground_plates.filler[0].polygon.bounding_box()[1][0]
+        y_lo, y_hi = gsg_frame_y_span(roles.ground_plates)
+        assert y_lo is not None
+
+        self.assertAlmostEqual(row["frame_cap_x0"], filler_right, places=2)
+        self.assertAlmostEqual(row["frame_cap_x1"], cavity_right + DEFAULT_FRAME_CAP_OVERLAP_UM, places=2)
+
+        updated = apply_filler_bridge_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap, indices=(0,),
+        )
+        cap_pieces = [
+            p for p in updated[0].filler_nets
+            if p.bounding_box()[0][0] >= filler_right - 0.02
+        ]
+        self.assertEqual(len(cap_pieces), 1)
+        cap_band = gdstk.rectangle(
+            (filler_right, y_lo),
+            (cavity_right + DEFAULT_FRAME_CAP_OVERLAP_UM + 0.01, y_hi),
+            2, 0,
+        )
+        overlap = gdstk.boolean([cap_pieces[0]], [cap_band], "and", precision=1e-3) or []
+        cap_area = sum(abs(p.area()) for p in overlap)
+        expected = (cavity_right + DEFAULT_FRAME_CAP_OVERLAP_UM - filler_right) * (y_hi - y_lo)
+        self.assertAlmostEqual(cap_area, expected, delta=5.0)
+
     def test_index0_bridge_has_no_union_spikes(self):
         updated = apply_filler_bridge_all_routes(
             self.routes, self.all_roles, self.all_classify, self.layermap, indices=(0,),
         )
-        poly = updated[0].filler_nets[0]
-        pts = [(float(x), float(y)) for x, y in poly.points]
+        roles = self.all_roles[0]
+        filler_right = roles.ground_plates.filler[0].polygon.bounding_box()[1][0]
+        plate_piece = max(
+            updated[0].filler_nets,
+            key=lambda p: abs(p.area()),
+        )
+        self.assertLessEqual(plate_piece.bounding_box()[1][0], filler_right + 0.02)
+        pts = [(float(x), float(y)) for x, y in plate_piece.points]
         acute = [_interior_angle_deg(pts, i) for i in range(len(pts))]
         self.assertFalse(
             any(ang < 45.0 for ang in acute),
@@ -179,7 +246,7 @@ class TestFillerBridgeKb331(unittest.TestCase):
         )
         detected_after, _ = split_rectangle_plate_detected(updated[7].filler_nets, filler_plate)
         self.assertFalse(detected_after)
-        self.assertEqual(len(updated[7].filler_nets), 1)
+        self.assertEqual(len(updated[7].filler_nets), 2)
 
 
 if __name__ == "__main__":

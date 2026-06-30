@@ -6,7 +6,9 @@ step-4 MBE width-filler rectangle split into two disconnected plate polygons
 (e.g. KB331 index 0). Reconnect them with a 1 µm-wide vertical strap from the
 rectangle top-right corner down to the bottom-right corner at the same height as
 the GSG MBE frame (layer 2/0 top/bottom ground plates), then merge into one
-closed polygon. No clearance rules apply to this bridge.
+closed polygon. Then append an independent MBE frame-ring cap polygon on the same
+layer (not unioned into the filler plate). No clearance rules apply to the bridge
+or cap.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ from rteg_utils import polys_bbox
 
 DEFAULT_FILLER_BRIDGE_WIDTH_UM = 1.0
 DEFAULT_MIN_SPLIT_PLATE_AREA_UM2 = 100.0
+DEFAULT_FRAME_CAP_OVERLAP_UM = 5.0
 
 # Boolean union of the 1 µm bridge strap with carved plate pieces can leave
 # ultra-acute tips on the strap's left edge where one adjacent edge is long.
@@ -40,6 +43,7 @@ FILLER_BRIDGE_SPIKE_CLEAN = SpikeCleanConfig(
 class FillerBridgeConfig:
     bridge_width_um: float = DEFAULT_FILLER_BRIDGE_WIDTH_UM
     min_plate_piece_area_um2: float = DEFAULT_MIN_SPLIT_PLATE_AREA_UM2
+    frame_cap_overlap_um: float = DEFAULT_FRAME_CAP_OVERLAP_UM
     boolean_precision: float = 1e-3
     spike_cfg: SpikeCleanConfig = FILLER_BRIDGE_SPIKE_CLEAN
 
@@ -52,6 +56,10 @@ class FillerBridgeResult:
     bridge_to: tuple[float, float] | None
     bridge_width_um: float
     bridge_length_um: float | None
+    frame_cap_applied: bool
+    frame_cap_x0: float | None
+    frame_cap_x1: float | None
+    frame_cap_overlap_um: float
     filler_pieces_before: int
     filler_pieces_after: int
 
@@ -76,6 +84,10 @@ class FillerBridgeResult:
             "bridge_to_y": round(ty, 2) if ty is not None else None,
             "bridge_width_um": self.bridge_width_um,
             "bridge_length_um": round(self.bridge_length_um, 2) if self.bridge_length_um is not None else None,
+            "frame_cap_applied": self.frame_cap_applied,
+            "frame_cap_x0": round(self.frame_cap_x0, 2) if self.frame_cap_x0 is not None else None,
+            "frame_cap_x1": round(self.frame_cap_x1, 2) if self.frame_cap_x1 is not None else None,
+            "frame_cap_overlap_um": self.frame_cap_overlap_um,
             "filler_pieces_before": self.filler_pieces_before,
             "filler_pieces_after": self.filler_pieces_after,
         }
@@ -170,6 +182,55 @@ def right_edge_bridge_polygon(
     )
 
 
+def _inner_cavity_right_x(frame_boundary: object) -> float | None:
+    cavity = getattr(frame_boundary, "cavity", None)
+    cavity_poly = getattr(cavity, "polygon", None) if cavity is not None else None
+    cavity_bb = cavity_poly.bounding_box() if cavity_poly is not None else None
+    if cavity_bb is None:
+        return None
+    return cavity_bb[1][0]
+
+
+def right_frame_cap_polygon(
+    filler_plate: Sequence[gdstk.Polygon],
+    ground_plates: object,
+    frame_boundary: object,
+    *,
+    overlap_um: float,
+    layer: int,
+    datatype: int,
+) -> tuple[gdstk.Polygon, float, float] | None:
+    """
+    Independent MBE cap on the filler right edge, GSG-frame height, overlapping the die frame inward.
+
+    Spans from the step-4 rectangle filler right edge to ``inner_cavity_right + overlap_um``
+    so the cap reaches about ``overlap_um`` into the RTEG frame ring. Returned as its own
+    closed polygon — not boolean-merged with the filler plate.
+    """
+    if overlap_um <= 0:
+        return None
+    bbox = _filler_plate_bbox(filler_plate)
+    y_span = gsg_frame_y_span(ground_plates)
+    cavity_right_x = _inner_cavity_right_x(frame_boundary)
+    if bbox is None or y_span is None or cavity_right_x is None:
+        return None
+    y_lo, y_hi = y_span
+    filler_right_x = bbox[2]
+    cap_right_x = cavity_right_x + overlap_um
+    if cap_right_x <= filler_right_x + 1e-6:
+        return None
+    return (
+        gdstk.rectangle(
+            (filler_right_x, y_lo),
+            (cap_right_x, y_hi),
+            layer=layer,
+            datatype=datatype,
+        ),
+        filler_right_x,
+        cap_right_x,
+    )
+
+
 def split_rectangle_plate_detected(
     filler_nets: Sequence[gdstk.Polygon],
     filler_plate: Sequence[gdstk.Polygon],
@@ -211,18 +272,20 @@ def filler_bridge_applies(
     return detected
 
 
-def _merge_filler_with_bridge(
+def _union_filler_with_extras(
     filler_nets: Sequence[gdstk.Polygon],
-    bridge: gdstk.Polygon,
+    extras: Sequence[gdstk.Polygon],
     *,
     layer: int,
     datatype: int,
     precision: float,
     spike_cfg: SpikeCleanConfig,
 ) -> list[gdstk.Polygon]:
-    merged = gdstk.boolean([*filler_nets, bridge], [], "or", precision=precision) or [
+    if not extras:
+        return list(filler_nets)
+    merged = gdstk.boolean([*filler_nets, *extras], [], "or", precision=precision) or [
         *filler_nets,
-        bridge,
+        *extras,
     ]
     cleaned: list[gdstk.Polygon] = []
     for piece in merged:
@@ -246,6 +309,25 @@ def _merge_filler_with_bridge(
     return cleaned
 
 
+def _merge_filler_with_bridge(
+    filler_nets: Sequence[gdstk.Polygon],
+    bridge: gdstk.Polygon,
+    *,
+    layer: int,
+    datatype: int,
+    precision: float,
+    spike_cfg: SpikeCleanConfig,
+) -> list[gdstk.Polygon]:
+    return _union_filler_with_extras(
+        filler_nets,
+        [bridge],
+        layer=layer,
+        datatype=datatype,
+        precision=precision,
+        spike_cfg=spike_cfg,
+    )
+
+
 def apply_filler_bridge_to_route(
     route: ResonatorRoute,
     roles: object,
@@ -254,7 +336,7 @@ def apply_filler_bridge_to_route(
     *,
     cfg: FillerBridgeConfig | None = None,
 ) -> tuple[ResonatorRoute, FillerBridgeResult]:
-    """Bridge a split rectangle plate and merge filler nets into one polygon."""
+    """Bridge a split rectangle plate, then append an independent frame-ring cap."""
     _ = layermap
     cfg = cfg or FillerBridgeConfig()
     precision = cfg.boolean_precision
@@ -265,6 +347,10 @@ def apply_filler_bridge_to_route(
         bridge_to=None,
         bridge_width_um=cfg.bridge_width_um,
         bridge_length_um=None,
+        frame_cap_applied=False,
+        frame_cap_x0=None,
+        frame_cap_x1=None,
+        frame_cap_overlap_um=cfg.frame_cap_overlap_um,
         filler_pieces_before=len(route.filler_nets),
         filler_pieces_after=len(route.filler_nets),
     )
@@ -302,6 +388,22 @@ def apply_filler_bridge_to_route(
         spike_cfg=cfg.spike_cfg,
     )
 
+    frame_cap_applied = False
+    frame_cap_x0: float | None = None
+    frame_cap_x1: float | None = None
+    cap_info = right_frame_cap_polygon(
+        filler_plate,
+        roles.ground_plates,
+        roles.frame_boundary,
+        overlap_um=cfg.frame_cap_overlap_um,
+        layer=layer,
+        datatype=datatype,
+    )
+    if cap_info is not None:
+        cap, frame_cap_x0, frame_cap_x1 = cap_info
+        new_nets = [*new_nets, cap]
+        frame_cap_applied = True
+
     result = FillerBridgeResult(
         applied=True,
         n_plate_pieces=2,
@@ -309,6 +411,10 @@ def apply_filler_bridge_to_route(
         bridge_to=bottom_right,
         bridge_width_um=cfg.bridge_width_um,
         bridge_length_um=bridge_length,
+        frame_cap_applied=frame_cap_applied,
+        frame_cap_x0=frame_cap_x0,
+        frame_cap_x1=frame_cap_x1,
+        frame_cap_overlap_um=cfg.frame_cap_overlap_um,
         filler_pieces_before=len(route.filler_nets),
         filler_pieces_after=len(new_nets),
     )
@@ -378,6 +484,7 @@ def filler_bridge_overview_rows(
 
 __all__ = [
     "DEFAULT_FILLER_BRIDGE_WIDTH_UM",
+    "DEFAULT_FRAME_CAP_OVERLAP_UM",
     "DEFAULT_MIN_SPLIT_PLATE_AREA_UM2",
     "FILLER_BRIDGE_SPIKE_CLEAN",
     "FillerBridgeConfig",
@@ -385,6 +492,7 @@ __all__ = [
     "apply_filler_bridge_all_routes",
     "apply_filler_bridge_to_route",
     "right_edge_bridge_polygon",
+    "right_frame_cap_polygon",
     "gsg_frame_y_span",
     "filler_bridge_applies",
     "filler_bridge_overview_rows",

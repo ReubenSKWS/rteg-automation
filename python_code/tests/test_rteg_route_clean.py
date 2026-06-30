@@ -20,7 +20,9 @@ from rteg_route_clean import (  # noqa: E402
     SpikeCleanConfig,
     clean_route_polygon_curves,
     clean_route_polygon_spikes,
+    find_arc_runs_to_straighten,
     find_release_keepout_notch_runs,
+    find_smooth_arc_runs,
     remove_polygon_spikes,
     rev_circle_specs,
 )
@@ -126,6 +128,48 @@ class RouteCleanTests(unittest.TestCase):
         self.assertEqual(res.arcs_straightened, 1)
         self.assertLess(len(cleaned.points), len(route_poly.points))
         self.assertLessEqual(len(cleaned.points), 9)
+
+    def test_detects_smooth_arc_without_keepout_ring_anchor(self):
+        center = (100.0, 100.0)
+        # Gentle arc offset from the REV keepout ring — typical boolean curve residue.
+        arc = _arc_points(center, 8.0, 200.0, 320.0, 14)
+        poly = gdstk.Polygon(
+            [
+                (center[0] - 40.0, center[1] - 10.0),
+                (center[0] + 40.0, center[1] - 10.0),
+                (center[0] + 40.0, center[1] + 30.0),
+                *reversed(arc),
+                (center[0] - 40.0, center[1] + 30.0),
+            ],
+            layer=2,
+            datatype=0,
+        )
+        pts = [(float(x), float(y)) for x, y in poly.points]
+        rev = _rev_circle_at((500.0, 500.0))
+        cfg = RouteCleanConfig()
+        runs = find_arc_runs_to_straighten(
+            pts, rev_circle_specs([rev]), MIN_RELEASE_HOLE_CLEARANCE_UM, cfg,
+        )
+        self.assertGreaterEqual(len(runs), 1)
+        cleaned, res = clean_route_polygon_curves(
+            poly, rev_circles=[rev], clearance_um=MIN_RELEASE_HOLE_CLEARANCE_UM,
+        )
+        self.assertGreaterEqual(res.arcs_straightened, 1)
+        self.assertLess(len(cleaned.points), len(poly.points))
+
+    def test_smooth_arc_rejects_large_filler_join(self):
+        filler_arc = _arc_points((0.0, 0.0), 50.0, 200.0, 340.0, 32)
+        poly = gdstk.Polygon(
+            [*filler_arc, (80.0, 0.0), (80.0, 80.0)],
+            layer=2,
+            datatype=0,
+        )
+        rev = _rev_circle_at((500.0, 500.0))
+        pts = [(float(x), float(y)) for x, y in poly.points]
+        runs = find_arc_runs_to_straighten(
+            pts, rev_circle_specs([rev]), MIN_RELEASE_HOLE_CLEARANCE_UM,
+        )
+        self.assertEqual(runs, [])
 
     def test_skips_without_rev_circles(self):
         route_poly, _ = _route_with_keepout_notch((100.0, 100.0))

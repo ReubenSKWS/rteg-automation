@@ -45,10 +45,16 @@ class RouteCleanConfig:
     min_arc_vertices: int = 5
     min_clusters: int = 3
     dedupe_tol_um: float = 0.05
-    keepout_radius_tol_um: float = 5.0
+    keepout_radius_tol_um: float = 8.0
     min_notch_span_deg: float = 20.0
     max_notch_span_deg: float = 270.0
     max_keepout_radius_um: float = 25.0
+    min_smooth_interior_angle_deg: float = 160.0
+    min_arc_bow_ratio: float = 1.025
+    max_arc_bow_ratio: float = 2.0
+    max_smooth_arc_radius_um: float = 40.0
+    large_smooth_arc_radius_um: float = 35.0
+    large_arc_keepout_tol_um: float = 15.0
 
 
 @dataclass
@@ -211,6 +217,60 @@ def _vertex_on_keepout_ring(
     return abs(dist - zone_radius_um) <= tol_um
 
 
+def _path_bow_ratio(seg: Sequence[Point]) -> float:
+    """Arc length divided by end-to-end chord — 1.0 is straight, larger is more bowed."""
+    if len(seg) < 2:
+        return 1.0
+    chord = math.hypot(seg[-1][0] - seg[0][0], seg[-1][1] - seg[0][1])
+    if chord < 1e-6:
+        return float("inf")
+    arc = sum(
+        math.hypot(seg[i + 1][0] - seg[i][0], seg[i + 1][1] - seg[i][1])
+        for i in range(len(seg) - 1)
+    )
+    return arc / chord
+
+
+def _mean_fit_radius(seg: Sequence[Point]) -> float:
+    """Mean vertex distance to the segment centroid — coarse arc radius estimate."""
+    n = len(seg)
+    if n == 0:
+        return 0.0
+    cx = sum(p[0] for p in seg) / n
+    cy = sum(p[1] for p in seg) / n
+    return sum(math.hypot(p[0] - cx, p[1] - cy) for p in seg) / n
+
+
+def _max_fit_radius(seg: Sequence[Point]) -> float:
+    """Max vertex distance to the segment centroid."""
+    n = len(seg)
+    if n == 0:
+        return 0.0
+    cx = sum(p[0] for p in seg) / n
+    cy = sum(p[1] for p in seg) / n
+    return max(math.hypot(p[0] - cx, p[1] - cy) for p in seg)
+
+
+def _run_has_keepout_anchor(
+    seg: Sequence[Point],
+    rev_specs: Sequence[RevCircleSpec],
+    clearance_um: float,
+    cfg: RouteCleanConfig,
+    *,
+    tol_um: float | None = None,
+) -> bool:
+    """True when at least one vertex lies on a ``BAW_REV`` keepout ring."""
+    ring_tol = tol_um if tol_um is not None else cfg.keepout_radius_tol_um
+    for pt in seg:
+        for center, rev_radius in rev_specs:
+            zone_r = rev_radius + clearance_um
+            if zone_r > cfg.max_keepout_radius_um:
+                continue
+            if _vertex_on_keepout_ring(pt, center, zone_r, ring_tol):
+                return True
+    return False
+
+
 def _arc_span_deg(seg: Sequence[Point], center: Point) -> float:
     """Angular span covered by ``seg`` around ``center`` (degrees)."""
     cx, cy = center
@@ -242,6 +302,8 @@ def find_release_keepout_notch_runs(
     rev_specs: Sequence[RevCircleSpec],
     clearance_um: float,
     cfg: RouteCleanConfig | None = None,
+    *,
+    claimed: list[bool] | None = None,
 ) -> list[tuple[int, int]]:
     """
     Return inclusive (start, end) pairs for vertices on a ``BAW_REV`` keepout ring.
@@ -255,7 +317,8 @@ def find_release_keepout_notch_runs(
     if len(points) < cfg.min_arc_vertices or not rev_specs:
         return []
 
-    claimed = [False] * len(points)
+    if claimed is None:
+        claimed = [False] * len(points)
     runs: list[tuple[int, int]] = []
 
     for center, rev_radius in rev_specs:
@@ -290,6 +353,90 @@ def find_release_keepout_notch_runs(
 
     runs.sort(key=lambda pair: pair[0])
     return _merge_wraparound_runs(points, runs)
+
+
+def find_smooth_arc_runs(
+    points: Sequence[Point],
+    cfg: RouteCleanConfig | None = None,
+    *,
+    claimed: list[bool] | None = None,
+    rev_specs: Sequence[RevCircleSpec] | None = None,
+    clearance_um: float = MIN_RELEASE_HOLE_CLEARANCE_UM,
+) -> list[tuple[int, int]]:
+    """
+    Return inclusive (start, end) pairs for gently bowed GDS arc vertex runs.
+
+    Catches boolean-merge curve approximations that no longer sit exactly on the
+    ``BAW_REV`` keepout ring. Rejects near-straight edges, tight U-bulges, and
+    large-radius filler joins via bow ratio and fitted-radius caps.
+    """
+    cfg = cfg or RouteCleanConfig()
+    if len(points) < cfg.min_arc_vertices:
+        return []
+    if claimed is None:
+        claimed = [False] * len(points)
+
+    def _is_smooth_vertex(index: int) -> bool:
+        return (
+            not claimed[index]
+            and _interior_angle_deg(points, index) >= cfg.min_smooth_interior_angle_deg
+        )
+
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(points):
+        if not _is_smooth_vertex(i):
+            i += 1
+            continue
+        j = i
+        while j < len(points) and _is_smooth_vertex(j):
+            j += 1
+        if j - i >= cfg.min_arc_vertices:
+            seg = points[i:j]
+            bow = _path_bow_ratio(seg)
+            fit_r = _mean_fit_radius(seg)
+            max_r = _max_fit_radius(seg)
+            if not (
+                cfg.min_arc_bow_ratio <= bow <= cfg.max_arc_bow_ratio
+                and fit_r <= cfg.max_smooth_arc_radius_um
+            ):
+                i = j
+                continue
+            if max_r > cfg.large_smooth_arc_radius_um:
+                if not rev_specs or not _run_has_keepout_anchor(
+                    seg, rev_specs, clearance_um, cfg,
+                    tol_um=cfg.large_arc_keepout_tol_um,
+                ):
+                    i = j
+                    continue
+            runs.append((i, j - 1))
+            for k in range(i, j):
+                claimed[k] = True
+        i = j
+
+    runs.sort(key=lambda pair: pair[0])
+    return _merge_wraparound_runs(points, runs)
+
+
+def find_arc_runs_to_straighten(
+    points: Sequence[Point],
+    rev_specs: Sequence[RevCircleSpec],
+    clearance_um: float,
+    cfg: RouteCleanConfig | None = None,
+) -> list[tuple[int, int]]:
+    """Keepout-ring notches first, then supplemental smooth-arc runs."""
+    cfg = cfg or RouteCleanConfig()
+    claimed = [False] * len(points)
+    runs = find_release_keepout_notch_runs(
+        points, rev_specs, clearance_um, cfg, claimed=claimed,
+    )
+    runs.extend(
+        find_smooth_arc_runs(
+            points, cfg, claimed=claimed, rev_specs=rev_specs, clearance_um=clearance_um,
+        )
+    )
+    runs.sort(key=lambda pair: pair[0])
+    return runs
 
 
 def _cluster_chord_points(
@@ -363,7 +510,7 @@ def clean_route_polygon_curves(
     before = len(pts)
     specs = rev_circle_specs(rev_circles)
     gap = clearance_um if clearance_um is not None else MIN_RELEASE_HOLE_CLEARANCE_UM
-    runs = find_release_keepout_notch_runs(pts, specs, gap, cfg)
+    runs = find_arc_runs_to_straighten(pts, specs, gap, cfg)
     straightened = 0
     for start, end in reversed(runs):
         if end - start + 1 < cfg.min_clusters * 2:
@@ -495,7 +642,9 @@ __all__ = [
     "clean_resonator_route",
     "clean_route_polygon_curves",
     "clean_route_polygon_spikes",
+    "find_arc_runs_to_straighten",
     "find_release_keepout_notch_runs",
+    "find_smooth_arc_runs",
     "remove_polygon_spikes",
     "rev_circle_specs",
     "route_clean_overview_rows",

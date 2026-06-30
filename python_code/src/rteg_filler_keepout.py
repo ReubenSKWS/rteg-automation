@@ -27,12 +27,13 @@ DEFAULT_FILLER_MTE_CLEARANCE_UM = DEFAULT_FILLER_KEEPOUT_CLEARANCE_UM
 DEFAULT_FILLER_ATTACHMENT_MARGIN_UM = 15.0
 
 # Boolean keepout carve can leave shallow inward notches at the MTE mouth.
+# Allow one long edge (rectangle side) so mouth tabs on wide shunt collars still collapse.
 FILLER_KEEPOUT_SPIKE_CLEAN = SpikeCleanConfig(
-    max_interior_angle_deg=60.0,
-    max_spike_edge_um=30.0,
-    max_spike_height_um=5.0,
-    acute_interior_angle_deg=15.0,
-    acute_short_edge_um=4.0,
+    max_interior_angle_deg=45.0,
+    max_spike_edge_um=200.0,
+    max_spike_height_um=2.5,
+    acute_interior_angle_deg=45.0,
+    acute_short_edge_um=6.0,
 )
 
 

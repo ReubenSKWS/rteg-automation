@@ -225,6 +225,20 @@ class TestFillerKeepoutKb331(unittest.TestCase):
         )
         self.assertEqual(len(updated[2].filler_nets), 1)
 
+    def test_index0_filler_has_no_internal_spikes(self):
+        """Shunt index 0: keepout mouth spike on long rectangle edge is removed."""
+        updated = apply_filler_keepout_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap,
+            indices=(0,),
+        )
+        for piece in updated[0].filler_nets:
+            pts = [(float(x), float(y)) for x, y in piece.points]
+            acute = [_interior_angle_deg(pts, i) for i in range(len(pts))]
+            self.assertFalse(
+                any(ang < 45.0 for ang in acute),
+                msg="filler should have no acute inward spikes after keepout",
+            )
+
     def test_index2_filler_has_no_internal_spikes(self):
         """Keepout carve + spike clean removes inward notches at the MTE mouth."""
         updated = apply_filler_keepout_all_routes(

@@ -25,6 +25,10 @@ from rteg_collect import (
 )
 from rteg_filler_keepout import (
     FillerKeepoutConfig,
+    _intersection_x_span,
+    _keepout_cut_zones,
+    _mte_attachment_zone,
+    _mte_extension_polys,
     _resonator_keepout_zone,
     apply_filler_keepout_all_routes,
     carve_rectangle_filler_outside_intersection,
@@ -34,6 +38,7 @@ from rteg_filler_keepout import (
     filler_keepout_applies,
     filler_keepout_overview_rows,
 )
+from rteg_route_clean import _interior_angle_deg
 from rteg_route_new import build_all_routes, extract_collar_contact, ground_filler_frame_mask
 
 
@@ -115,7 +120,9 @@ class TestFillerKeepoutKb331(unittest.TestCase):
             cls.all_classify[idx] = classify_nodes(
                 roles.ground_plates, roles.preserved, orientation=orient, res_type=res.res_type,
             )
-        cls.routes = build_all_routes(cls.all_roles, cls.all_classify, layermap)
+        cls.routes = build_all_routes(
+            cls.all_roles, cls.all_classify, layermap, apply_filler_keepout=False,
+        )
         cls.layermap = layermap
 
     def test_center_pad_indices_skip_keepout(self):
@@ -206,6 +213,90 @@ class TestFillerKeepoutKb331(unittest.TestCase):
             before = sum(abs(p.area()) for p in self.routes[idx].filler_nets)
             after = sum(abs(p.area()) for p in updated[idx].filler_nets)
             self.assertLess(after, before, f"index {idx} should lose filler area outside intersection span")
+
+    def test_index2_filler_stays_one_polygon_through_mte_extension(self):
+        """Series index 2 (S1B): carved filler remains one net through the MTE mouth."""
+        before = self.routes[2].filler_nets
+        self.assertEqual(len(before), 1)
+        updated = apply_filler_keepout_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap,
+            indices=(2,),
+            cfg=FillerKeepoutConfig(clearance_um=20.0),
+        )
+        self.assertEqual(len(updated[2].filler_nets), 1)
+
+    def test_index2_filler_has_no_internal_spikes(self):
+        """Keepout carve + spike clean removes inward notches at the MTE mouth."""
+        updated = apply_filler_keepout_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap,
+            indices=(2,),
+        )
+        pts = [(float(x), float(y)) for x, y in updated[2].filler_nets[0].points]
+        acute = [_interior_angle_deg(pts, i) for i in range(len(pts))]
+        self.assertFalse(
+            any(ang < 45.0 for ang in acute),
+            msg="filler should have no acute inward spikes after keepout",
+        )
+
+    def test_index2_filler_does_not_wrap_outside_mte_intersection(self):
+        """Series index 2 (S1B): rectangle filler attaches only through MTE extension stub."""
+        roles = self.all_roles[2]
+        body = [*roles.resonator_body_mte, *roles.resonator_body_mbe]
+        filler_plate = [tp.polygon for tp in roles.ground_plates.filler]
+        cfg = FillerKeepoutConfig(clearance_um=20.0)
+        mte = _mte_extension_polys(roles, cfg)
+        span, _ = _intersection_x_span(filler_plate, mte, precision=cfg.boolean_precision)
+        self.assertIsNotNone(span)
+        assert span is not None
+        x_lo, x_hi = span
+
+        updated = apply_filler_keepout_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap,
+            indices=(2,),
+            cfg=cfg,
+        )
+        ys: list[float] = []
+        for p in filler_plate:
+            bb = p.bounding_box()
+            if bb:
+                ys.extend([bb[0][1], bb[1][1]])
+        cut = _keepout_cut_zones(
+            body, mte, span, (min(ys), max(ys)),
+            clearance_um=cfg.clearance_um,
+            attachment_margin_um=cfg.attachment_margin_um,
+            precision=cfg.boolean_precision,
+        )
+        for piece in updated[2].filler_nets:
+            overlap = gdstk.boolean([piece], cut, "and", precision=cfg.boolean_precision) or []
+            overlap_area = sum(abs(p.area()) for p in overlap)
+            self.assertLess(
+                overlap_area,
+                25.0,
+                msg="filler keepout overlap should be negligible after spike clean",
+            )
+
+        # Within the intersection x-span, filler must not hug the body off-extension.
+        keepout = _resonator_keepout_zone(body, cfg.clearance_um, precision=cfg.boolean_precision)
+        attach = _mte_attachment_zone(
+            mte, margin_um=cfg.attachment_margin_um, precision=cfg.boolean_precision,
+        )
+        mouth_band = gdstk.Polygon([(x_lo, 250.0), (x_lo, 335.0), (x_hi, 335.0), (x_hi, 250.0)])
+        in_band = gdstk.boolean(updated[2].filler_nets, [mouth_band], "and", precision=cfg.boolean_precision) or []
+        off_ext = gdstk.boolean(in_band, attach, "not", precision=cfg.boolean_precision) or []
+        near_body = gdstk.boolean(off_ext, keepout, "and", precision=cfg.boolean_precision) or []
+        self.assertFalse(near_body, msg="in-span filler tabs near MBE intercepts must be carved")
+
+    def test_build_all_routes_applies_filler_keepout_by_default(self):
+        routes = build_all_routes(self.all_roles, self.all_classify, self.layermap)
+        manual = apply_filler_keepout_all_routes(
+            self.routes, self.all_roles, self.all_classify, self.layermap,
+        )
+        for idx in COLLAR_EXTEND_INDICES:
+            self.assertAlmostEqual(
+                sum(abs(p.area()) for p in routes[idx].filler_nets),
+                sum(abs(p.area()) for p in manual[idx].filler_nets),
+                places=2,
+            )
 
     def test_outside_band_respects_resonator_outline_keepout(self):
         updated = apply_filler_keepout_all_routes(

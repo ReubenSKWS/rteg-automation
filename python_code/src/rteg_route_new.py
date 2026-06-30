@@ -1367,9 +1367,18 @@ def build_all_routes(
     layermap: LayerMap,
     *,
     indices: Sequence[int] | None = None,
+    apply_filler_keepout: bool = True,
+    filler_keepout_cfg: object | None = None,
     **kwargs: object,
 ) -> dict[int, ResonatorRoute]:
-    """Route every resonator index present in both maps (or a subset)."""
+    """
+    Route every resonator index present in both maps (or a subset).
+
+    When ``apply_filler_keepout`` is true (default), step 5.3b carves the MBE
+    rectangle filler for ``collar_extend`` resonators so ground metal outside the
+    grounded MTE-extension intersection only attaches through that span — it does
+    not wrap around the resonator body.
+    """
     out: dict[int, ResonatorRoute] = {}
     keys = indices if indices is not None else sorted(roles_by_index)
     for idx in keys:
@@ -1377,6 +1386,18 @@ def build_all_routes(
             continue
         out[idx] = build_resonator_route(
             roles_by_index[idx], classifications[idx], layermap, **kwargs
+        )
+    if apply_filler_keepout and out:
+        from rteg_filler_keepout import FillerKeepoutConfig, apply_filler_keepout_all_routes
+
+        cfg = filler_keepout_cfg if filler_keepout_cfg is not None else FillerKeepoutConfig()
+        out = apply_filler_keepout_all_routes(
+            out,
+            roles_by_index,
+            classifications,
+            layermap,
+            indices=sorted(out),
+            cfg=cfg,
         )
     return out
 

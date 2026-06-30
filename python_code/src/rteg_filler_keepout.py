@@ -2,9 +2,10 @@
 Step 5.3b — MBE width-filler keepout vs resonator outline.
 
 For ``collar_extend`` resonators (MTE does not face the center pad), the step-4
-MBE rectangle filler can intersect the grounded MTE extension. Filler metal
-outside the horizontal span of that intersection is carved back using a
-``clearance_um`` keepout that follows the resonator body outline (MBE + MTE).
+MBE rectangle filler can intersect the grounded MTE extension. Filler metal in
+the resonator keepout ring is carved back except on a grown MTE-extension
+attachment corridor inside the intersection x-span, so the plate stays one
+continuous polygon through the mouth without wrap tabs.
 """
 from __future__ import annotations
 
@@ -16,17 +17,29 @@ import gdstk
 from layermap import LayerMap
 from rteg_classify import NodeClassification
 from rteg_route_new import ResonatorRoute, _overlap_area, split_bridging_orphans
+from rteg_route_clean import SpikeCleanConfig, remove_polygon_spikes
 
 Point = tuple[float, float]
 _BIG = 1e5
 
 DEFAULT_FILLER_KEEPOUT_CLEARANCE_UM = 20.0
 DEFAULT_FILLER_MTE_CLEARANCE_UM = DEFAULT_FILLER_KEEPOUT_CLEARANCE_UM
+DEFAULT_FILLER_ATTACHMENT_MARGIN_UM = 15.0
+
+# Boolean keepout carve can leave shallow inward notches at the MTE mouth.
+FILLER_KEEPOUT_SPIKE_CLEAN = SpikeCleanConfig(
+    max_interior_angle_deg=60.0,
+    max_spike_edge_um=30.0,
+    max_spike_height_um=5.0,
+    acute_interior_angle_deg=15.0,
+    acute_short_edge_um=4.0,
+)
 
 
 @dataclass(frozen=True)
 class FillerKeepoutConfig:
     clearance_um: float = DEFAULT_FILLER_KEEPOUT_CLEARANCE_UM
+    attachment_margin_um: float = DEFAULT_FILLER_ATTACHMENT_MARGIN_UM
     boolean_precision: float = 1e-3
     mbe_body_overlap_frac: float = 0.4
 
@@ -229,14 +242,38 @@ def _resonator_keepout_zone(
     return gdstk.offset(source, clearance_um, join="round", precision=precision)
 
 
-def _keepout_cut_outside_span(
+def _mte_attachment_zone(
+    mte_polys: Sequence[gdstk.Polygon],
+    *,
+    margin_um: float,
+    precision: float,
+) -> list[gdstk.Polygon]:
+    """Grounded MTE extension grown enough to keep the filler bridge continuous."""
+    if not mte_polys:
+        return []
+    source = gdstk.boolean(list(mte_polys), [], "or", precision=precision) or list(mte_polys)
+    if margin_um <= 0:
+        return source
+    return gdstk.offset(source, margin_um, join="round", precision=precision)
+
+
+def _keepout_cut_zones(
     body_polys: Sequence[gdstk.Polygon],
+    mte_polys: Sequence[gdstk.Polygon],
     x_span: tuple[float, float],
     y_span: tuple[float, float],
     *,
     clearance_um: float,
+    attachment_margin_um: float,
     precision: float,
 ) -> list[gdstk.Polygon]:
+    """
+    Carve zones for collar_extend filler keepout.
+
+    * Outside the MTE intersection x-span: full resonator keepout.
+    * Inside the span: keepout minus a grown MTE extension stub so the rectangle
+      plate stays one continuous polygon through the mouth without wrap tabs.
+    """
     keepout = _resonator_keepout_zone(body_polys, clearance_um, precision=precision)
     if not keepout:
         return []
@@ -244,8 +281,107 @@ def _keepout_cut_outside_span(
     y_lo, y_hi = y_span
     cut: list[gdstk.Polygon] = []
     for mask in _outside_x_masks(x_lo, x_hi, y_lo, y_hi):
-        cut.extend(gdstk.boolean(keepout, [mask], "and", precision=precision))
+        cut.extend(gdstk.boolean(keepout, [mask], "and", precision=precision) or [])
+
+    inside_band = gdstk.Polygon([(x_lo, y_lo), (x_lo, y_hi), (x_hi, y_hi), (x_hi, y_lo)])
+    inside_keepout = gdstk.boolean(keepout, [inside_band], "and", precision=precision) or []
+    if inside_keepout:
+        attach = _mte_attachment_zone(
+            mte_polys, margin_um=attachment_margin_um, precision=precision,
+        )
+        if attach:
+            cut.extend(gdstk.boolean(inside_keepout, attach, "not", precision=precision) or [])
+        else:
+            cut.extend(inside_keepout)
     return cut
+
+
+def _keepout_cut_except_mte_attachment(
+    body_polys: Sequence[gdstk.Polygon],
+    mte_polys: Sequence[gdstk.Polygon],
+    *,
+    clearance_um: float,
+    precision: float,
+    attachment_margin_um: float = DEFAULT_FILLER_ATTACHMENT_MARGIN_UM,
+    x_span: tuple[float, float] | None = None,
+    y_span: tuple[float, float] | None = None,
+) -> list[gdstk.Polygon]:
+    """Backward-compatible entry point; prefers span-aware ``_keepout_cut_zones``."""
+    if x_span is not None and y_span is not None:
+        return _keepout_cut_zones(
+            body_polys,
+            mte_polys,
+            x_span,
+            y_span,
+            clearance_um=clearance_um,
+            attachment_margin_um=attachment_margin_um,
+            precision=precision,
+        )
+    keepout = _resonator_keepout_zone(body_polys, clearance_um, precision=precision)
+    if not keepout:
+        return []
+    attach = _mte_attachment_zone(
+        mte_polys, margin_um=attachment_margin_um, precision=precision,
+    )
+    if not attach:
+        return keepout
+    return gdstk.boolean(keepout, attach, "not", precision=precision) or []
+
+
+def _keepout_cut_outside_span(
+    body_polys: Sequence[gdstk.Polygon],
+    x_span: tuple[float, float],
+    y_span: tuple[float, float],
+    *,
+    clearance_um: float,
+    precision: float,
+    mte_polys: Sequence[gdstk.Polygon] | None = None,
+    attachment_margin_um: float = DEFAULT_FILLER_ATTACHMENT_MARGIN_UM,
+) -> list[gdstk.Polygon]:
+    """Backward-compatible wrapper; prefer ``_keepout_cut_zones``."""
+    return _keepout_cut_zones(
+        body_polys,
+        mte_polys or [],
+        x_span,
+        y_span,
+        clearance_um=clearance_um,
+        attachment_margin_um=attachment_margin_um,
+        precision=precision,
+    )
+
+
+def _clean_filler_spikes(
+    filler_nets: Sequence[gdstk.Polygon],
+    *,
+    spike_cfg: SpikeCleanConfig | None = None,
+) -> list[gdstk.Polygon]:
+    """Collapse inward boolean notches left by step-5.3b keepout carving."""
+    cfg = spike_cfg or FILLER_KEEPOUT_SPIKE_CLEAN
+    cleaned: list[gdstk.Polygon] = []
+    for poly in filler_nets:
+        pts, _ = remove_polygon_spikes(
+            [(float(x), float(y)) for x, y in poly.points],
+            cfg,
+        )
+        cleaned.append(gdstk.Polygon(pts, poly.layer, poly.datatype))
+    return cleaned
+
+
+def _merge_filler_net_pieces(
+    pieces: Sequence[gdstk.Polygon],
+    *,
+    layer: int,
+    datatype: int,
+    precision: float,
+) -> list[gdstk.Polygon]:
+    """Re-union carved filler fragments into one net when they still touch."""
+    if not pieces:
+        return []
+    merged = gdstk.boolean(list(pieces), [], "or", precision=precision) or list(pieces)
+    return [
+        gdstk.Polygon(_poly_points(piece), layer, datatype)
+        for piece in merged
+    ]
 
 
 def _carve_polys(
@@ -273,7 +409,7 @@ def carve_rectangle_filler_outside_intersection(
     *,
     cfg: FillerKeepoutConfig | None = None,
 ) -> tuple[list[gdstk.Polygon], FillerKeepoutResult]:
-    """Carve the MBE rectangle plate outside the MTE intersection x-span."""
+    """Carve the MBE rectangle plate back to the MTE extension attachment only."""
     cfg = cfg or FillerKeepoutConfig()
     precision = cfg.boolean_precision
     plate = list(filler_plate)
@@ -307,9 +443,11 @@ def carve_rectangle_filler_outside_intersection(
             n_body_pieces=len(body),
         )
 
-    cut = _keepout_cut_outside_span(
-        body, span, (min(ys), max(ys)),
-        clearance_um=cfg.clearance_um, precision=precision,
+    cut = _keepout_cut_zones(
+        body, mte, span, (min(ys), max(ys)),
+        clearance_um=cfg.clearance_um,
+        attachment_margin_um=cfg.attachment_margin_um,
+        precision=precision,
     )
     carved = _carve_polys(plate, cut, precision=precision) or plate
     area_after = sum(abs(p.area()) for p in carved)
@@ -372,24 +510,32 @@ def apply_filler_keepout_to_route(
         bb = p.bounding_box()
         if bb:
             ys.extend([bb[0][1], bb[1][1]])
-    cut = _keepout_cut_outside_span(
-        body_polys, span, (min(ys), max(ys)),
-        clearance_um=cfg.clearance_um, precision=precision,
+    cut = _keepout_cut_zones(
+        body_polys, mte_polys, span, (min(ys), max(ys)),
+        clearance_um=cfg.clearance_um,
+        attachment_margin_um=cfg.attachment_margin_um,
+        precision=precision,
     )
 
+    layer = route.filler_nets[0].layer
+    datatype = route.filler_nets[0].datatype
     new_nets: list[gdstk.Polygon] = []
     for net_poly in route.filler_nets:
         plate_parts = gdstk.boolean([net_poly], filler_plate, "and", precision=precision) or []
         other_parts = gdstk.boolean([net_poly], filler_plate, "not", precision=precision) or []
         carved_plate = _carve_polys(plate_parts, cut, precision=precision)
-        merged = gdstk.boolean([*carved_plate, *other_parts], [], "or", precision=precision) or []
+        merged = _merge_filler_net_pieces(
+            [*carved_plate, *other_parts],
+            layer=layer,
+            datatype=datatype,
+            precision=precision,
+        )
         if not merged:
             new_nets.append(net_poly)
             continue
-        for piece in merged:
-            new_nets.append(
-                gdstk.Polygon(_poly_points(piece), net_poly.layer, net_poly.datatype)
-            )
+        new_nets.extend(merged)
+
+    new_nets = _clean_filler_spikes(new_nets)
 
     area_after = sum(abs(p.area()) for p in new_nets)
     result = FillerKeepoutResult(
@@ -464,8 +610,9 @@ def filler_keepout_overview_rows(
 
 __all__ = [
     "DEFAULT_FILLER_KEEPOUT_CLEARANCE_UM",
+    "DEFAULT_FILLER_ATTACHMENT_MARGIN_UM",
     "DEFAULT_FILLER_MTE_CLEARANCE_UM",
-    "FillerKeepoutConfig",
+    "FILLER_KEEPOUT_SPIKE_CLEAN",
     "FillerKeepoutResult",
     "apply_filler_keepout_all_routes",
     "apply_filler_keepout_to_route",

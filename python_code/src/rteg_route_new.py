@@ -669,8 +669,10 @@ def build_signal_route(
     datatype: int,
     merge_polys: Sequence[gdstk.Polygon] = (),
     ext_polys: Sequence[gdstk.Polygon] = (),
+    merge_bridging: bool = True,
     launch_overlap_um: float = 0.5,
     clamp_launch: bool = False,
+    direct_route: bool = False,
     precision: float = 1e-3,
 ) -> SignalRoute:
     """
@@ -689,6 +691,11 @@ def build_signal_route(
     the intercept runs parallel to the extension edge — reproducing the original
     filter approach angle. Falls back to the unconstrained ring per-intercept when
     no extension edge is found near that intercept.
+
+    ``direct_route`` skips the body arc walk and builds a direct trapezoid from the
+    clamped launch corners straight to the two intercept points. Use for
+    collar_extend resonators where the body arc contains concave release-hole
+    keepout features that would make the connector self-intersect.
     """
     launch_bbox = _probe_signal_pad_bbox(launch_polys)
     mouth = contact.mouth_center
@@ -703,18 +710,22 @@ def build_signal_route(
         )
 
     collar_body = _select_collar_body(body_polys, contact.intercept_a, contact.intercept_b)
-    arc = _collar_arc(
-        collar_body, contact.intercept_a, contact.intercept_b, contact.bridging
-    )
+    if direct_route:
+        arc: list[Point] = [contact.intercept_a, contact.intercept_b]
+    else:
+        arc = _collar_arc(
+            collar_body, contact.intercept_a, contact.intercept_b, contact.bridging
+        )
 
     # Clip bridging fingers at the pad's front face (the face that faces the resonator)
     # so the merged net's pad-side edge is a straight line at the launch edge.
     keep_half = _pad_front_keep_half(launch_bbox, launch_hi, launch_lo)
 
     clipped_bridging: list[gdstk.Polygon] = []
-    for bp in contact.bridging:
-        cb = gdstk.boolean([bp], [keep_half], "and", precision=precision)
-        clipped_bridging.extend(cb)
+    if merge_bridging:
+        for bp in contact.bridging:
+            cb = gdstk.boolean([bp], [keep_half], "and", precision=precision)
+            clipped_bridging.extend(cb)
 
     # Candidate knee points reproduce the extension approach angle into each
     # intercept (arc[0] ≈ intercept_a, arc[-1] ≈ intercept_b). The knee is the
@@ -1268,13 +1279,20 @@ def build_resonator_route(
     if contact is not None and signal_pad:
         # Split the bridging into the collar ring (kept) and die filter extensions.
         # The collar closely follows the body (high overlap fraction); extensions
-        # are filter interconnect metal that only touch at intercepts. The extension
-        # geometry also carries the approach angle the new route should reproduce.
+        # are filter interconnect metal that only touch at intercepts.
         _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
+        # For collar_extend the preserved MBE may be a single large filter-bus piece
+        # (the bus + collar combined). Whether it's classified as extension (knee
+        # constraint → U-shape) or collar (merged into signal net → complex polygon),
+        # the result is a wild signal route. Fix: skip the bridging merge and pass no
+        # ext_polys so build_signal_route produces only the clean conn polygon (launch
+        # corners → intercept arc). The original contact.bridging is still passed for
+        # _collar_arc disambiguation (which arc direction hugs the connect finger).
+        route_ext = ext_pieces if center_pad else ()
         signal_route = build_signal_route(
             contact, signal_pad, body, terminal=terminal,
             layer=s_layer, datatype=s_dt, clamp_launch=False,
-            ext_polys=ext_pieces, precision=precision,
+            ext_polys=route_ext, merge_bridging=center_pad, precision=precision,
         )
         signal_net = signal_route.net
         intercepts = (contact.intercept_a, contact.intercept_b)

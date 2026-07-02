@@ -1,9 +1,14 @@
-"""
-Step 6.1 — MBE pad-to-collar connection for ``collar_extend`` resonators.
+﻿"""
+Step 6.1 — MBE pad-to-collar connection.
 
-Four-sided connector: pad right edge on the left, straight lines from the top
-and bottom pad corners to collar bends on the pad-facing side, and a straight
-line between those two collar points on the right.
+Applies only when MTE does **not** face the center pad (``collar_extend`` /
+``mte_faces_center == false``). Resonators routed by step 5.4 (``center_pad``)
+are skipped — MTE already carries signal to the pad.
+
+Mirrors the 5.3/5.4 MTE intercept pattern on MBE:
+  5.3  ``find_outward_lip_ab`` → SKILL slope intercepts on MTE collar
+  5.4  pad TR/BR → intercept_a / intercept_b
+  6.1  same intercept logic on the MBE collar → stretch MBE to those intercepts
 """
 from __future__ import annotations
 
@@ -21,7 +26,11 @@ from rteg_collect import (
     TaggedPolygon,
     preserved_mbe_overlap_with_body,
 )
-from rteg_mte_extensions import select_extension_collar_from_pieces
+from rteg_mte_extensions import (
+    MteBuildConfig,
+    find_outward_lip_ab,
+    select_extension_collar_from_pieces,
+)
 from rteg_mte_route import _union_pad_bbox
 from rteg_utils import assign_layer
 
@@ -29,7 +38,6 @@ Point = tuple[float, float]
 
 MBE_LAYER_NAME = "BAW_MBE"
 PDK6_MBE_GDS_PAIR = (2, 0)
-_PAD_FACING_X_MARGIN_UM = 30.0
 
 
 def tag_baw_mbe(poly: gdstk.Polygon, layermap: LayerMap) -> gdstk.Polygon:
@@ -51,16 +59,11 @@ class MbeConnectionConfig:
 
     mbe_layer: str = "BAW_MBE"
     boolean_precision: float = 1e-3
+    boundary_tolerance_um: float = 0.15
+    pad_touch_overlap_um: float = 0.5
+    junction_merge_inset_um: float = 0.5
     min_collar_overlap_um2: float = 1.0
-    stadium_collar_area_um2: float = 2500.0
-    max_edge_collar_area_um2: float = 800.0
-    collar_association_gap_um: float = 35.0
-    mouth_y_margin_um: float = 30.0
-    horiz_angle_tol_deg: float = 8.0
-    cluster_short_edge_um: float = 3.5
-    cluster_long_edge_um: float = 8.0
-    cluster_min_points: int = 4
-    cluster_y_sweep_step_um: float = 0.25
+    skill_pad_expand_um: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -85,8 +88,8 @@ class MbeExtensionResult:
 
 
 def mbe_extension_applies(classification: NodeClassification) -> bool:
-    """Step 6.1 applies when preserved MTE does not face center."""
-    return not classification.collar_orientation.mte_faces_center
+    """Step 6.1 applies only when step 5.4 does not route MTE to the pad."""
+    return classification.mte_route_target == "collar_extend"
 
 
 def _fmt_point(p: Point | None) -> str | None:
@@ -107,94 +110,6 @@ def _pad_corners_tr_br(signal_polys: Sequence[gdstk.Polygon]) -> tuple[Point, Po
 
 def _collar_vertices(collar: gdstk.Polygon) -> list[Point]:
     return [(float(p[0]), float(p[1])) for p in collar.points]
-
-
-def _collar_centroid(collar: gdstk.Polygon) -> Point:
-    verts = _collar_vertices(collar)
-    if not verts:
-        return (0.0, 0.0)
-    return (
-        sum(v[0] for v in verts) / len(verts),
-        sum(v[1] for v in verts) / len(verts),
-    )
-
-
-def _pad_on_left(collar: gdstk.Polygon, pad_ref: Point) -> bool:
-    cx, _ = _collar_centroid(collar)
-    return pad_ref[0] <= cx
-
-
-def _pad_facing_vertices(collar: gdstk.Polygon, pad_ref: Point) -> list[Point]:
-    """Collar vertices on the side that faces the signal pad."""
-    verts = _collar_vertices(collar)
-    cx, _ = _collar_centroid(collar)
-    margin = _PAD_FACING_X_MARGIN_UM
-    if pad_ref[0] <= cx:
-        return [v for v in verts if v[0] <= cx + margin]
-    return [v for v in verts if v[0] >= cx - margin]
-
-
-def _ray_segment_hit_t(
-    origin: Point,
-    direction: Point,
-    p0: Point,
-    p1: Point,
-) -> float | None:
-    ox, oy = origin
-    dx, dy = direction
-    sx, sy = p1[0] - p0[0], p1[1] - p0[1]
-    denom = dx * sy - dy * sx
-    if abs(denom) < 1e-12:
-        return None
-    qx, qy = p0[0] - ox, p0[1] - oy
-    t = (qx * sy - qy * sx) / denom
-    s = (qx * dy - qy * dx) / denom
-    if t >= 1e-6 and -1e-6 <= s <= 1.0 + 1e-6:
-        return t
-    return None
-
-
-def _raycast_collar_hits(
-    collar: gdstk.Polygon,
-    origin: Point,
-    target: Point,
-    pad_ref: Point,
-) -> list[tuple[float, Point]]:
-    """Ray intersections with the collar boundary, sorted by distance from *origin*."""
-    dx, dy = target[0] - origin[0], target[1] - origin[1]
-    length = math.hypot(dx, dy)
-    if length < 1e-9:
-        return []
-    direction = (dx / length, dy / length)
-    pad_on_left = _pad_on_left(collar, pad_ref)
-    cx, _ = _collar_centroid(collar)
-    margin = _PAD_FACING_X_MARGIN_UM
-    verts = _collar_vertices(collar)
-    n = len(verts)
-    hits: list[tuple[float, Point]] = []
-    for i in range(n):
-        p0, p1 = verts[i], verts[(i + 1) % n]
-        t = _ray_segment_hit_t(origin, direction, p0, p1)
-        if t is None:
-            continue
-        hit = (
-            origin[0] + direction[0] * t,
-            origin[1] + direction[1] * t,
-        )
-        if pad_on_left and hit[0] > cx + margin:
-            continue
-        if not pad_on_left and hit[0] < cx - margin:
-            continue
-        hits.append((t, hit))
-    hits.sort(key=lambda item: item[0])
-    return hits
-
-
-def _snap_to_collar_vertex(point: Point, collar: gdstk.Polygon, tol: float = 0.01) -> Point:
-    for v in _collar_vertices(collar):
-        if abs(v[0] - point[0]) <= tol and abs(v[1] - point[1]) <= tol:
-            return v
-    return point
 
 
 def _locate_on_collar_boundary(point: Point, verts: Sequence[Point]) -> tuple[int, float]:
@@ -354,261 +269,34 @@ def _connection_points(
     return [point_b, point_a, *mouth]
 
 
-def _edge_angle_deg(p0: Point, p1: Point) -> float:
-    return math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0]))
-
-
 def _edge_length(p0: Point, p1: Point) -> float:
     return math.hypot(p1[0] - p0[0], p1[1] - p0[1])
 
 
-def _vertex_turn_deg(verts: Sequence[Point], index: int) -> float:
-    n = len(verts)
-    p0 = verts[(index - 1) % n]
-    p1 = verts[index]
-    p2 = verts[(index + 1) % n]
-    a1 = _edge_angle_deg(p0, p1)
-    a2 = _edge_angle_deg(p1, p2)
-    return abs((a2 - a1 + 180.0) % 360.0 - 180.0)
-
-
-def _collar_bend_clusters(
-    verts: Sequence[Point],
+def _find_mbe_collar_intercepts(
+    collar: gdstk.Polygon,
+    body_mbe_polys: Sequence[gdstk.Polygon],
+    signal_polys: Sequence[gdstk.Polygon],
     cfg: MbeConnectionConfig,
-) -> list[list[Point]]:
-    """Group fillet vertices into bend clusters (short-edge chains)."""
-    n = len(verts)
-    if n < cfg.cluster_min_points:
-        return []
+) -> tuple[Point, Point]:
+    """
+    SKILL slope intercepts on the MBE collar mouth (mirrors 5.3 MTE intercept logic).
 
-    clusters: list[list[Point]] = []
-    i = 0
-    while i < n:
-        cluster = [verts[i]]
-        i += 1
-        while i < n:
-            edge_len = _edge_length(verts[i - 1], verts[i])
-            if edge_len > cfg.cluster_long_edge_um and len(cluster) >= cfg.cluster_min_points:
-                break
-            is_short = edge_len <= cfg.cluster_short_edge_um
-            is_turn = _vertex_turn_deg(verts, i) >= cfg.horiz_angle_tol_deg
-            if not is_short and not is_turn and len(cluster) >= cfg.cluster_min_points:
-                break
-            cluster.append(verts[i])
-            i += 1
-            if len(cluster) > 80:
-                break
-        if len(cluster) >= cfg.cluster_min_points:
-            clusters.append(cluster)
-    return clusters
-
-
-def _cluster_mouth_corner(cluster: Sequence[Point], pad_on_left: bool) -> Point:
-    if pad_on_left:
-        return max(cluster, key=lambda v: (v[0], v[1]))
-    return min(cluster, key=lambda v: (v[0], -v[1]))
-
-
-def _horizontal_collar_hits(
-    collar: gdstk.Polygon,
-    pad_x: float,
-    y: float,
-    pad_ref: Point,
-) -> list[Point]:
-    """Horizontal ray from the pad side through the collar at fixed *y*."""
-    bbox = collar.bounding_box()
-    if bbox is None:
-        return []
-    far_x = bbox[1][0] + 50.0 if _pad_on_left(collar, pad_ref) else bbox[0][0] - 50.0
-    return [hit for _, hit in _raycast_collar_hits(collar, (pad_x, y), (far_x, y), pad_ref)]
-
-
-def _stretch_hit_to_cluster(
-    collar: gdstk.Polygon,
-    pad_corner: Point,
-    cluster: Sequence[Point],
-    pad_ref: Point,
-    cfg: MbeConnectionConfig,
-) -> Point:
-    """Farthest pad-side collar hit across the cluster Y band."""
-    pad_on_left = _pad_on_left(collar, pad_ref)
-    corner = _cluster_mouth_corner(cluster, pad_on_left)
-    y_lo = min(v[1] for v in cluster)
-    y_hi = max(v[1] for v in cluster)
-    y_start = min(pad_corner[1], y_lo) if pad_corner[1] <= y_hi else y_lo
-    y_end = max(pad_corner[1], y_hi)
-
-    best = corner
-    best_score = corner[0] if pad_on_left else -corner[0]
-    y = y_start
-    while y <= y_end + 1e-6:
-        for hit in _horizontal_collar_hits(collar, pad_corner[0], y, pad_ref):
-            score = hit[0] if pad_on_left else -hit[0]
-            if score > best_score + 1e-6:
-                best = hit
-                best_score = score
-        y += cfg.cluster_y_sweep_step_um
-    return _snap_to_collar_vertex(best, collar)
-
-
-def _pick_bend_cluster(
-    clusters: Sequence[Sequence[Point]],
-    pad_corner_y: float,
-    is_upper: bool,
-    mid_y: float,
-    pad_on_left: bool,
-) -> list[Point] | None:
-    in_half = [
-        c
-        for c in clusters
-        if (sum(v[1] for v in c) / len(c) >= mid_y) == is_upper
-    ]
-    if not in_half:
-        return None
-
-    def mouth_x(c: Sequence[Point]) -> float:
-        corner = _cluster_mouth_corner(c, pad_on_left)
-        return corner[0] if pad_on_left else -corner[0]
-
-    def centroid_y(c: Sequence[Point]) -> float:
-        return sum(v[1] for v in c) / len(c)
-
-    if is_upper:
-        return max(
-            in_half,
-            key=lambda c: (mouth_x(c), -abs(centroid_y(c) - pad_corner_y), len(c)),
-        )
-    return min(
-        in_half,
-        key=lambda c: (abs(centroid_y(c) - pad_corner_y), -mouth_x(c), -len(c)),
+    Calls ``find_outward_lip_ab`` with the MBE collar and resonator body MBE
+    polygons — same ``rdsBawFindMinMaxSlope2`` algorithm used for MTE in step 5.3.
+    Returns ``(hit_a, hit_b)`` with higher-Y point first.
+    """
+    mte_cfg = MteBuildConfig(
+        skill_pad_expand_um=cfg.skill_pad_expand_um,
+        boolean_precision=cfg.boolean_precision,
     )
-
-
-def _collar_mouth_bends(
-    collar: gdstk.Polygon,
-    pad_ref: Point,
-    pad_top: Point,
-    pad_bot: Point,
-    cfg: MbeConnectionConfig,
-) -> tuple[Point | None, Point | None]:
-    """Detect pad-facing fillet bends and stretch hits to the inner mouth corner."""
-    pad_on_left = _pad_on_left(collar, pad_ref)
-    facing = set(_pad_facing_vertices(collar, pad_ref))
-    verts = _collar_vertices(collar)
-    if not verts:
-        return None, None
-
-    mid_y = (pad_top[1] + pad_bot[1]) / 2.0
-    y_min = pad_bot[1] - cfg.mouth_y_margin_um
-    y_max = pad_top[1] + cfg.mouth_y_margin_um
-
-    mouth_clusters: list[list[Point]] = []
-    for cluster in _collar_bend_clusters(verts, cfg):
-        if not any(v in facing for v in cluster):
-            continue
-        cy = sum(v[1] for v in cluster) / len(cluster)
-        if y_min <= cy <= y_max:
-            mouth_clusters.append(list(cluster))
-
-    top_cluster = _pick_bend_cluster(mouth_clusters, pad_top[1], True, mid_y, pad_on_left)
-    bot_cluster = _pick_bend_cluster(mouth_clusters, pad_bot[1], False, mid_y, pad_on_left)
-
-    bend_top = (
-        _stretch_hit_to_cluster(collar, pad_top, top_cluster, pad_ref, cfg)
-        if top_cluster
-        else None
+    lip = find_outward_lip_ab(
+        collar,
+        body_mbe_polys,
+        mte_cfg,
+        signal_polys=signal_polys,
     )
-    bend_bottom = (
-        _stretch_hit_to_cluster(collar, pad_bot, bot_cluster, pad_ref, cfg)
-        if bot_cluster
-        else None
-    )
-    return bend_top, bend_bottom
-
-
-def _fallback_collar_hit(
-    collar: gdstk.Polygon,
-    pad_corner: Point,
-    pad_ref: Point,
-) -> Point:
-    """Ray hit when no fillet cluster is found near the pad corner."""
-    facing = _pad_facing_vertices(collar, pad_ref)
-    is_upper = pad_corner[1] >= pad_ref[1]
-    mouth = [v for v in facing if v[0] > pad_corner[0] + _PAD_FACING_X_MARGIN_UM]
-    if not mouth:
-        return _collar_centroid(collar)
-
-    if is_upper:
-        aim = max(
-            mouth,
-            key=lambda v: (
-                v[1],
-                -math.hypot(v[0] - pad_corner[0], v[1] - pad_corner[1]),
-            ),
-        )
-    else:
-        aim = min(
-            mouth,
-            key=lambda v: (
-                v[1],
-                math.hypot(v[0] - pad_corner[0], v[1] - pad_corner[1]),
-            ),
-        )
-
-    dx, dy = aim[0] - pad_corner[0], aim[1] - pad_corner[1]
-    length = math.hypot(dx, dy)
-    if length < 1e-9:
-        return _snap_to_collar_vertex(aim, collar)
-
-    direction = (dx / length, dy / length)
-    far = (pad_corner[0] + direction[0] * 1e4, pad_corner[1] + direction[1] * 1e4)
-    hits = _raycast_collar_hits(collar, pad_corner, far, pad_ref)
-    verts_on_ray = [
-        (t, v)
-        for v in _collar_vertices(collar)
-        if (t := _ray_vertex_t(pad_corner, direction, v)) is not None
-    ]
-
-    bbox = collar.bounding_box()
-    horizontal_far = (bbox[1][0] + 50.0, pad_corner[1]) if bbox else far
-    hits_h = _raycast_collar_hits(collar, pad_corner, horizontal_far, pad_ref)
-
-    if is_upper:
-        if hits_h:
-            use_h = True
-            if hits and len(verts_on_ray) >= 2:
-                if max(t for t, _ in verts_on_ray) - hits[0][0] > 25.0:
-                    use_h = False
-            hit = (
-                hits_h[0][1]
-                if use_h
-                else max(verts_on_ray, key=lambda item: item[0])[1]
-            )
-        elif hits:
-            hit = hits[0][1]
-        else:
-            hit = aim
-    elif hits_h:
-        hit = hits_h[0][1]
-    elif hits:
-        hit = hits[0][1]
-    else:
-        hit = aim
-
-    return _snap_to_collar_vertex(hit, collar)
-
-
-def _ray_vertex_t(
-    origin: Point,
-    direction: Point,
-    point: Point,
-    tol: float = 0.5,
-) -> float | None:
-    vx, vy = point[0] - origin[0], point[1] - origin[1]
-    if abs(vx * direction[1] - vy * direction[0]) > tol:
-        return None
-    t = vx * direction[0] + vy * direction[1]
-    return t if t > 1e-6 else None
+    return lip.point_a, lip.point_b
 
 
 def _select_collar_by_pad_proximity(
@@ -697,20 +385,25 @@ def _empty_mbe_result(preserved: PreservedMetal) -> MbeExtensionResult:
 
 def draw_mbe_pad_connection(
     collar_tp: TaggedPolygon,
+    body_mbe_polys: Sequence[gdstk.Polygon],
     signal_polys: Sequence[gdstk.Polygon],
     layermap: LayerMap,
     cfg: MbeConnectionConfig | None = None,
 ) -> tuple[gdstk.Polygon, MbeConnectionDraw]:
-    """Build a pad-to-collar connector tracing the collar mouth edge."""
+    """
+    Build a pad-to-collar MBE connector using SKILL slope intercepts.
+
+    Mirrors the 5.3/5.4 MTE pattern: ``find_outward_lip_ab`` locates the
+    intercept points on the MBE collar mouth, then the polygon connects
+    the signal pad TR/BR corners to those intercepts, tracing the collar
+    boundary between them.
+    """
     c = cfg or MbeConnectionConfig()
     layer, datatype = layermap.pair(c.mbe_layer)
     collar = collar_tp.polygon
 
     point_a, point_b = _pad_corners_tr_br(signal_polys)
-    pad_ref = ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
-    bend_top, bend_bottom = _collar_mouth_bends(collar, pad_ref, point_a, point_b, c)
-    hit_a = bend_top or _fallback_collar_hit(collar, point_a, pad_ref)
-    hit_b = bend_bottom or _fallback_collar_hit(collar, point_b, pad_ref)
+    hit_a, hit_b = _find_mbe_collar_intercepts(collar, body_mbe_polys, signal_polys, c)
 
     connection = gdstk.Polygon(
         _connection_points(point_a, point_b, hit_a, hit_b, collar),
@@ -734,17 +427,9 @@ def _extension_for_roles(
 ) -> MbeExtensionResult:
     preserved = roles.preserved
     signal_polys = [tp.polygon for tp in classification.center_pad_polygons()]
-    collar_tp = select_extension_collar_mbe(
-        preserved,
-        roles.resonator_body_mbe,
-        cfg,
-        signal_polys=signal_polys or None,
-    )
-    if collar_tp is None:
-        return _empty_mbe_result(preserved)
     if not signal_polys:
         return MbeExtensionResult(
-            collar=collar_tp,
+            collar=None,
             extension=None,
             routed_net=None,
             preserved_collar_polygons=[tp.polygon for tp in preserved.mbe],
@@ -753,7 +438,29 @@ def _extension_for_roles(
             drc_violations=["no center signal pad geometry"],
         )
 
-    connection, draw = draw_mbe_pad_connection(collar_tp, signal_polys, layermap, cfg)
+    collar_tp = select_extension_collar_mbe(
+        preserved,
+        roles.resonator_body_mbe,
+        cfg,
+        signal_polys=signal_polys,
+    )
+    if collar_tp is None:
+        return _empty_mbe_result(preserved)
+
+    try:
+        connection, draw = draw_mbe_pad_connection(
+            collar_tp, roles.resonator_body_mbe, signal_polys, layermap, cfg
+        )
+    except ValueError as exc:
+        return MbeExtensionResult(
+            collar=collar_tp,
+            extension=None,
+            routed_net=None,
+            preserved_collar_polygons=[tp.polygon for tp in preserved.mbe],
+            n_extensions=0,
+            connection_draw=None,
+            drc_violations=[str(exc)],
+        )
 
     return MbeExtensionResult(
         collar=collar_tp,
@@ -763,21 +470,6 @@ def _extension_for_roles(
         n_extensions=1,
         connection_draw=draw,
     )
-
-
-def build_mbe_extension(
-    roles: RtegGeometryRoles,
-    classification: NodeClassification,
-    layermap: LayerMap,
-    config: MbeConnectionConfig | None = None,
-) -> MbeExtensionResult:
-    """Run step 6.1 for a single resonator."""
-    cfg = config or MbeConnectionConfig()
-    if not mbe_extension_applies(classification):
-        return _empty_mbe_result(roles.preserved)
-    if not roles.preserved.mbe:
-        return _empty_mbe_result(roles.preserved)
-    return _extension_for_roles(roles, classification, layermap, cfg)
 
 
 def build_mbe_extensions(
@@ -834,7 +526,6 @@ __all__ = [
     "MbeConnectionDraw",
     "MbeExtensionResult",
     "PDK6_MBE_GDS_PAIR",
-    "build_mbe_extension",
     "build_mbe_extensions",
     "draw_mbe_pad_connection",
     "mbe_extension_applies",

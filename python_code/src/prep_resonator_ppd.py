@@ -7,7 +7,6 @@ Returns in-memory ``ResonatorPpdAssembly`` objects for step 4 and export.
 from __future__ import annotations
 
 import math
-import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,8 +70,12 @@ def ppd_pad_keepout_polys(
 ) -> list[gdstk.Polygon]:
     """Pad / frame metal from the flattened PPD, translated to ``ppd_origin``."""
     ox, oy = ppd_origin
+    # Flatten on a throwaway wrapper so the source cell keeps its references
+    # (``Cell.flatten()`` mutates in place; step 5.2b re-prep needs them intact).
+    probe = gdstk.Cell("_ppd_pad_keepout_probe")
+    probe.add(gdstk.Reference(ppd_cell))
     keepouts: list[gdstk.Polygon] = []
-    for poly in ppd_cell.flatten().polygons:
+    for poly in probe.flatten().polygons:
         if (poly.layer, poly.datatype) not in PPD_PAD_LAYERS:
             continue
         if abs(poly.area()) < MIN_KEEPOUT_POLY_AREA:
@@ -154,6 +157,16 @@ def resonator_release_hole_polys(
     return _shifted_resonator_polys(res, dx, dy, layers=RELEASE_HOLE_LAYERS)
 
 
+def resonator_layer_polys(
+    res: Resonator,
+    dx: float,
+    dy: float,
+    layer_pair: tuple[int, int],
+) -> list[gdstk.Polygon]:
+    """Flattened resonator polygons on one GDS layer pair after ``(dx, dy)`` placement."""
+    return _shifted_resonator_polys(res, dx, dy, layers=frozenset({layer_pair}))
+
+
 def _metal_bbox(
     metal_polys: Sequence[gdstk.Polygon],
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
@@ -208,16 +221,6 @@ def polys_satisfy_clearance(
             if gdstk.boolean(poly, zone, "and"):
                 return False
     return True
-
-
-def metal_satisfies_frame_clearance(
-    metal_polys: Sequence[gdstk.Polygon],
-    keepout_polys: Sequence[gdstk.Polygon],
-    *,
-    min_gap: float = MIN_FRAME_CLEARANCE_UM,
-) -> bool:
-    """True when resonator metal is at least ``min_gap`` from every pad polygon."""
-    return polys_satisfy_clearance(metal_polys, keepout_polys, min_gap=min_gap)
 
 
 def ppd_clearance_satisfied(
@@ -624,12 +627,3 @@ def assemblies_summary_df(
     assemblies: Sequence[ResonatorPpdAssembly],
 ) -> pd.DataFrame:
     return pd.DataFrame([a.summary_row() for a in assemblies])
-
-
-def preview_assembly_svg(assembly: ResonatorPpdAssembly) -> str:
-    """Render one assembly to SVG text for notebook display."""
-    flat = assembly.flatten()
-    with tempfile.TemporaryDirectory() as tmp:
-        svg_path = Path(tmp) / f"{assembly.top_cell.name}.svg"
-        flat.write_svg(str(svg_path))
-        return svg_path.read_text(encoding="utf-8")

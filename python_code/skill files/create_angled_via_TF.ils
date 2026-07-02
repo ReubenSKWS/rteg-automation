@@ -1,0 +1,87 @@
+/*
+create_angled_via_TF
+
+DESCRIPTION
+
+Run this script while a cellview is open.
+This will open up the menu and you can change the specifics before pressing OK.
+The new via will be placed at (0, 0).
+
+SETUP
+
+Create a new instance of a via named a.
+Copy it and name it b.
+Create two masks. The rectangular masks extend from the bottom of a(b) x microns. The names are A and B, respectively.
+
+INNER ANGLE
+Rotate b and B by 180-inner_angle. The pivot should be the center of b.
+
+APPLY MASKS
+Mask = A | B;
+c = a | b;
+new_via = c - Mask;
+
+OUTER ANGLE
+Rotate new_via by outer_angle. The pivot is the far end of a (opposite of inner angle pivot).
+
+Taylor Fernald
+taylorfernald@skyworksinc.com
+
+home/fernaldt/skill_code/create_angled_via_TF.ils
+
+@param
+@returns
+*/
+    
+( defun create_angled_via_TF ( @aux GUIform fields shownGUIform inner_angle outer_angle inner_length outer_length )
+
+    inner_angle = (hiCreateFloatField ?name 'inner_angle ?prompt "Inner Angle" ?value 45.0)
+    outer_angle = (hiCreateFloatField ?name 'outer_angle ?prompt "Outer Angle" ?value 45.0)
+    inner_length = (hiCreateFloatField ?name 'inner_length ?prompt "Inner Length" ?value 45.0)
+    outer_length = (hiCreateFloatField ?name 'outer_length ?prompt "Outer Length" ?value 45.0)
+
+    fields = list(
+      list( inner_angle 20:20 700:30 80 ) 
+      list( outer_angle 20:40 700:30 80 ) 
+      list( inner_length 20:60 700:30 80 ) 
+      list( outer_length 20:80 700:30 80 ) 
+      )
+
+    GUIform = hiCreateAppForm( 
+                                ?name 'GUIform
+                               ?formTitle "GUI form"
+                               ?fields fields 
+                                ?initialSize t
+                               ?callback "create_angled_via_TF_callback( hiGetCurrentForm() )"
+                                ?buttonLayout 'OKCancelApply
+                            )        
+    shownGUIform = hiDisplayForm('GUIform)
+)
+( defun create_angled_via_TF_callback ( GUIform @aux inner_angle outer_angle inner_length outer_length cell_view via_cell_view a b mask_height mask_bBox A B )
+
+     temp_layer = "text"    ; What layer to use as the temp layer for the masks.
+     inner_angle = GUIform->inner_angle->value
+     outer_angle = GUIform->outer_angle->value
+     inner_length = GUIform->inner_length->value
+     outer_length = GUIform->outer_length->value
+
+     cell_view = geGetWindowCellView()
+     new_via_cell_view = dbOpenCellViewByType(cell_view~>libName "new_via" "layout" "maskLayout" "write")
+     via_cell_view = dbOpenCellViewByType("bawpdk4" "vtb3" "layout")
+     ;Create the via twice.
+     b = dbCreateInst( new_via_cell_view via_cell_view nil list(0 0) "R0" 1 ) 
+     ; Create the mask
+     mask_height = rightEdge(b)-leftEdge(b) ; Width of the via.
+     B_bBox = (list rightEdge(b):bottomEdge(b) rightEdge(b):topEdge(b)) 
+     ;B = dbCreateRect( cell_view temp_layer B_bBox )
+     ; Flatten the parts of b through one layer.
+     ; TODO: Find out why this dbFlattenInst call isn't working.
+     (unless dbFlattenInst(b 2) error("Flatten Failed") )
+     ; Rotate ALL of the current shapes according to the pivot.
+    
+     ;Create the masks.
+     ;A_bBox = (list rightEdge(a):bottomEdge(a) rightEdge(a)+mask_height:topEdge(a)) 
+        
+     ;A = dbCreateRect( cell_view temp_layer A_bBox )
+     dbSave(new_via_cell_view)
+)

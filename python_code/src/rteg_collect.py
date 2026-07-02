@@ -1,13 +1,13 @@
-"""
-Step 5.1 — Collect framed-resonator geometry into typed roles.
+﻿"""
+Step 5.1 ΓÇö Collect framed-resonator geometry into typed roles.
 
 Pulls polygons from a step-4 ``RtegFrameAssembly`` by **layermap name** (no
 hardcoded layer numbers) and splits them into the sets downstream booleans need:
 
-- **ground plates** — GSG pad / arm MBE + the step-4 width filler (not resonator)
-- **preserved metal** — filter interconnect MBE/MTE from the connect cells
-- **release holes** — ``BAW_ReF`` / ``BAW_CAV`` near the resonator
-- **inner frame boundary** — inner cavity rectangle + die-frame MBE ring
+- **ground plates** ΓÇö GSG pad / arm MBE + the step-4 width filler (not resonator)
+- **preserved metal** ΓÇö filter interconnect MBE/MTE from the connect cells
+- **release holes** ΓÇö ``BAW_ReF`` / ``BAW_CAV`` near the resonator
+- **inner frame boundary** ΓÇö inner cavity rectangle + die-frame MBE ring
 
 Reference counts for KB331 resonator **index 05** (shunt):
 
@@ -17,18 +17,22 @@ Reference counts for KB331 resonator **index 05** (shunt):
 | preserved MBE | 1 |
 | preserved MTE | 2 |
 | release holes (ReF + CAV near resonator) | 2 + 7 |
+| rev release circles (BAW_REV 37/0, circle-only) | 3 |
 | frame boundary (cavity + ring) | 2 |
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 import gdstk
 
 from layermap import LayerMap
 from prep_resonator_ppd import (
+    MIN_RELEASE_HOLE_CLEARANCE_UM,
     ppd_pad_keepout_polys,
+    resonator_layer_polys,
     resonator_metal_polys,
     resonator_release_hole_polys,
 )
@@ -43,11 +47,12 @@ Bbox = tuple[tuple[float, float], tuple[float, float]]
 
 @dataclass(frozen=True)
 class RtegCollectConfig:
-    """Layer names and margins — resolved through ``LayerMap`` at runtime."""
+    """Layer names and margins ΓÇö resolved through ``LayerMap`` at runtime."""
 
     mbe_layer: str = "BAW_MBE"
     mte_layer: str = "BAW_MTE"
     release_hole_layers: tuple[str, ...] = ("BAW_ReF", "BAW_CAV")
+    rev_release_layer: str = "BAW_REV"
     boundary_layer: str = "BAW_EDGE"
 
     preserved_overlap_margin_um: float = 10.0
@@ -56,7 +61,8 @@ class RtegCollectConfig:
     max_edge_collar_area_um2: float = 800.0
     min_body_interface_collar_area_um2: float = 100.0
     max_body_interface_collar_area_um2: float = 2000.0
-    release_hole_margin_um: float = 10.0
+    release_hole_margin_um: float = MIN_RELEASE_HOLE_CLEARANCE_UM
+    max_rev_release_circle_area_um2: float = 10_000.0
     filler_bbox_tol_um: float = 1.0
     frame_ring_min_area_um2: float = 10_000.0
     min_polygon_area_um2: float = 1.0
@@ -143,6 +149,20 @@ class ReleaseHoles:
 
 
 @dataclass
+class RevReleaseCircles:
+    """Circle-only ``BAW_REV`` (37/0) release-hole outlines for routing clearout."""
+
+    circles: list[TaggedPolygon] = field(default_factory=list)
+    clearance_um: float = MIN_RELEASE_HOLE_CLEARANCE_UM
+
+    def polygons(self) -> list[gdstk.Polygon]:
+        return [tp.polygon for tp in self.circles]
+
+    def groups(self) -> dict[str, list[TaggedPolygon]]:
+        return {"BAW_REV_circles": self.circles}
+
+
+@dataclass
 class InnerFrameBoundary:
     """Inner die cavity (routable envelope) and the frame MBE ring polygon."""
 
@@ -165,6 +185,7 @@ class RtegGeometryRoles:
     ground_plates: GroundPlates
     preserved: PreservedMetal
     release_holes: ReleaseHoles
+    rev_release_circles: RevReleaseCircles
     frame_boundary: InnerFrameBoundary
     resonator_body_mte: list[gdstk.Polygon] = field(default_factory=list)
     resonator_body_mbe: list[gdstk.Polygon] = field(default_factory=list)
@@ -176,6 +197,8 @@ class RtegGeometryRoles:
         for name, items in self.preserved.groups().items():
             counts[name] = len(items)
         for name, items in self.release_holes.groups().items():
+            counts[name] = len(items)
+        for name, items in self.rev_release_circles.groups().items():
             counts[name] = len(items)
         for name, items in self.frame_boundary.groups().items():
             counts[name] = len(items)
@@ -205,14 +228,6 @@ def _resonator_shift(res: Resonator, assembly: RtegFrameAssembly) -> Point:
         + assembly.resonator_frame_shift[1],
     )
     return (rteg_origin[0] - res.origin[0], rteg_origin[1] - res.origin[1])
-
-
-def resonator_body_polys(
-    res: Resonator, assembly: RtegFrameAssembly
-) -> list[gdstk.Polygon]:
-    """Resonator MBE+MTE body polygons in RTEG world space."""
-    dx, dy = _resonator_shift(res, assembly)
-    return resonator_metal_polys(res, dx, dy)
 
 
 def _resonator_rteg_bbox(
@@ -408,7 +423,7 @@ def _associate_stadium_mte_collars(
     """
     When only a stadium-sized MTE piece is in ``seeds``, add nearby edge tabs.
 
-    Edge collars can sit just outside the resonator bbox window (~31 µm from the
+    Edge collars can sit just outside the resonator bbox window (~31 ┬╡m from the
     stadium in KB331) while still belonging to the same resonator interconnect.
     """
     large = [p for p in seeds if abs(p.area()) >= cfg.stadium_collar_area_um2]
@@ -515,7 +530,7 @@ def preserved_collars_at_shift(
 
     Selects ``{parent}_connectMTE`` / ``{parent}_connectMBE`` polygons that
     overlap the resonator window (in filter coordinates), then offsets them by
-    ``shift`` — the delta from filter placement to the target placement. Shared
+    ``shift`` ΓÇö the delta from filter placement to the target placement. Shared
     by step 3 (PPD-space orientation) and step 5.1 (RTEG-world collection), so
     both see the same collar geometry. Returns ``(mte_polys, mbe_polys)``.
     """
@@ -633,31 +648,6 @@ def preserved_mte_overlap_with_body(
     return overlap
 
 
-def select_preserved_collar_mte(
-    preserved: PreservedMetal,
-    body_mte_polys: Sequence[gdstk.Polygon],
-    *,
-    min_overlap_um2: float = 0.01,
-    precision: float = 1e-3,
-) -> TaggedPolygon | None:
-    """
-    Pick the one preserved MTE collar that overlaps resonator-body MTE.
-
-    Filter connectMTE often yields two pieces (resonator outline + edge collar);
-    only the collar touching the resonator body should receive an extension.
-    """
-    best: TaggedPolygon | None = None
-    best_overlap = 0.0
-    for collar_tp in preserved.mte:
-        overlap = preserved_mte_overlap_with_body(
-            collar_tp.polygon, body_mte_polys, precision=precision
-        )
-        if overlap >= min_overlap_um2 and overlap > best_overlap:
-            best = collar_tp
-            best_overlap = overlap
-    return best
-
-
 def preserved_mbe_overlap_with_body(
     preserved_mbe: gdstk.Polygon,
     body_mbe_polys: Sequence[gdstk.Polygon],
@@ -671,32 +661,6 @@ def preserved_mbe_overlap_with_body(
         if inter:
             overlap = max(overlap, sum(abs(p.area()) for p in inter))
     return overlap
-
-
-def select_preserved_collar_mbe(
-    preserved: PreservedMetal,
-    body_mbe_polys: Sequence[gdstk.Polygon],
-    *,
-    min_overlap_um2: float = 0.01,
-    precision: float = 1e-3,
-) -> TaggedPolygon | None:
-    """
-    Pick the preserved MBE collar for step 6.1 extension.
-
-    Uses the same edge-tab-over-stadium rules as MTE ``select_extension_collar``.
-    """
-    from rteg_mte_extensions import MteBuildConfig, select_extension_collar_from_pieces
-
-    cfg = MteBuildConfig(
-        min_collar_overlap_um2=min_overlap_um2,
-        boolean_precision=precision,
-    )
-    return select_extension_collar_from_pieces(
-        preserved.mbe,
-        body_mbe_polys,
-        preserved_mbe_overlap_with_body,
-        cfg,
-    )
 
 
 def collect_resonator_body_mte(
@@ -757,6 +721,93 @@ def collect_release_holes(
             TaggedPolygon(f"{layer_name}[{i}]", layer_name, poly)
         )
     return ReleaseHoles(by_layer=by_layer)
+
+
+def is_circle_polygon(
+    poly: gdstk.Polygon,
+    *,
+    min_vertices: int = 8,
+    min_aspect: float = 0.8,
+    max_radius_cv: float = 0.12,
+    min_circularity: float = 0.55,
+    max_circularity: float = 1.35,
+) -> bool:
+    """
+    True when ``poly`` is a near-circular outline (GDS arc approximation).
+
+    Rejects rectangles and stadium-like shapes on ``BAW_REV`` while keeping the
+    small release-hole circles used for DRC clearout.
+    """
+    pts = poly.points
+    if len(pts) < min_vertices:
+        return False
+    bb = poly.bounding_box()
+    if bb is None:
+        return False
+    (x0, y0), (x1, y1) = bb
+    width, height = x1 - x0, y1 - y0
+    if width <= 0 or height <= 0:
+        return False
+    if min(width, height) / max(width, height) < min_aspect:
+        return False
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    mean_r = sum(math.hypot(x - cx, y - cy) for x, y in pts) / len(pts)
+    if mean_r <= 0:
+        return False
+    rel_std = math.sqrt(
+        sum((math.hypot(x - cx, y - cy) - mean_r) ** 2 for x, y in pts) / len(pts)
+    ) / mean_r
+    if rel_std > max_radius_cv:
+        return False
+    nominal_r = (width + height) / 4
+    circularity = abs(poly.area()) / (math.pi * nominal_r * nominal_r)
+    return min_circularity <= circularity <= max_circularity
+
+
+def collect_rev_release_circles(
+    assembly: RtegFrameAssembly,
+    res: Resonator,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> RevReleaseCircles:
+    """
+    Circle-only ``BAW_REV`` (37/0) release-hole outlines in RTEG world space.
+
+    Non-circular ``BAW_REV`` shapes (rectangles, large resonator outlines) are
+    skipped so clearout applies only to the round release-hole markers.
+    """
+    cfg = config or RtegCollectConfig()
+    dx, dy = _resonator_shift(res, assembly)
+    rev_pair = layermap.pair(cfg.rev_release_layer)
+    circles: list[TaggedPolygon] = []
+    for i, poly in enumerate(resonator_layer_polys(res, dx, dy, rev_pair)):
+        area = abs(poly.area())
+        if area < cfg.min_polygon_area_um2:
+            continue
+        if area > cfg.max_rev_release_circle_area_um2:
+            continue
+        if not is_circle_polygon(poly):
+            continue
+        circles.append(
+            TaggedPolygon(f"{cfg.rev_release_layer}_circle[{i}]", cfg.rev_release_layer, poly)
+        )
+    return RevReleaseCircles(circles=circles, clearance_um=cfg.release_hole_margin_um)
+
+
+def grown_rev_circle_clearout_zones(
+    circle_polys: Sequence[gdstk.Polygon],
+    clearance_um: float,
+    *,
+    precision: float = 1e-3,
+) -> list[gdstk.Polygon]:
+    """Expand circle outlines outward by ``clearance_um`` (PDK6 release-hole gap)."""
+    if clearance_um <= 0:
+        return list(circle_polys)
+    zones: list[gdstk.Polygon] = []
+    for poly in circle_polys:
+        grown = gdstk.offset(poly, clearance_um, join="round", precision=precision)
+        zones.extend(grown if grown else [poly])
+    return zones
 
 
 def get_inner_frame_boundary(
@@ -900,27 +951,77 @@ def collect_geometry_roles(
             assembly, res, identification, layermap, cfg
         ),
         release_holes=collect_release_holes(assembly, res, layermap, cfg),
+        rev_release_circles=collect_rev_release_circles(assembly, res, layermap, cfg),
         frame_boundary=get_inner_frame_boundary(assembly, layermap, cfg),
         resonator_body_mte=collect_resonator_body_mte(res, assembly, layermap, cfg),
         resonator_body_mbe=collect_resonator_body_mbe(res, assembly, layermap, cfg),
     )
 
 
-def mte_extension_frame_obstacles(
-    roles: RtegGeometryRoles,
+def attach_preserved_filter_interconnect(
+    assembly: RtegFrameAssembly,
+    res: Resonator,
+    identification: IdentificationResult,
     layermap: LayerMap,
     config: RtegCollectConfig | None = None,
-) -> list[gdstk.Polygon]:
-    """Die-frame MBE geometry the horizontal MTE cap must not intersect."""
-    cfg = config or RtegCollectConfig()
-    obstacles: list[gdstk.Polygon] = []
-    if roles.frame_boundary.ring is not None:
-        obstacles.append(roles.frame_boundary.ring.polygon)
-    mbe_pair = layermap.pair(cfg.mbe_layer)
-    for tp in roles.ground_plates.all_items():
-        if (tp.polygon.layer, tp.polygon.datatype) == mbe_pair:
-            obstacles.append(tp.polygon)
-    return obstacles
+) -> PreservedMetal:
+    """
+    Copy filter ``connectMTE`` / ``connectMBE`` metal into the RTEG frame cell.
+
+    Uses the same overlap + collar-association rules as step 5.1
+    ``collect_preserved_metal``, but writes polygons directly onto
+    ``assembly.top_cell`` so step-4 GDS export includes the preserved interconnect.
+    """
+    preserved = collect_preserved_metal(
+        assembly, res, identification, layermap, config
+    )
+    for tp in preserved.mte:
+        assembly.top_cell.add(tp.polygon)
+    for tp in preserved.mbe:
+        assembly.top_cell.add(tp.polygon)
+    return preserved
+
+
+def attach_preserved_filter_interconnect_all(
+    assemblies: Sequence[RtegFrameAssembly],
+    resonators: Sequence[Resonator],
+    identification: IdentificationResult,
+    layermap: LayerMap,
+    config: RtegCollectConfig | None = None,
+) -> dict[int, PreservedMetal]:
+    """Attach preserved filter interconnect for every framed resonator index."""
+    res_by_index = {i: r for i, r in enumerate(resonators)}
+    out: dict[int, PreservedMetal] = {}
+    for assembly in assemblies:
+        res = res_by_index[assembly.index]
+        out[assembly.index] = attach_preserved_filter_interconnect(
+            assembly, res, identification, layermap, config
+        )
+    return out
+
+
+def preserved_interconnect_attach_rows(
+    preserved_by_index: Mapping[int, PreservedMetal],
+    *,
+    inst_names: Mapping[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Summary table for notebook display after attach step."""
+    rows: list[dict[str, object]] = []
+    for idx in sorted(preserved_by_index):
+        preserved = preserved_by_index[idx]
+        mte_areas = [round(abs(tp.polygon.area()), 1) for tp in preserved.mte]
+        mbe_areas = [round(abs(tp.polygon.area()), 1) for tp in preserved.mbe]
+        rows.append(
+            {
+                "index": idx,
+                "inst_name": inst_names.get(idx) if inst_names else None,
+                "n_preserved_mte": len(preserved.mte),
+                "n_preserved_mbe": len(preserved.mbe),
+                "mte_areas_um2": mte_areas,
+                "mbe_areas_um2": mbe_areas,
+            }
+        )
+    return rows
 
 
 def geometry_roles_summary_table(roles: RtegGeometryRoles) -> list[dict[str, object]]:
@@ -930,6 +1031,7 @@ def geometry_roles_summary_table(roles: RtegGeometryRoles) -> list[dict[str, obj
         ("ground_plates", roles.ground_plates.groups()),
         ("preserved", roles.preserved.groups()),
         ("release_holes", roles.release_holes.groups()),
+        ("rev_release_circles", roles.rev_release_circles.groups()),
         ("frame_boundary", roles.frame_boundary.groups()),
     ]
     for section, groups in sections:

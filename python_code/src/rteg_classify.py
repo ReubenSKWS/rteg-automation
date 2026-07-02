@@ -115,7 +115,7 @@ def classify_nodes(
     else:
         note = (
             "preserved MTE not facing center — extend preserved MTE at collar only; "
-            "MBE signal route (Step 6.1) + MBE ground body (Step 6.2)"
+            "MBE signal route (Step 6.1)"
         )
 
     nodes: list[ClassifiedNode] = []

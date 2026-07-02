@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Print KB331 MTE extension validation table (step 5.3)."""
 from __future__ import annotations
 

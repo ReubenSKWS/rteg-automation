@@ -1,4 +1,4 @@
-"""Shared KB331 fixture for integration tests."""
+﻿"""Shared KB331 fixture for integration tests."""
 from __future__ import annotations
 
 import sys
@@ -23,7 +23,7 @@ LAYERMAP = INPUT / "layermap"
 
 
 def load_kb331_pipeline(*, with_orientation: bool = True):
-    """Run steps 2–4 for all KB331 resonators."""
+    """Run steps 2ΓÇô4 for all KB331 resonators."""
     if not FILTER.is_file():
         raise FileNotFoundError(FILTER)
     layermap = load_layermap(LAYERMAP)

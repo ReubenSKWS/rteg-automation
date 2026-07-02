@@ -603,9 +603,13 @@ def _collar_arc(
     """
     Walk the body boundary from ``a`` to ``b`` along the collar-mouth arc.
 
-    Of the two boundary arcs between the intercepts, return the one that hugs the
-    connect finger (the contact mouth), oriented ``a -> b`` inclusive of the body
-    vertices nearest the intercepts.
+    Of the two boundary arcs between the intercepts, return the shorter one by
+    total path length.  The collar mouth spans a fraction of one body edge so
+    the mouth arc is always the shorter arc for any expected resonator geometry.
+    Wide-span collar_extend collars (e.g. res5/res7) wrap the bridging around
+    multiple body sides, making the old bridging-distance heuristic ambiguous and
+    causing it to pick the long arc that encloses the body — path length is
+    unambiguous.
     """
     ring = _poly_points(body_poly)
     n = len(ring)
@@ -629,7 +633,9 @@ def _collar_arc(
             break
         i = (i - 1) % n
 
-    return fwd if _arc_dist_to_polys(fwd, bridging) <= _arc_dist_to_polys(bwd, bridging) else bwd
+    fwd_len = sum(_dist(fwd[j], fwd[j + 1]) for j in range(len(fwd) - 1))
+    bwd_len = sum(_dist(bwd[j], bwd[j + 1]) for j in range(len(bwd) - 1))
+    return fwd if fwd_len <= bwd_len else bwd
 
 
 @dataclass
@@ -1116,9 +1122,29 @@ def choose_signal_shift(
     y_lo = min(contact.intercept_a[1], contact.intercept_b[1])
     y_hi = max(contact.intercept_a[1], contact.intercept_b[1])
     if y_lo - span_tol_um <= pad_y <= y_hi + span_tol_um:
-        return (0.0, 0.0)
-
-    dy = pad_y - (y_lo + y_hi) / 2.0
+        # Intercepts straddle pad center — but the collar body arc may
+        # overshoot the pad bounds (e.g. concave notch above pad top).
+        # Check the arc and shift if needed.
+        pad_top = pad_bb[1][1]
+        pad_bot = pad_bb[0][1]
+        collar_body = _select_collar_body(
+            body_polys, contact.intercept_a, contact.intercept_b
+        )
+        arc = _collar_arc(
+            collar_body, contact.intercept_a, contact.intercept_b, contact.bridging
+        )
+        arc_ys = [pt[1] for pt in arc]
+        arc_y_max = max(arc_ys)
+        arc_y_min = min(arc_ys)
+        if arc_y_max <= pad_top + span_tol_um and arc_y_min >= pad_bot - span_tol_um:
+            return (0.0, 0.0)
+        # Arc overshoots — shift to pull the arc inside pad bounds.
+        if arc_y_max > pad_top + span_tol_um:
+            dy = pad_top - arc_y_max  # downward (negative)
+        else:
+            dy = pad_bot - arc_y_min  # upward (positive)
+    else:
+        dy = pad_y - (y_lo + y_hi) / 2.0
 
     bb = polys_bbox(list(body_polys))
     if bb is None:
@@ -1273,21 +1299,50 @@ def build_resonator_route(
 
     # --- signal route ---
     probe_pad = [_main_signal_pad_polygon(signal_pad)]
-    contact = extract_collar_contact(
-        connect, body, signal_pad_polys=probe_pad, precision=precision,
-    )
+
+    # For collar_extend, the wide-span MBE collar wraps around multiple sides of
+    # body_mbe. _farthest_pair then picks two diagonally-opposite body-boundary
+    # points as intercepts, causing the connector's closing edge to cut through
+    # the body. Fix: clip the preserved MBE to the pad-facing half of the body
+    # bbox before contact extraction so only pad-side candidates are considered.
+    if not center_pad:
+        body_bb = polys_bbox(list(body))
+        pad_bb = polys_bbox(probe_pad)
+        connect_for_contact: list[gdstk.Polygon] = list(connect)
+        if body_bb is not None and pad_bb is not None:
+            body_cx = (body_bb[0][0] + body_bb[1][0]) / 2.0
+            pad_cx = (pad_bb[0][0] + pad_bb[1][0]) / 2.0
+            _BIG = 1e5
+            if pad_cx < body_cx:
+                half_mask = gdstk.Polygon(
+                    [(-_BIG, -_BIG), (-_BIG, _BIG), (body_cx, _BIG), (body_cx, -_BIG)]
+                )
+            else:
+                half_mask = gdstk.Polygon(
+                    [(body_cx, -_BIG), (body_cx, _BIG), (_BIG, _BIG), (_BIG, -_BIG)]
+                )
+            clipped_connect: list[gdstk.Polygon] = []
+            for p in connect:
+                parts = gdstk.boolean([p], [half_mask], "and", precision=precision)
+                clipped_connect.extend(parts)
+            if clipped_connect:
+                connect_for_contact = clipped_connect
+        contact = extract_collar_contact(
+            connect_for_contact, body, signal_pad_polys=probe_pad, precision=precision,
+        )
+    else:
+        contact = extract_collar_contact(
+            connect, body, signal_pad_polys=probe_pad, precision=precision,
+        )
+
     if contact is not None and signal_pad:
         # Split the bridging into the collar ring (kept) and die filter extensions.
         # The collar closely follows the body (high overlap fraction); extensions
         # are filter interconnect metal that only touch at intercepts.
         _, ext_pieces = _split_collar_extensions(contact.bridging, body, precision=precision)
-        # For collar_extend the preserved MBE may be a single large filter-bus piece
-        # (the bus + collar combined). Whether it's classified as extension (knee
-        # constraint → U-shape) or collar (merged into signal net → complex polygon),
-        # the result is a wild signal route. Fix: skip the bridging merge and pass no
-        # ext_polys so build_signal_route produces only the clean conn polygon (launch
-        # corners → intercept arc). The original contact.bridging is still passed for
-        # _collar_arc disambiguation (which arc direction hugs the connect finger).
+        # For collar_extend: skip the bridging merge and pass no ext_polys so
+        # build_signal_route produces only the clean connector polygon (launch
+        # corners → intercept arc). _collar_arc picks the short arc by path length.
         route_ext = ext_pieces if center_pad else ()
         signal_route = build_signal_route(
             contact, signal_pad, body, terminal=terminal,
